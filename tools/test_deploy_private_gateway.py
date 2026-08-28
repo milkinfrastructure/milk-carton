@@ -240,6 +240,12 @@ if name == "curl":
     done()
 
 if name == "docker":
+    if "--config" in args:
+        config = Path(args[args.index("--config") + 1])
+        plugin = config / "cli-plugins/docker-buildx"
+        expected = Path(os.environ["HOME"]) / ".docker/cli-plugins/docker-buildx"
+        if not plugin.is_symlink() or plugin.resolve() != expected.resolve():
+            done(94)
     values = without_global(args)
     if values == ["context", "show"]:
         print("default")
@@ -385,6 +391,11 @@ class Fixture:
         }))
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        self.home = self.root / "home"
+        self.buildx_plugin = self.home / ".docker/cli-plugins/docker-buildx"
+        self.buildx_plugin.parent.mkdir(parents=True)
+        self.buildx_plugin.write_text("#!/bin/sh\nexit 0\n")
+        self.buildx_plugin.chmod(0o700)
         command = self.bin / "command"
         command.write_text(textwrap.dedent(FAKE_COMMAND))
         command.chmod(0o755)
@@ -404,6 +415,7 @@ class Fixture:
         self.bootstrap = bootstrap
         python_directory = str(Path(sys.executable).resolve().parent)
         self.environment = {
+            "HOME": str(self.home),
             "PATH": str(self.bin) + os.pathsep + python_directory + os.pathsep + "/usr/bin:/bin",
             "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
             "CLOUDFLARE_API_TOKEN": "cloudflare-test-token",
@@ -692,6 +704,16 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         commands = fixture.state["commands"]
         self.assertFalse(any(item["command"] in {"gh", "docker", "wrangler", "curl"} for item in commands))
         self.assertEqual(fixture.terminal()["failure_stage"], "source-authority")
+
+    def test_buildx_plugin_must_exist_in_a_standard_location(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        fixture.buildx_plugin.unlink()
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"buildx plugin is unavailable", result.stderr)
+        self.assertFalse(fixture.evidence.exists())
+        self.assertEqual(fixture.state["commands"], [])
 
     def test_committed_config_is_a_fail_closed_prebuilt_template(self):
         config_raw = (ROOT / "deploy/cloudflare/wrangler.jsonc").read_text()

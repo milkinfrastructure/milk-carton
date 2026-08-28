@@ -718,6 +718,23 @@ def main():
             raise DeployFailure(f"{command} is unavailable")
         commands[command] = resolved
 
+    buildx_candidates = []
+    home = base_environment.get("HOME")
+    if home:
+        buildx_candidates.append(Path(home) / ".docker/cli-plugins/docker-buildx")
+    buildx_candidates.extend(Path(value) for value in (
+        "/opt/homebrew/lib/docker/cli-plugins/docker-buildx",
+        "/usr/local/lib/docker/cli-plugins/docker-buildx",
+        "/usr/libexec/docker/cli-plugins/docker-buildx",
+        "/usr/lib/docker/cli-plugins/docker-buildx",
+    ))
+    buildx_plugin = next(
+        (path for path in buildx_candidates if path.is_file() and os.access(path, os.X_OK)),
+        None,
+    )
+    if buildx_plugin is None:
+        raise DeployFailure("docker buildx plugin is unavailable in standard locations")
+
     evidence_directory.mkdir(mode=0o700)
     operation_id = secrets.token_hex(12)
     evidence = Evidence(evidence_directory, operation_id)
@@ -729,6 +746,11 @@ def main():
     previous_worker = None
     temporary_config = None
     scratch = Path(tempfile.mkdtemp(prefix="milk-gateway-deploy."))
+    docker_config = scratch / "docker-config"
+    docker_config.mkdir(mode=0o700)
+    docker_plugins = docker_config / "cli-plugins"
+    docker_plugins.mkdir(mode=0o700)
+    (docker_plugins / "docker-buildx").symlink_to(buildx_plugin)
 
     def interrupt(signum, _frame):
         raise Interrupted(f"signal {signum}")
@@ -1019,10 +1041,9 @@ def main():
         ).stdout.decode().strip()
         if not (docker_endpoint.startswith("unix://") or docker_endpoint.startswith("npipe://")):
             raise ContractFailure("Docker context is not a local socket")
-        (scratch / "docker-config").mkdir(mode=0o700)
         runner.run(
             "docker-buildx-version",
-            [commands["docker"], "--config", str(scratch / "docker-config"), "--host", docker_endpoint, "buildx", "version"],
+            [commands["docker"], "--config", str(docker_config), "--host", docker_endpoint, "buildx", "version"],
         )
 
         image_tag = f"sha256-{admitted['child_sha256']}-op-{operation_id}"
