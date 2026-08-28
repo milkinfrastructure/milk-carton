@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import binascii
 import hashlib
 import json
 from pathlib import Path
@@ -18,7 +19,13 @@ GITHUB_USERNAME = "ShantanuJoshi"
 BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
 BUILDKIT_VERSION = "v0.23.2"
 DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
-BUILDKIT_BUILD_TYPE = "https://mobyproject.org/buildkit@v1"
+BUILDKIT_BUILD_TYPE = (
+    "https://github.com/moby/buildkit/blob/master/"
+    "docs/attestations/slsa-definitions.md"
+)
+SBOM_SCANNER_SHA256 = (
+    "ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9"
+)
 BASE_IMAGE_SHA256 = {
     "6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1",
     "d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a",
@@ -82,6 +89,8 @@ def _run(*arguments):
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        if urllib.parse.urlsplit(new_url).scheme != "https":
+            raise ValueError("registry redirect left HTTPS")
         redirected = super().redirect_request(
             request, file_pointer, code, message, headers, new_url
         )
@@ -161,20 +170,67 @@ def _registry_blob(bearer, digest):
 
 def _subject_binds(statement, child_digest):
     subjects = statement.get("subject")
-    if not isinstance(subjects, list) or not subjects:
+    if not isinstance(subjects, list) or len(subjects) != 1:
         return False
-    child_sha256 = child_digest.removeprefix("sha256:")
-    return any(
+    subject = subjects[0]
+    return (
         isinstance(subject, dict)
-        and isinstance(subject.get("digest"), dict)
-        and subject["digest"].get("sha256") == child_sha256
-        for subject in subjects
+        and set(subject) == {"name", "digest"}
+        and isinstance(subject["name"], str)
+        and 1 <= len(subject["name"]) <= 4096
+        and subject["digest"]
+        == {"sha256": child_digest.removeprefix("sha256:")}
     )
 
 
 def _write_new(path, raw):
     with path.open("xb") as output:
         output.write(raw)
+
+
+def _validate_buildkit_metadata(value):
+    if not isinstance(value, dict) or set(value) != {"source"}:
+        raise ValueError("SLSA v1 BuildKit metadata is invalid")
+    source = value["source"]
+    if not isinstance(source, dict) or set(source) != {"infos", "locations"}:
+        raise ValueError("SLSA v1 BuildKit source metadata is invalid")
+    infos = source["infos"]
+    locations = source["locations"]
+    if not isinstance(infos, list) or len(infos) != 1:
+        raise ValueError("SLSA v1 Dockerfile source metadata is invalid")
+    info = infos[0]
+    if not isinstance(info, dict) or set(info) != {
+        "data",
+        "digestMapping",
+        "filename",
+        "language",
+        "llbDefinition",
+    }:
+        raise ValueError("SLSA v1 Dockerfile source metadata is invalid")
+    if info["filename"] != "Dockerfile" or info["language"] != "Dockerfile":
+        raise ValueError("SLSA v1 Dockerfile identity is invalid")
+    encoded = info["data"]
+    if not isinstance(encoded, str) or not 1 <= len(encoded) <= 1_048_576:
+        raise ValueError("SLSA v1 Dockerfile source is invalid")
+    try:
+        dockerfile = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError("SLSA v1 Dockerfile source is invalid") from error
+    expected = Path(__file__).resolve().parents[1] / "deploy/cloudflare/Dockerfile"
+    if dockerfile != expected.read_bytes():
+        raise ValueError("SLSA v1 Dockerfile differs from the committed source")
+    if (
+        not isinstance(info["digestMapping"], dict)
+        or not info["digestMapping"]
+        or len(info["digestMapping"]) > 4096
+        or not isinstance(info["llbDefinition"], list)
+        or not info["llbDefinition"]
+        or len(info["llbDefinition"]) > 4096
+        or not isinstance(locations, dict)
+        or not locations
+        or len(locations) > 4096
+    ):
+        raise ValueError("SLSA v1 max-mode source mapping is incomplete")
 
 
 def _validate_slsa(predicate, arguments):
@@ -189,13 +245,16 @@ def _validate_slsa(predicate, arguments):
     if definition["buildType"] != BUILDKIT_BUILD_TYPE:
         raise ValueError("SLSA v1 build type is not BuildKit")
     external = definition["externalParameters"]
-    if not isinstance(external, dict) or set(external) != {
-        "source", "frontend", "args", "locals",
-    }:
+    if not isinstance(external, dict) or set(external) != {"configSource", "request"}:
         raise ValueError("SLSA v1 external parameters are invalid")
-    if external["source"] is not None or external["frontend"] != "dockerfile.v0":
-        raise ValueError("SLSA v1 frontend parameters are invalid")
-    locals_ = external["locals"]
+    if external["configSource"] != {"path": "Dockerfile"}:
+        raise ValueError("SLSA v1 configuration source is invalid")
+    request = external["request"]
+    if not isinstance(request, dict) or set(request) != {"frontend", "args", "locals"}:
+        raise ValueError("SLSA v1 frontend request is invalid")
+    if request["frontend"] != "gateway.v0":
+        raise ValueError("SLSA v1 frontend is not the pinned gateway frontend")
+    locals_ = request["locals"]
     if (
         not isinstance(locals_, list)
         or sorted(item.get("name", "") for item in locals_ if isinstance(item, dict))
@@ -211,28 +270,34 @@ def _validate_slsa(predicate, arguments):
         "build-arg:SOURCE_DATE_EPOCH": str(arguments.source_date_epoch),
         "label:org.opencontainers.image.revision": arguments.source_commit,
         "label:org.opencontainers.image.source": SOURCE_REPOSITORY,
+        "cmdline": DOCKERFILE_FRONTEND,
+        "source": DOCKERFILE_FRONTEND,
     }
-    parameters = external["args"]
-    if not isinstance(parameters, dict) or any(
-        not isinstance(key, str)
-        or not isinstance(value, str)
-        or len(key) > 256
-        or len(value) > 4096
-        for key, value in parameters.items()
-    ):
-        raise ValueError("SLSA v1 build arguments are invalid")
-    if any(parameters.get(key) != value for key, value in expected.items()):
+    parameters = request["args"]
+    if parameters != expected:
         raise ValueError("SLSA v1 build arguments do not bind release inputs")
-    if any(
-        key.startswith("build-arg:") and key not in expected
-        or key.startswith("label:") and key not in expected
-        for key in parameters
-    ):
-        raise ValueError("SLSA v1 build arguments contain unauthorized parameters")
-    if not isinstance(definition["internalParameters"], dict):
+    internal = definition["internalParameters"]
+    if not isinstance(internal, dict) or set(internal) != {
+        "builderPlatform",
+        "buildConfig",
+    }:
         raise ValueError("SLSA v1 internal parameters are invalid")
+    if internal["builderPlatform"] != "linux/amd64":
+        raise ValueError("SLSA v1 builder platform is not linux/amd64")
+    build_config = internal["buildConfig"]
+    if (
+        not isinstance(build_config, dict)
+        or set(build_config) != {"llbDefinition", "digestMapping"}
+        or not isinstance(build_config["llbDefinition"], list)
+        or not build_config["llbDefinition"]
+        or len(build_config["llbDefinition"]) > 4096
+        or not isinstance(build_config["digestMapping"], dict)
+        or not build_config["digestMapping"]
+        or len(build_config["digestMapping"]) > 4096
+    ):
+        raise ValueError("SLSA v1 max-mode build configuration is incomplete")
     dependencies = definition["resolvedDependencies"]
-    if not isinstance(dependencies, list) or not 3 <= len(dependencies) <= 32:
+    if not isinstance(dependencies, list) or not 3 <= len(dependencies) <= 64:
         raise ValueError("SLSA v1 resolved dependencies are invalid")
     dependency_sha256 = set()
     dependency_uris = set()
@@ -254,29 +319,44 @@ def _validate_slsa(predicate, arguments):
             raise ValueError("SLSA v1 resolved dependency identity is invalid")
         dependency_uris.add(uri)
         dependency_sha256.add(digests["sha256"])
-    expected_dependencies = BASE_IMAGE_SHA256 | {DOCKERFILE_FRONTEND.rsplit("@sha256:", 1)[1]}
+    expected_dependencies = BASE_IMAGE_SHA256 | {
+        DOCKERFILE_FRONTEND.rsplit("@sha256:", 1)[1],
+        SBOM_SCANNER_SHA256,
+    }
     if not expected_dependencies.issubset(dependency_sha256):
-        raise ValueError("SLSA v1 dependencies do not bind the frontend and base images")
+        raise ValueError(
+            "SLSA v1 dependencies do not bind the frontend, scanner, and base images"
+        )
 
-    if not isinstance(details, dict) or not {"builder", "metadata"}.issubset(details) or not set(
-        details
-    ).issubset({"builder", "metadata", "byproducts"}):
+    if not isinstance(details, dict) or set(details) != {"builder", "metadata"}:
         raise ValueError("SLSA v1 run details are invalid")
     builder = details["builder"]
     metadata = details["metadata"]
     if (
         not isinstance(builder, dict)
         or set(builder) != {"id"}
-        or not isinstance(builder["id"], str)
-        or not 1 <= len(builder["id"]) <= 4096
+        or builder["id"] != ""
         or not isinstance(metadata, dict)
-        or set(metadata) != {"invocationId", "startedOn", "finishedOn"}
-        or any(not isinstance(metadata[key], str) or not metadata[key] for key in (
-            "invocationId", "startedOn", "finishedOn"
-        ))
-        or ("byproducts" in details and not isinstance(details["byproducts"], list))
+        or set(metadata)
+        != {
+            "invocationID",
+            "startedOn",
+            "finishedOn",
+            "buildkit_metadata",
+            "buildkit_completeness",
+        }
+        or any(
+            not isinstance(metadata[key], str) or not metadata[key]
+            for key in ("invocationID", "startedOn", "finishedOn")
+        )
     ):
         raise ValueError("SLSA v1 run details are incomplete")
+    if metadata["buildkit_completeness"] != {
+        "request": True,
+        "resolvedDependencies": False,
+    }:
+        raise ValueError("SLSA v1 BuildKit completeness is invalid")
+    _validate_buildkit_metadata(metadata["buildkit_metadata"])
 
 
 def _validate_spdx(predicate):
@@ -415,21 +495,41 @@ def verify(arguments, github_token):
     if _digest(raw_attestation) != attestation_digest or len(raw_attestation) != attestation_size:
         raise ValueError("attestation manifest differs from its descriptor")
     attestation = _object(raw_attestation, "attestation manifest")
-    if attestation.get("schemaVersion") != 2:
-        raise ValueError("attestation manifest schema is invalid")
-    if attestation.get("artifactType") != "application/vnd.docker.attestation.manifest.v1+json":
-        raise ValueError("attestation artifact type is invalid")
-    attestation_subject = attestation.get("subject")
-    if attestation_subject is not None and (
-        not isinstance(attestation_subject, dict)
-        or attestation_subject.get("digest") != child_digest
+    if (
+        set(attestation) != {"schemaVersion", "mediaType", "config", "layers"}
+        or attestation["schemaVersion"] != 2
+        or attestation["mediaType"] != "application/vnd.oci.image.manifest.v1+json"
     ):
-        raise ValueError("attestation manifest subject is invalid")
+        raise ValueError("attestation manifest identity is invalid")
+    (
+        attestation_config_digest,
+        attestation_config_size,
+        attestation_config_media_type,
+    ) = _descriptor(attestation["config"], "attestation configuration")
+    if attestation_config_media_type != "application/vnd.oci.image.config.v1+json":
+        raise ValueError("attestation configuration media type is invalid")
     attestation_layers = attestation.get("layers")
     if not isinstance(attestation_layers, list) or len(attestation_layers) != 2:
         raise ValueError("attestation manifest must contain exactly two statements")
 
     bearer = _registry_bearer(github_token)
+    raw_attestation_config = _registry_blob(bearer, attestation_config_digest)
+    if len(raw_attestation_config) != attestation_config_size:
+        raise ValueError("attestation configuration size differs from its descriptor")
+    attestation_config = _object(
+        raw_attestation_config, "attestation configuration"
+    )
+    statement_digests = [
+        _descriptor(layer, "attestation statement")[0]
+        for layer in attestation_layers
+    ]
+    if attestation_config != {
+        "architecture": "unknown",
+        "config": {},
+        "os": "unknown",
+        "rootfs": {"diff_ids": statement_digests, "type": "layers"},
+    }:
+        raise ValueError("attestation configuration is invalid")
     raw_config = _registry_blob(bearer, config_digest)
     if len(raw_config) != config_size:
         raise ValueError("runtime configuration size differs from its descriptor")
@@ -475,9 +575,11 @@ def verify(arguments, github_token):
         if len(raw_statement) != layer_size:
             raise ValueError("attestation statement size differs from its descriptor")
         statement = _object(raw_statement, "attestation statement")
-        if statement.get("_type") != "https://in-toto.io/Statement/v0.1":
+        if set(statement) != {"_type", "subject", "predicateType", "predicate"}:
+            raise ValueError("attestation statement is not strict")
+        if statement["_type"] != "https://in-toto.io/Statement/v0.1":
             raise ValueError("attestation statement type is invalid")
-        if statement.get("predicateType") != declared_predicate:
+        if statement["predicateType"] != declared_predicate:
             raise ValueError("attestation statement predicate differs from its descriptor")
         if not _subject_binds(statement, child_digest):
             raise ValueError("attestation statement does not bind the runnable image")

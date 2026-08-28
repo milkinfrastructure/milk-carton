@@ -1,4 +1,5 @@
 import argparse
+import base64
 import hashlib
 import importlib.util
 import json
@@ -10,6 +11,7 @@ import tarfile
 import tempfile
 import textwrap
 import unittest
+import urllib.request
 from unittest import mock
 
 
@@ -106,36 +108,74 @@ class VerifierFixture:
                 "buildDefinition": {
                     "buildType": VERIFY.BUILDKIT_BUILD_TYPE,
                     "externalParameters": {
-                        "source": None,
-                        "frontend": "dockerfile.v0",
-                        "args": {
-                            "build-arg:BUILDKIT_SYNTAX": VERIFY.DOCKERFILE_FRONTEND,
-                            "build-arg:MILK_BUILDKIT_IMAGE_REFERENCE": VERIFY.BUILDKIT_IMAGE,
-                            "build-arg:MILK_SOURCE_COMMIT": self.commit,
-                            "build-arg:MILK_SOURCE_CONTEXT_SHA256": self.context_sha256,
-                            "build-arg:SOURCE_DATE_EPOCH": str(self.source_epoch),
-                            "label:org.opencontainers.image.revision": self.commit,
-                            "label:org.opencontainers.image.source": VERIFY.SOURCE_REPOSITORY,
+                        "configSource": {"path": "Dockerfile"},
+                        "request": {
+                            "frontend": "gateway.v0",
+                            "args": {
+                                "build-arg:BUILDKIT_SYNTAX": VERIFY.DOCKERFILE_FRONTEND,
+                                "build-arg:MILK_BUILDKIT_IMAGE_REFERENCE": VERIFY.BUILDKIT_IMAGE,
+                                "build-arg:MILK_SOURCE_COMMIT": self.commit,
+                                "build-arg:MILK_SOURCE_CONTEXT_SHA256": self.context_sha256,
+                                "build-arg:SOURCE_DATE_EPOCH": str(self.source_epoch),
+                                "label:org.opencontainers.image.revision": self.commit,
+                                "label:org.opencontainers.image.source": VERIFY.SOURCE_REPOSITORY,
+                                "cmdline": VERIFY.DOCKERFILE_FRONTEND,
+                                "source": VERIFY.DOCKERFILE_FRONTEND,
+                            },
+                            "locals": [{"name": "context"}, {"name": "dockerfile"}],
                         },
-                        "locals": [{"name": "context"}, {"name": "dockerfile"}],
                     },
-                    "internalParameters": {"load": True},
+                    "internalParameters": {
+                        "builderPlatform": "linux/amd64",
+                        "buildConfig": {
+                            "llbDefinition": [{"id": "step0", "op": {"Op": {}}}],
+                            "digestMapping": {"sha256:" + "7" * 64: "step0"},
+                        },
+                    },
                     "resolvedDependencies": [
                         {"uri": f"pkg:docker/dependency-{index}", "digest": {"sha256": digest}}
                         for index, digest in enumerate(sorted(
                             VERIFY.BASE_IMAGE_SHA256
-                            | {VERIFY.DOCKERFILE_FRONTEND.rsplit("@sha256:", 1)[1]}
+                            | {
+                                VERIFY.DOCKERFILE_FRONTEND.rsplit("@sha256:", 1)[1],
+                                VERIFY.SBOM_SCANNER_SHA256,
+                            }
                         ))
                     ],
                 },
                 "runDetails": {
-                    "builder": {"id": "https://mobyproject.org/buildkit@v0.23.2"},
+                    "builder": {"id": ""},
                     "metadata": {
-                        "invocationId": "fixture-build",
+                        "invocationID": "fixture-build",
                         "startedOn": "2026-01-01T00:00:00Z",
                         "finishedOn": "2026-01-01T00:01:00Z",
+                        "buildkit_completeness": {
+                            "request": True,
+                            "resolvedDependencies": False,
+                        },
+                        "buildkit_metadata": {
+                            "source": {
+                                "infos": [
+                                    {
+                                        "data": base64.b64encode(
+                                            ROOT.joinpath(
+                                                "deploy/cloudflare/Dockerfile"
+                                            ).read_bytes()
+                                        ).decode(),
+                                        "digestMapping": {
+                                            "sha256:" + "8" * 64: "step0"
+                                        },
+                                        "filename": "Dockerfile",
+                                        "language": "Dockerfile",
+                                        "llbDefinition": [
+                                            {"id": "step0", "op": {"Op": {}}}
+                                        ],
+                                    }
+                                ],
+                                "locations": {"step0": {}},
+                            }
+                        },
                     },
-                    "byproducts": [],
                 },
             },
         }
@@ -165,14 +205,24 @@ class VerifierFixture:
         self.raw_spdx = _json(spdx)
         self.slsa_digest = _digest(self.raw_slsa)
         self.spdx_digest = _digest(self.raw_spdx)
+        attestation_config = {
+            "architecture": "unknown",
+            "config": {},
+            "os": "unknown",
+            "rootfs": {
+                "diff_ids": [self.slsa_digest, self.spdx_digest],
+                "type": "layers",
+            },
+        }
+        self.raw_attestation_config = _json(attestation_config)
+        self.attestation_config_digest = _digest(self.raw_attestation_config)
         attestation = {
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "artifactType": "application/vnd.docker.attestation.manifest.v1+json",
             "config": {
-                "mediaType": "application/vnd.oci.empty.v1+json",
-                "digest": _digest(b"{}"),
-                "size": 2,
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": self.attestation_config_digest,
+                "size": len(self.raw_attestation_config),
             },
             "layers": [
                 {
@@ -188,11 +238,6 @@ class VerifierFixture:
                     "annotations": {"in-toto.io/predicate-type": VERIFY.SPDX},
                 },
             ],
-            "subject": {
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": self.manifest_digest,
-                "size": len(self.raw_manifest),
-            },
         }
         self.raw_attestation = _json(attestation)
         self.attestation_digest = _digest(self.raw_attestation)
@@ -245,6 +290,7 @@ class VerifierFixture:
         )
         self.blobs = {
             self.config_digest: self.raw_config,
+            self.attestation_config_digest: self.raw_attestation_config,
             self.slsa_digest: self.raw_slsa,
             self.spdx_digest: self.raw_spdx,
         }
@@ -368,7 +414,7 @@ class PrivateImageVerifierTests(unittest.TestCase):
             fixture = VerifierFixture(directory)
             predicate = json.loads(fixture.raw_slsa)["predicate"]
             VERIFY._validate_slsa(predicate, fixture.args)
-            predicate["buildDefinition"]["externalParameters"]["args"][
+            predicate["buildDefinition"]["externalParameters"]["request"]["args"][
                 "build-arg:MILK_SOURCE_CONTEXT_SHA256"
             ] = "0" * 64
             with self.assertRaisesRegex(ValueError, "bind release inputs"):
@@ -382,6 +428,22 @@ class PrivateImageVerifierTests(unittest.TestCase):
             predicate["packages"][0]["checksums"] = []
             with self.assertRaisesRegex(ValueError, "checksum"):
                 VERIFY._validate_spdx(predicate)
+
+    def test_registry_redirect_never_sends_credentials_outside_https(self):
+        handler = VERIFY._SafeRedirect()
+        request = urllib.request.Request(
+            "https://ghcr.io/source",
+            headers={"Authorization": "Bearer registry-secret"},
+        )
+        with self.assertRaisesRegex(ValueError, "left HTTPS"):
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "http://ghcr.io/target"
+            )
+        redirected = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://objects.example/target"
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
 
 
 class PrivateBuildScriptTests(unittest.TestCase):
