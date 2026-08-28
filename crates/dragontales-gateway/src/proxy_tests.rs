@@ -155,14 +155,35 @@ fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
 }
 
 #[test]
-fn student_runtime_image_is_immutable_and_matches_route_authority() {
+fn student_runtime_images_are_immutable_and_branch_matches_route_authority() {
     let mut invalid = config(1_024, 4);
     invalid
         .teacher
         .as_mut()
         .unwrap()
-        .student_runtime_image_reference = "ghcr.io/milkinfrastructure/milk-student:latest".into();
+        .student_train_runtime_image_reference =
+        String::from("ghcr.io/milkinfrastructure/milk-student-train:latest");
     assert!(validate_teacher_config(&invalid).is_err());
+
+    let mut invalid = config(1_024, 4);
+    invalid
+        .teacher
+        .as_mut()
+        .unwrap()
+        .student_branch_runtime_image_reference =
+        String::from("ghcr.io/milkinfrastructure/milk-student-branch:latest");
+    assert!(validate_teacher_config(&invalid).is_err());
+
+    let mut same_digest = config(1_024, 4);
+    same_digest
+        .teacher
+        .as_mut()
+        .unwrap()
+        .student_branch_runtime_image_reference = format!(
+        "ghcr.io/another-owner/another-image@sha256:{}",
+        "4".repeat(64)
+    );
+    assert!(validate_teacher_config(&same_digest).is_err());
 
     let mut routed = config(1_024, 4);
     routed.route = Some(RouteStartupConfig {
@@ -170,8 +191,8 @@ fn student_runtime_image_is_immutable_and_matches_route_authority() {
         signing_key_id: "route-test".into(),
         allow_private_candidate_http: false,
         authorized_provider_terms_sha256: "6".repeat(64),
-        authorized_runtime_image_reference: format!(
-            "ghcr.io/milkinfrastructure/milk-student@sha256:{}",
+        authorized_student_branch_runtime_image_reference: format!(
+            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
             "7".repeat(64)
         ),
         authorized_admission_program_sha256: "8".repeat(64),
@@ -185,11 +206,11 @@ fn student_runtime_image_is_immutable_and_matches_route_authority() {
         .route
         .as_mut()
         .unwrap()
-        .authorized_runtime_image_reference = routed
+        .authorized_student_branch_runtime_image_reference = routed
         .teacher
         .as_ref()
         .unwrap()
-        .student_runtime_image_reference
+        .student_branch_runtime_image_reference
         .clone();
     validate_teacher_config(&routed).unwrap();
 }
@@ -608,9 +629,13 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
             output_rate_microusd_per_million_tokens: 1,
             max_cost_microusd: 10,
             student_recipe_sha256: "3".repeat(64),
-            student_runtime_image_reference: format!(
-                "ghcr.io/milkinfrastructure/milk-student@sha256:{}",
+            student_train_runtime_image_reference: format!(
+                "ghcr.io/milkinfrastructure/milk-student-train@sha256:{}",
                 "4".repeat(64)
+            ),
+            student_branch_runtime_image_reference: format!(
+                "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
+                "6".repeat(64)
             ),
         }),
         route: None,

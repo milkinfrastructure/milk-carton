@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use uuid::Uuid;
 
-pub(crate) const ROUTE_SCHEMA_VERSION: &str = "dragontales.route.v3";
-pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "dragontales.winner-admission-receipt.v1";
+pub(crate) const ROUTE_SCHEMA_VERSION: &str = "dragontales.route.v4";
+pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "dragontales.winner-admission-receipt.v2";
 const ROUTE_LIVE_SCHEMA_VERSION: &str = "dragontales.route-live.v1";
 const BASELINE_ROUTE_REVISION: &str = "openai-baseline-v1";
 pub(crate) const MAX_ROUTE_MANIFEST_BYTES: usize = 8 * 1_024;
@@ -57,7 +57,7 @@ pub(crate) struct RouteStartupConfig {
     pub(crate) signing_key_id: String,
     pub(crate) allow_private_candidate_http: bool,
     pub(crate) authorized_provider_terms_sha256: String,
-    pub(crate) authorized_runtime_image_reference: String,
+    pub(crate) authorized_student_branch_runtime_image_reference: String,
     pub(crate) authorized_admission_program_sha256: String,
     pub(crate) winner_authorization_not_after: DateTime<Utc>,
     pub(crate) winner_max_wall_seconds: u64,
@@ -79,13 +79,15 @@ impl RouteStartupConfig {
 
     pub(crate) fn winner_deployment_authority(&self) -> Result<WinnerDeploymentAuthority> {
         let authority = WinnerDeploymentAuthority {
-            schema_version: "dragontales.winner-deployment-authority.v1".to_owned(),
+            schema_version: "dragontales.winner-deployment-authority.v2".to_owned(),
             provider_policy: WinnerProviderPolicy {
                 primary: WINNER_PRIMARY_PROVIDER.to_owned(),
                 fallback: WINNER_FALLBACK_PROVIDER.to_owned(),
             },
             provider_terms_sha256: self.authorized_provider_terms_sha256.clone(),
-            runtime_image_reference: self.authorized_runtime_image_reference.clone(),
+            student_branch_runtime_image_reference: self
+                .authorized_student_branch_runtime_image_reference
+                .clone(),
             admission_program_sha256: self.authorized_admission_program_sha256.clone(),
             authorization_not_after: self.winner_authorization_not_after,
             max_wall_seconds: self.winner_max_wall_seconds,
@@ -113,7 +115,7 @@ pub(crate) struct WinnerDeploymentAuthority {
     pub(crate) schema_version: String,
     pub(crate) provider_policy: WinnerProviderPolicy,
     pub(crate) provider_terms_sha256: String,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
     pub(crate) admission_program_sha256: String,
     pub(crate) authorization_not_after: DateTime<Utc>,
     pub(crate) max_wall_seconds: u64,
@@ -145,12 +147,12 @@ impl WinnerDeploymentAuthority {
             &self.provider_terms_sha256,
             "authorized provider terms SHA-256",
         )?;
-        validate_runtime_image_reference(&self.runtime_image_reference)?;
+        validate_runtime_image_reference(&self.student_branch_runtime_image_reference)?;
         decode_lowercase_hex_32(
             &self.admission_program_sha256,
             "authorized admission program SHA-256",
         )?;
-        if self.schema_version != "dragontales.winner-deployment-authority.v1"
+        if self.schema_version != "dragontales.winner-deployment-authority.v2"
             || self.provider_policy.primary != WINNER_PRIMARY_PROVIDER
             || self.provider_policy.fallback != WINNER_FALLBACK_PROVIDER
             || self.authorization_not_after.nanosecond() != 0
@@ -283,7 +285,7 @@ pub(crate) struct WinnerAdmissionReceipt {
     pub(crate) model_alias: String,
     pub(crate) model_alias_sha256: String,
     pub(crate) candidate_api_key_sha256: String,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
     pub(crate) admission_program_sha256: String,
     pub(crate) execution_id: String,
     pub(crate) execution_name: String,
@@ -376,8 +378,10 @@ impl WinnerAdmissionReceipt {
         if self.model_alias_sha256 != hex_digest(&model_alias_sha256) {
             bail!("winner admission model alias digest differs");
         }
-        validate_runtime_image_reference(&self.runtime_image_reference)?;
-        if self.runtime_image_reference != authority.runtime_image_reference {
+        validate_runtime_image_reference(&self.student_branch_runtime_image_reference)?;
+        if self.student_branch_runtime_image_reference
+            != authority.student_branch_runtime_image_reference
+        {
             bail!("winner admission runtime image is not authorized");
         }
         if self.admission_program_sha256 != authority.admission_program_sha256 {
@@ -450,7 +454,7 @@ pub(crate) struct VerifiedRouteWinner {
     pub(crate) dev_receipt_sha256: [u8; 32],
     pub(crate) cohort_sha256: [u8; 32],
     pub(crate) student_variant: WinnerVariant,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
 }
 
 struct ParsedRouteManifest {
@@ -472,7 +476,7 @@ pub(crate) struct RoutePublication {
     pub(crate) deployment_sha256: [u8; 32],
     pub(crate) winner_provider_binding_sha256: [u8; 32],
     pub(crate) student_variant: WinnerVariant,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
     pub(crate) provider_terms_sha256: [u8; 32],
     pub(crate) candidate_endpoint: String,
     pub(crate) logical_model_alias: String,
@@ -567,7 +571,9 @@ impl RoutePublication {
                 "winner provider binding SHA-256",
             )?,
             student_variant: manifest.winner_admission.student_variant,
-            runtime_image_reference: manifest.winner_admission.runtime_image_reference,
+            student_branch_runtime_image_reference: manifest
+                .winner_admission
+                .student_branch_runtime_image_reference,
             provider_terms_sha256: decode_lowercase_hex_32(
                 &manifest.provider_terms_sha256,
                 "provider terms SHA-256",
@@ -617,7 +623,8 @@ pub(crate) fn prepare_route_manifest(
     if winner_admission.student_job_id != hex_digest(&winner.student_job_id)
         || winner_admission.model_manifest_sha256 != hex_digest(&winner.model_manifest_sha256)
         || winner_admission.student_variant != winner.student_variant
-        || winner_admission.runtime_image_reference != winner.runtime_image_reference
+        || winner_admission.student_branch_runtime_image_reference
+            != winner.student_branch_runtime_image_reference
     {
         bail!("winner admission differs from the verified stored winner");
     }
@@ -1131,8 +1138,8 @@ impl RoutePolicy {
                         candidate_api_key_sha256: hex_digest(
                             &Sha256::digest(candidate_api_key.as_bytes()).into(),
                         ),
-                        runtime_image_reference: format!(
-                            "ghcr.io/milkinfrastructure/milk-student@sha256:{}",
+                        student_branch_runtime_image_reference: format!(
+                            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
                             "91".repeat(32)
                         ),
                         admission_program_sha256: "92".repeat(32),
@@ -1432,6 +1439,18 @@ fn validate_winner_admission(
 }
 
 pub(crate) fn validate_runtime_image_reference(value: &str) -> Result<()> {
+    runtime_image_digest(value)?;
+    Ok(())
+}
+
+pub(crate) fn validate_distinct_runtime_image_references(left: &str, right: &str) -> Result<()> {
+    if runtime_image_digest(left)? == runtime_image_digest(right)? {
+        bail!("runtime images must use distinct SHA-256 digests");
+    }
+    Ok(())
+}
+
+fn runtime_image_digest(value: &str) -> Result<&str> {
     let Some((name, digest)) = value.rsplit_once("@sha256:") else {
         bail!("runtime image reference must use an immutable SHA-256 digest");
     };
@@ -1445,7 +1464,7 @@ pub(crate) fn validate_runtime_image_reference(value: &str) -> Result<()> {
         bail!("runtime image reference is invalid");
     }
     decode_lowercase_hex_32(digest, "runtime image digest")?;
-    Ok(())
+    Ok(digest)
 }
 
 fn valid_provider(value: &str) -> bool {
@@ -1613,8 +1632,8 @@ mod tests {
             };
             let secret_hex = hex_bytes(&ROUTE_SECRET);
             let route_secret_sha256: [u8; 32] = Sha256::digest(ROUTE_SECRET).into();
-            let runtime_image_reference = format!(
-                "ghcr.io/milkinfrastructure/milk-student@sha256:{}",
+            let student_branch_runtime_image_reference = format!(
+                "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
                 repeated_digest(0x91)
             );
             let admission_program_sha256 = repeated_digest(0x92);
@@ -1626,7 +1645,8 @@ mod tests {
                 signing_key_id: "route-key-v1".to_owned(),
                 allow_private_candidate_http: false,
                 authorized_provider_terms_sha256: repeated_digest(0x66),
-                authorized_runtime_image_reference: runtime_image_reference.clone(),
+                authorized_student_branch_runtime_image_reference:
+                    student_branch_runtime_image_reference.clone(),
                 authorized_admission_program_sha256: admission_program_sha256.clone(),
                 winner_authorization_not_after: not_after,
                 winner_max_wall_seconds: MAX_WINNER_DEPLOYMENT_WALL_SECONDS,
@@ -1652,7 +1672,8 @@ mod tests {
                     candidate_api_key_sha256: hex_digest(
                         &Sha256::digest(b"candidate-test-secret").into(),
                     ),
-                    runtime_image_reference: runtime_image_reference.clone(),
+                    student_branch_runtime_image_reference: student_branch_runtime_image_reference
+                        .clone(),
                     admission_program_sha256: admission_program_sha256.clone(),
                     execution_id: "sb-0123456789".to_owned(),
                     execution_name: "winner-test".to_owned(),
@@ -1733,7 +1754,9 @@ mod tests {
             dev_receipt_sha256: decode_lowercase_hex_32(&source.dev_receipt_sha256, "DEV").unwrap(),
             cohort_sha256: decode_lowercase_hex_32(&source.cohort_sha256, "cohort").unwrap(),
             student_variant: source.winner_admission.student_variant,
-            runtime_image_reference: source.winner_admission.runtime_image_reference,
+            student_branch_runtime_image_reference: source
+                .winner_admission
+                .student_branch_runtime_image_reference,
         };
         (winner, admission)
     }
@@ -1842,8 +1865,8 @@ mod tests {
             .is_err()
         );
         let mut wrong_runtime_winner = winner.clone();
-        wrong_runtime_winner.runtime_image_reference = format!(
-            "ghcr.io/milkinfrastructure/milk-student@sha256:{}",
+        wrong_runtime_winner.student_branch_runtime_image_reference = format!(
+            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
             "a".repeat(64)
         );
         assert!(
@@ -2472,8 +2495,8 @@ mod tests {
         );
 
         let mut wrong_image = fixture.config.clone();
-        wrong_image.authorized_runtime_image_reference = format!(
-            "ghcr.io/milkinfrastructure/milk-student@sha256:{}",
+        wrong_image.authorized_student_branch_runtime_image_reference = format!(
+            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
             repeated_digest(0xaa)
         );
         assert!(

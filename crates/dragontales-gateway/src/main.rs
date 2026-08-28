@@ -369,7 +369,8 @@ struct TeacherConfig {
     output_rate_microusd_per_million_tokens: u64,
     max_cost_microusd: u64,
     student_recipe_sha256: String,
-    student_runtime_image_reference: String,
+    student_train_runtime_image_reference: String,
+    student_branch_runtime_image_reference: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -1548,7 +1549,8 @@ async fn tick_action_with_records(
         teacher.authorization_not_after,
     )?;
     let recipe_sha256 = decode_lowercase_sha256(&teacher.student_recipe_sha256)?;
-    let runtime_image_reference = &teacher.student_runtime_image_reference;
+    let train_runtime_image_reference = &teacher.student_train_runtime_image_reference;
+    let branch_runtime_image_reference = &teacher.student_branch_runtime_image_reference;
     if let Some(route) = &config.route
         && let Some(launch) = records
             .claim_student_winner_deployment(
@@ -1566,7 +1568,8 @@ async fn tick_action_with_records(
             &scope,
             &provider_binding,
             &recipe_sha256,
-            runtime_image_reference,
+            train_runtime_image_reference,
+            branch_runtime_image_reference,
             now,
         )
         .await?
@@ -1578,7 +1581,8 @@ async fn tick_action_with_records(
             &scope,
             &provider_binding,
             &recipe_sha256,
-            runtime_image_reference,
+            train_runtime_image_reference,
+            branch_runtime_image_reference,
             now,
         )
         .await?
@@ -2028,12 +2032,16 @@ fn validate_teacher_config(config: &FileConfig) -> Result<()> {
     decode_lowercase_sha256(&teacher.deployment_sha256)?;
     decode_lowercase_sha256(&teacher.terms_sha256)?;
     decode_lowercase_sha256(&teacher.student_recipe_sha256)?;
-    route::validate_runtime_image_reference(&teacher.student_runtime_image_reference)?;
+    route::validate_distinct_runtime_image_references(
+        &teacher.student_train_runtime_image_reference,
+        &teacher.student_branch_runtime_image_reference,
+    )?;
     snapshot_analyzer_config(config, None)?;
     if let Some(route) = &config.route
-        && route.authorized_runtime_image_reference != teacher.student_runtime_image_reference
+        && route.authorized_student_branch_runtime_image_reference
+            != teacher.student_branch_runtime_image_reference
     {
-        bail!("teacher student runtime image must equal the route-authorized runtime image");
+        bail!("student branch runtime image must equal the route-authorized runtime image");
     }
     if teacher.authorization_not_after.nanosecond() != 0 {
         bail!("teacher authorization expiry must use whole seconds");

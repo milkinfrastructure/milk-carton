@@ -35,7 +35,7 @@ use crate::route::{
     BaselineReason, ED25519_SIGNATURE_BYTES, MAX_ROUTE_LIVE_BYTES, MAX_ROUTE_MANIFEST_BYTES,
     RouteLivePointer, RoutePublication, RouteScope, VerifiedRouteWinner, WinnerAdmissionReceipt,
     WinnerDeploymentAuthority, WinnerProviderPolicy, WinnerVariant,
-    validate_runtime_image_reference,
+    validate_distinct_runtime_image_references, validate_runtime_image_reference,
 };
 
 const TRACE_QUEUE_RECORDS: usize = 1_024;
@@ -81,6 +81,10 @@ const STUDENT_MAX_BRANCH_GPU_SECONDS: u64 = 30 * 60;
 const STUDENT_MAX_TOTAL_GPU_SECONDS: u64 =
     STUDENT_MAX_TRAIN_GPU_SECONDS + 3 * STUDENT_MAX_BRANCH_GPU_SECONDS;
 const STUDENT_START_WINDOW_SECONDS: i64 = 15 * 60;
+const STUDENT_PRIME_RL_VERSION: &str = "0.9.0";
+const STUDENT_ACCELERATE_VERSION: &str = "1.14.0";
+const STUDENT_PEFT_VERSION: &str = "0.20.0";
+const STUDENT_TRAIN_TORCH_CUDA_VERSION: &str = "12.8";
 const STUDENT_FP8_KERNEL: &str =
     "Selected CutlassFP8ScaledMMLinearKernel for CompressedTensorsW8A8Fp8";
 const STUDENT_VLLM_VERSION: &str = "0.28.0+cu129";
@@ -1897,12 +1901,6 @@ struct StudentQualityGates {
     max_p95_latency_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StudentInitialStage {
-    TrainMerge,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StudentJobDefinition {
@@ -1913,19 +1911,13 @@ struct StudentJobDefinition {
     dev_set_sha256: String,
     counts: StudentInputCounts,
     recipe_sha256: String,
-    runtime_image_reference: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_gpu_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_train_gpu_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_branch_gpu_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_total_gpu_seconds: Option<u64>,
+    student_train_runtime_image_reference: String,
+    student_branch_runtime_image_reference: String,
+    max_train_gpu_seconds: u64,
+    max_branch_gpu_seconds: u64,
+    max_total_gpu_seconds: u64,
     quality: StudentQualityGates,
     expires_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    initial_stage: Option<StudentInitialStage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2072,6 +2064,7 @@ struct StudentBranchDefinition {
     variant: StudentVariant,
     train_result_sha256: String,
     recipe_sha256: String,
+    student_branch_runtime_image_reference: String,
     max_gpu_seconds: u64,
     expires_at: DateTime<Utc>,
 }
@@ -2093,7 +2086,7 @@ struct StudentFanoutClaim {
     student_job_id: String,
     train_result_sha256: String,
     recipe_sha256: String,
-    runtime_image_reference: String,
+    student_branch_runtime_image_reference: String,
     max_total_gpu_seconds: u64,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
@@ -2111,7 +2104,7 @@ struct StudentWinnerDeploymentClaim {
     winner: StudentVariant,
     model_manifest: StudentArtifactRef,
     dev_receipt: StudentArtifactRef,
-    runtime_image_reference: String,
+    student_branch_runtime_image_reference: String,
     provider_binding_sha256: String,
     authority: WinnerDeploymentAuthority,
     claimed_at: DateTime<Utc>,
@@ -2622,16 +2615,26 @@ struct StudentGpuDevice {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StudentRuntimeProbe {
-    schema_version: String,
-    platform: String,
-    vllm_version: String,
-    vllm_metadata_sha256: String,
-    compressed_tensors_version: String,
-    compressed_tensors_wheel_sha256: String,
-    fp8_dynamic_supported: bool,
-    fp8_static_supported: bool,
+#[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
+enum StudentRuntimeProbe {
+    Train {
+        schema_version: String,
+        platform: String,
+        prime_rl_version: String,
+        accelerate_version: String,
+        peft_version: String,
+        torch_cuda_version: String,
+    },
+    Branch {
+        schema_version: String,
+        platform: String,
+        vllm_version: String,
+        vllm_metadata_sha256: String,
+        compressed_tensors_version: String,
+        compressed_tensors_wheel_sha256: String,
+        fp8_dynamic_supported: bool,
+        fp8_static_supported: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2732,7 +2735,8 @@ pub(crate) struct StudentJobClaimWrite {
     pub(crate) claim_object_key: String,
     pub(crate) claim_sha256: String,
     pub(crate) counts: StudentInputCounts,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_train_runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
     pub(crate) state: &'static str,
 }
 
@@ -2752,7 +2756,7 @@ pub(crate) struct StudentFanoutLaunchWrite {
     pub(crate) student_job_id: String,
     pub(crate) fanout_claim_object_key: String,
     pub(crate) fanout_claim_sha256: String,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
     branches: Vec<StudentBranchClaim>,
 }
 
@@ -2767,7 +2771,7 @@ pub(crate) struct StudentWinnerDeploymentLaunchWrite {
     pub(crate) deployment_claim_sha256: String,
     pub(crate) provider_binding_sha256: String,
     pub(crate) provider_policy: WinnerProviderPolicy,
-    pub(crate) runtime_image_reference: String,
+    pub(crate) student_branch_runtime_image_reference: String,
     pub(crate) max_wall_seconds: u64,
     pub(crate) max_cost_microusd: u64,
     pub(crate) expires_at: DateTime<Utc>,
@@ -3962,7 +3966,8 @@ impl Records {
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
         recipe_sha256: &[u8; 32],
-        runtime_image_reference: &str,
+        student_train_runtime_image_reference: &str,
+        student_branch_runtime_image_reference: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<StudentJobClaimWrite>> {
         self.store
@@ -3970,7 +3975,8 @@ impl Records {
                 scope,
                 teacher_provider_binding_sha256,
                 recipe_sha256,
-                runtime_image_reference,
+                student_train_runtime_image_reference,
+                student_branch_runtime_image_reference,
                 now,
             )
             .await
@@ -4003,7 +4009,8 @@ impl Records {
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
         recipe_sha256: &[u8; 32],
-        runtime_image_reference: &str,
+        student_train_runtime_image_reference: &str,
+        student_branch_runtime_image_reference: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<StudentFanoutLaunchWrite>> {
         self.store
@@ -4011,7 +4018,8 @@ impl Records {
                 scope,
                 teacher_provider_binding_sha256,
                 recipe_sha256,
-                runtime_image_reference,
+                student_train_runtime_image_reference,
+                student_branch_runtime_image_reference,
                 now,
             )
             .await
@@ -8803,7 +8811,8 @@ impl RecordStore {
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
         recipe_sha256: &[u8; 32],
-        runtime_image_reference: &str,
+        student_train_runtime_image_reference: &str,
+        student_branch_runtime_image_reference: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<StudentJobClaimWrite>> {
         if let Some(frontier) = self
@@ -8813,7 +8822,8 @@ impl RecordStore {
             validate_student_execution_authority(
                 &frontier.index.claim,
                 recipe_sha256,
-                runtime_image_reference,
+                student_train_runtime_image_reference,
+                student_branch_runtime_image_reference,
             )?;
             if let Some(write) = self
                 .reconcile_student_reservation(
@@ -8838,7 +8848,8 @@ impl RecordStore {
             scope,
             teacher_provider_binding_sha256,
             recipe_sha256,
-            runtime_image_reference,
+            student_train_runtime_image_reference,
+            student_branch_runtime_image_reference,
             now,
             &verified,
         )?
@@ -9133,7 +9144,8 @@ impl RecordStore {
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
         recipe_sha256: &[u8; 32],
-        runtime_image_reference: &str,
+        student_train_runtime_image_reference: &str,
+        student_branch_runtime_image_reference: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<StudentFanoutLaunchWrite>> {
         let Some(student) = self
@@ -9146,7 +9158,8 @@ impl RecordStore {
         validate_student_execution_authority(
             &student.claim,
             recipe_sha256,
-            runtime_image_reference,
+            student_train_runtime_image_reference,
+            student_branch_runtime_image_reference,
         )?;
         let student_job_id = decode_hex_digest(&student.claim.student_job_id)?;
         let claim_payload = serde_json::to_vec(&student.claim)?;
@@ -9915,7 +9928,8 @@ impl RecordStore {
                 || publication.winner_provider_binding_sha256
                     != previous.winner_provider_binding_sha256
                 || publication.student_variant != previous.student_variant
-                || publication.runtime_image_reference != previous.runtime_image_reference
+                || publication.student_branch_runtime_image_reference
+                    != previous.student_branch_runtime_image_reference
                 || publication.provider_terms_sha256 != previous.provider_terms_sha256
                 || publication.candidate_endpoint != previous.candidate_endpoint
                 || publication.logical_model_alias != previous.logical_model_alias
@@ -9945,7 +9959,8 @@ impl RecordStore {
             || publication.dev_receipt_sha256 != student.dev_receipt_sha256
             || publication.cohort_sha256 != student.cohort_sha256
             || publication.student_variant != student.student_variant
-            || publication.runtime_image_reference != student.runtime_image_reference
+            || publication.student_branch_runtime_image_reference
+                != student.student_branch_runtime_image_reference
             || publication.deployment_sha256 != deployment.admission.deployment_sha256()?
             || publication.winner_provider_binding_sha256
                 != decode_hex_digest(&deployment_claim.provider_binding_sha256)?
@@ -9990,7 +10005,11 @@ impl RecordStore {
                 StudentVariant::DynamicFp8 => WinnerVariant::DynamicFp8,
                 StudentVariant::StaticFp8 => WinnerVariant::StaticFp8,
             },
-            runtime_image_reference: winner.claim.definition.runtime_image_reference.clone(),
+            student_branch_runtime_image_reference: winner
+                .claim
+                .definition
+                .student_branch_runtime_image_reference
+                .clone(),
         })
     }
 
@@ -10473,6 +10492,7 @@ impl RecordStore {
                 &evidence,
                 false,
                 Some(variant),
+                true,
             )?;
             if evidence.kernels.len() != 1 {
                 bail!("staged route branch lacks its exact kernel evidence");
@@ -13282,11 +13302,15 @@ fn prepare_student_job_claim(
     scope: &Scope,
     teacher_provider_binding_sha256: &[u8; 32],
     recipe_sha256: &[u8; 32],
-    runtime_image_reference: &str,
+    student_train_runtime_image_reference: &str,
+    student_branch_runtime_image_reference: &str,
     now: DateTime<Utc>,
     verified: &[VerifiedTeacherResultObject],
 ) -> Result<Option<(StudentJobClaim, Vec<u8>)>> {
-    validate_runtime_image_reference(runtime_image_reference)?;
+    validate_distinct_runtime_image_references(
+        student_train_runtime_image_reference,
+        student_branch_runtime_image_reference,
+    )?;
     let provider_binding = hex_digest(teacher_provider_binding_sha256);
     let mut current = verified
         .iter()
@@ -13402,29 +13426,28 @@ fn prepare_student_job_claim(
         .min()
         .context("student job has no teacher expiry")?;
     let definition = StudentJobDefinition {
-        schema_version: "dragontales.student-job-definition.v3".to_owned(),
+        schema_version: "dragontales.student-job-definition.v4".to_owned(),
         teacher_provider_binding_sha256: provider_binding,
         teacher_results: current.into_iter().map(|source| source.reference).collect(),
         input_sha256: hex_digest(&Sha256::digest(&input).into()),
         dev_set_sha256: student_dev_set_sha256(&bundle.dev)?,
         counts,
         recipe_sha256: hex_digest(recipe_sha256),
-        runtime_image_reference: runtime_image_reference.to_owned(),
-        max_gpu_seconds: None,
-        max_train_gpu_seconds: Some(STUDENT_MAX_TRAIN_GPU_SECONDS),
-        max_branch_gpu_seconds: Some(STUDENT_MAX_BRANCH_GPU_SECONDS),
-        max_total_gpu_seconds: Some(STUDENT_MAX_TOTAL_GPU_SECONDS),
+        student_train_runtime_image_reference: student_train_runtime_image_reference.to_owned(),
+        student_branch_runtime_image_reference: student_branch_runtime_image_reference.to_owned(),
+        max_train_gpu_seconds: STUDENT_MAX_TRAIN_GPU_SECONDS,
+        max_branch_gpu_seconds: STUDENT_MAX_BRANCH_GPU_SECONDS,
+        max_total_gpu_seconds: STUDENT_MAX_TOTAL_GPU_SECONDS,
         quality: StudentQualityGates {
             min_mean_score_bps: STUDENT_MIN_MEAN_SCORE_BPS,
             max_mean_loss_vs_bf16_bps: STUDENT_MAX_MEAN_LOSS_VS_BF16_BPS,
             max_p95_latency_ms: STUDENT_MAX_P95_LATENCY_MS,
         },
         expires_at,
-        initial_stage: Some(StudentInitialStage::TrainMerge),
     };
     let student_job_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
     let claim = StudentJobClaim {
-        schema_version: "dragontales.student-job-claim.v3".to_owned(),
+        schema_version: "dragontales.student-job-claim.v4".to_owned(),
         scope: scope.clone(),
         student_job_id: hex_digest(&student_job_id),
         definition,
@@ -13624,13 +13647,11 @@ fn validate_student_job_claim(
         .teacher_results
         .windows(2)
         .all(|pair| pair[0].teacher_job_id < pair[1].teacher_job_id);
-    let valid_version = claim.schema_version == "dragontales.student-job-claim.v3"
-        && claim.definition.schema_version == "dragontales.student-job-definition.v3"
-        && claim.definition.initial_stage == Some(StudentInitialStage::TrainMerge)
-        && claim.definition.max_gpu_seconds.is_none()
-        && claim.definition.max_train_gpu_seconds == Some(STUDENT_MAX_TRAIN_GPU_SECONDS)
-        && claim.definition.max_branch_gpu_seconds == Some(STUDENT_MAX_BRANCH_GPU_SECONDS)
-        && claim.definition.max_total_gpu_seconds == Some(STUDENT_MAX_TOTAL_GPU_SECONDS);
+    let valid_version = claim.schema_version == "dragontales.student-job-claim.v4"
+        && claim.definition.schema_version == "dragontales.student-job-definition.v4"
+        && claim.definition.max_train_gpu_seconds == STUDENT_MAX_TRAIN_GPU_SECONDS
+        && claim.definition.max_branch_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
+        && claim.definition.max_total_gpu_seconds == STUDENT_MAX_TOTAL_GPU_SECONDS;
     if serde_json::to_vec(claim)? != payload
         || !valid_version
         || claim.scope != *scope
@@ -13644,7 +13665,11 @@ fn validate_student_job_claim(
         || !valid_lowercase_sha256(&claim.definition.input_sha256)
         || !valid_lowercase_sha256(&claim.definition.dev_set_sha256)
         || !valid_lowercase_sha256(&claim.definition.recipe_sha256)
-        || validate_runtime_image_reference(&claim.definition.runtime_image_reference).is_err()
+        || validate_distinct_runtime_image_references(
+            &claim.definition.student_train_runtime_image_reference,
+            &claim.definition.student_branch_runtime_image_reference,
+        )
+        .is_err()
         || claim.definition.teacher_results.is_empty()
         || claim.definition.teacher_results.len() > MAX_ITERATION_SNAPSHOT_ARTIFACTS
         || !references_are_sorted
@@ -13667,11 +13692,18 @@ fn validate_student_job_claim(
 fn validate_student_execution_authority(
     claim: &StudentJobClaim,
     recipe_sha256: &[u8; 32],
-    runtime_image_reference: &str,
+    student_train_runtime_image_reference: &str,
+    student_branch_runtime_image_reference: &str,
 ) -> Result<()> {
-    validate_runtime_image_reference(runtime_image_reference)?;
+    validate_distinct_runtime_image_references(
+        student_train_runtime_image_reference,
+        student_branch_runtime_image_reference,
+    )?;
     if claim.definition.recipe_sha256 != hex_digest(recipe_sha256)
-        || claim.definition.runtime_image_reference != runtime_image_reference
+        || claim.definition.student_train_runtime_image_reference
+            != student_train_runtime_image_reference
+        || claim.definition.student_branch_runtime_image_reference
+            != student_branch_runtime_image_reference
     {
         bail!("active student claim differs from the configured execution authority");
     }
@@ -13725,15 +13757,16 @@ fn student_branch_definition(
     train_result_sha256: String,
 ) -> Result<StudentBranchDefinition> {
     Ok(StudentBranchDefinition {
-        schema_version: "dragontales.student-branch-definition.v1".to_owned(),
+        schema_version: "dragontales.student-branch-definition.v2".to_owned(),
         student_job_id: claim.student_job_id.clone(),
         variant,
         train_result_sha256,
         recipe_sha256: claim.definition.recipe_sha256.clone(),
-        max_gpu_seconds: claim
+        student_branch_runtime_image_reference: claim
             .definition
-            .max_branch_gpu_seconds
-            .context("staged student claim has no branch GPU bound")?,
+            .student_branch_runtime_image_reference
+            .clone(),
+        max_gpu_seconds: claim.definition.max_branch_gpu_seconds,
         expires_at: claim.definition.expires_at,
     })
 }
@@ -13743,23 +13776,12 @@ fn prepare_student_fanout_claim(
     train: &StudentTrainResult,
     created_at: DateTime<Utc>,
 ) -> Result<StudentFanoutClaim> {
-    if parent.definition.initial_stage != Some(StudentInitialStage::TrainMerge)
-        || !matches!(train.outcome, StudentTrainOutcome::Succeeded { .. })
-    {
+    if !matches!(train.outcome, StudentTrainOutcome::Succeeded { .. }) {
         bail!("student fanout requires a successful staged train result");
     }
-    let max_train_gpu_seconds = parent
-        .definition
-        .max_train_gpu_seconds
-        .context("staged student claim has no train GPU bound")?;
-    let max_branch_gpu_seconds = parent
-        .definition
-        .max_branch_gpu_seconds
-        .context("staged student claim has no branch GPU bound")?;
-    let max_total_gpu_seconds = parent
-        .definition
-        .max_total_gpu_seconds
-        .context("staged student claim has no total GPU bound")?;
+    let max_train_gpu_seconds = parent.definition.max_train_gpu_seconds;
+    let max_branch_gpu_seconds = parent.definition.max_branch_gpu_seconds;
+    let max_total_gpu_seconds = parent.definition.max_total_gpu_seconds;
     let authorized_gpu_seconds = max_branch_gpu_seconds
         .checked_mul(student_variants().len() as u64)
         .and_then(|seconds| seconds.checked_add(max_train_gpu_seconds))
@@ -13779,7 +13801,7 @@ fn prepare_student_fanout_claim(
             let definition =
                 student_branch_definition(parent, variant, train_result_sha256.clone())?;
             Ok(StudentBranchClaim {
-                schema_version: "dragontales.student-branch-claim.v1".to_owned(),
+                schema_version: "dragontales.student-branch-claim.v2".to_owned(),
                 branch_id: hex_digest(&Sha256::digest(serde_json::to_vec(&definition)?).into()),
                 variant,
                 max_gpu_seconds: definition.max_gpu_seconds,
@@ -13787,12 +13809,15 @@ fn prepare_student_fanout_claim(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(StudentFanoutClaim {
-        schema_version: "dragontales.student-fanout-claim.v3".to_owned(),
+        schema_version: "dragontales.student-fanout-claim.v4".to_owned(),
         scope: parent.scope.clone(),
         student_job_id: parent.student_job_id.clone(),
         train_result_sha256,
         recipe_sha256: parent.definition.recipe_sha256.clone(),
-        runtime_image_reference: parent.definition.runtime_image_reference.clone(),
+        student_branch_runtime_image_reference: parent
+            .definition
+            .student_branch_runtime_image_reference
+            .clone(),
         max_total_gpu_seconds,
         created_at,
         expires_at: parent.definition.expires_at,
@@ -13838,11 +13863,13 @@ fn student_fanout_launch_write(
     key: String,
 ) -> StudentFanoutLaunchWrite {
     StudentFanoutLaunchWrite {
-        schema_version: "dragontales.student-fanout-launch.v2",
+        schema_version: "dragontales.student-fanout-launch.v3",
         student_job_id: claim.student_job_id.clone(),
         fanout_claim_object_key: key,
         fanout_claim_sha256: hex_digest(&Sha256::digest(payload).into()),
-        runtime_image_reference: claim.runtime_image_reference.clone(),
+        student_branch_runtime_image_reference: claim
+            .student_branch_runtime_image_reference
+            .clone(),
         branches: claim.branches.clone(),
     }
 }
@@ -13862,7 +13889,11 @@ fn prepare_student_winner_deployment_claim(
                 .context("verified student result has no winner")?
         || winner.candidate.model_manifest.sha256 != hex_digest(&winner.model_manifest_sha256)
         || winner.candidate.dev_receipt.sha256 != hex_digest(&winner.dev_receipt_sha256)
-        || winner.claim.definition.runtime_image_reference != authority.runtime_image_reference
+        || winner
+            .claim
+            .definition
+            .student_branch_runtime_image_reference
+            != authority.student_branch_runtime_image_reference
         || claimed_at < winner.result.finished_at
         || claimed_at >= authority.authorization_not_after
     {
@@ -13873,7 +13904,7 @@ fn prepare_student_winner_deployment_claim(
     let student_result_sha256 =
         hex_digest(&Sha256::digest(canonical_json_line(&winner.result)?).into());
     Ok(StudentWinnerDeploymentClaim {
-        schema_version: "dragontales.student-winner-deployment-claim.v1".to_owned(),
+        schema_version: "dragontales.student-winner-deployment-claim.v2".to_owned(),
         scope: scope.clone(),
         student_job_id: winner.claim.student_job_id.clone(),
         student_claim_sha256,
@@ -13881,7 +13912,11 @@ fn prepare_student_winner_deployment_claim(
         winner: winner.candidate.variant,
         model_manifest: winner.candidate.model_manifest.clone(),
         dev_receipt: winner.candidate.dev_receipt.clone(),
-        runtime_image_reference: winner.claim.definition.runtime_image_reference.clone(),
+        student_branch_runtime_image_reference: winner
+            .claim
+            .definition
+            .student_branch_runtime_image_reference
+            .clone(),
         provider_binding_sha256: hex_digest(&authority.provider_binding_sha256()?),
         expires_at: authority.authorization_not_after,
         authority,
@@ -13919,14 +13954,15 @@ fn validate_student_winner_deployment_claim_record(
     validate_student_artifact_ref(scope, student_job_id, &claim.model_manifest)?;
     validate_student_artifact_ref(scope, student_job_id, &claim.dev_receipt)?;
     if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "dragontales.student-winner-deployment-claim.v1"
+        || claim.schema_version != "dragontales.student-winner-deployment-claim.v2"
         || claim.scope != *scope
         || claim.student_job_id != hex_digest(student_job_id)
         || !valid_lowercase_sha256(&claim.student_claim_sha256)
         || !valid_lowercase_sha256(&claim.student_result_sha256)
         || !valid_lowercase_sha256(&claim.provider_binding_sha256)
         || claim.provider_binding_sha256 != hex_digest(&claim.authority.provider_binding_sha256()?)
-        || claim.runtime_image_reference != claim.authority.runtime_image_reference
+        || claim.student_branch_runtime_image_reference
+            != claim.authority.student_branch_runtime_image_reference
         || claim.claimed_at >= claim.expires_at
         || claim.expires_at != claim.authority.authorization_not_after
     {
@@ -14174,7 +14210,8 @@ fn validate_student_winner_deployment_result(
         || result.admission.student_job_id != claim.student_job_id
         || result.admission.student_variant != expected_variant
         || result.admission.model_manifest_sha256 != claim.model_manifest.sha256
-        || result.admission.runtime_image_reference != claim.runtime_image_reference
+        || result.admission.student_branch_runtime_image_reference
+            != claim.student_branch_runtime_image_reference
         || result.admission.launch_started_at < claim.claimed_at
         || result.admission.admitted_at >= claim.expires_at
     {
@@ -14376,7 +14413,7 @@ fn student_winner_deployment_launch_write(
     key: String,
 ) -> StudentWinnerDeploymentLaunchWrite {
     StudentWinnerDeploymentLaunchWrite {
-        schema_version: "dragontales.student-winner-deployment-launch.v1",
+        schema_version: "dragontales.student-winner-deployment-launch.v2",
         student_job_id: claim.student_job_id.clone(),
         student_result_sha256: claim.student_result_sha256.clone(),
         winner: claim.winner,
@@ -14384,7 +14421,9 @@ fn student_winner_deployment_launch_write(
         deployment_claim_sha256: hex_digest(&Sha256::digest(payload).into()),
         provider_binding_sha256: claim.provider_binding_sha256.clone(),
         provider_policy: claim.authority.provider_policy.clone(),
-        runtime_image_reference: claim.runtime_image_reference.clone(),
+        student_branch_runtime_image_reference: claim
+            .student_branch_runtime_image_reference
+            .clone(),
         max_wall_seconds: claim.authority.max_wall_seconds,
         max_cost_microusd: claim.authority.max_cost_microusd,
         expires_at: claim.expires_at,
@@ -14438,17 +14477,13 @@ fn validate_student_train_result(
     claim_payload: &[u8],
     result: &StudentTrainResult,
 ) -> Result<()> {
-    let max_train_gpu_seconds = claim
-        .definition
-        .max_train_gpu_seconds
-        .context("staged student claim has no train GPU bound")?;
+    let max_train_gpu_seconds = claim.definition.max_train_gpu_seconds;
     let wall_seconds = student_stage_wall_seconds(result.started_at, result.finished_at);
     if result.schema_version != "dragontales.student-train-result.v1"
         || result.scope != *scope
         || result.student_job_id != hex_digest(student_job_id)
         || result.claim_sha256 != hex_digest(&Sha256::digest(claim_payload).into())
         || result.runner_sha256 != claim.definition.recipe_sha256
-        || claim.definition.initial_stage != Some(StudentInitialStage::TrainMerge)
         || result.started_at < claim.started_at
         || result.started_at >= claim.started_at + TimeDelta::seconds(STUDENT_START_WINDOW_SECONDS)
         || result.finished_at < result.started_at
@@ -14665,15 +14700,8 @@ fn validate_student_train_upload(
             &evidence,
             allow_fixture,
             None,
+            false,
         )?;
-        if evidence.kernels.len() > 1
-            || evidence
-                .kernels
-                .first()
-                .is_some_and(|kernel| kernel.variant != StudentVariant::Bf16)
-        {
-            bail!("student train GPU evidence has a non-train kernel set");
-        }
     }
     if let StudentTrainOutcome::Succeeded {
         adapter_manifest,
@@ -14757,11 +14785,8 @@ fn validate_student_branch_upload(
             &evidence,
             allow_fixture,
             Some(result.variant),
+            matches!(result.outcome, StudentBranchOutcome::Succeeded { .. }),
         )?;
-        let successful = matches!(result.outcome, StudentBranchOutcome::Succeeded { .. });
-        if successful && evidence.kernels.len() != 1 {
-            bail!("successful student branch evidence lacks its one candidate kernel");
-        }
     }
     if let Some(reference) = model_manifest {
         let model: StudentModelManifest = parse_canonical_json_line(
@@ -14924,56 +14949,136 @@ fn validate_student_stage_gpu_evidence(
     evidence: &StudentGpuEvidence,
     allow_fixture: bool,
     expected_variant: Option<StudentVariant>,
+    require_candidate_kernel: bool,
 ) -> Result<()> {
-    if evidence.schema_version != "dragontales.student-gpu-evidence.v1"
+    if evidence.schema_version != "dragontales.student-gpu-evidence.v2"
         || evidence.student_job_id != student_job_id
         || evidence.recipe_sha256 != recipe_sha256
         || evidence.device.compute_capability != [9, 0]
         || evidence.device.total_memory_bytes < 79 * 1_024 * 1_024 * 1_024
-        || evidence.runtime.schema_version != "dragontales.h100-fp8-image-probe.v2"
-        || !evidence.runtime.fp8_dynamic_supported
-        || !evidence.runtime.fp8_static_supported
         || evidence.kernels.len() > 3
     {
         bail!("student GPU evidence identity or fixed H100 capability is invalid");
     }
-    match evidence.mode {
+    let device_valid = match evidence.mode {
         StudentGpuMode::H100 => {
             let uuid = evidence
                 .device
                 .uuid
                 .as_deref()
                 .context("student H100 evidence has no GPU UUID")?;
-            if !valid_student_gpu_uuid(uuid)
-                || !evidence.device.cuda.starts_with("12.9")
-                || !evidence.device.name.contains("H100")
-                || evidence.runtime.platform != "linux/amd64"
-                || evidence.runtime.vllm_version != STUDENT_VLLM_VERSION
-                || evidence.runtime.vllm_metadata_sha256 != STUDENT_VLLM_METADATA_SHA256
-                || evidence.runtime.compressed_tensors_version != STUDENT_COMPRESSED_TENSORS_VERSION
-                || evidence.runtime.compressed_tensors_wheel_sha256
-                    != STUDENT_COMPRESSED_TENSORS_WHEEL_SHA256
-            {
-                bail!("student H100 runtime evidence differs from the pinned runtime");
-            }
+            valid_student_gpu_uuid(uuid) && evidence.device.name.contains("H100")
         }
         StudentGpuMode::Fixture => {
-            if !allow_fixture
-                || evidence.device.uuid.is_some()
-                || evidence.device.cuda != "fixture"
-                || evidence.device.name != "deterministic-one-h100-fixture"
-                || evidence.device.total_memory_bytes != 80 * 1_024 * 1_024 * 1_024
-                || evidence.runtime.platform != "fixture"
-                || evidence.runtime.vllm_version != "fixture"
-                || evidence.runtime.vllm_metadata_sha256
-                    != hex_digest(&Sha256::digest(b"fixture-vllm").into())
-                || evidence.runtime.compressed_tensors_version != "fixture"
-                || evidence.runtime.compressed_tensors_wheel_sha256
-                    != hex_digest(&Sha256::digest(b"fixture-compressed-tensors").into())
-            {
-                bail!("student fixture evidence is not the deterministic local fixture");
-            }
+            allow_fixture
+                && evidence.device.uuid.is_none()
+                && evidence.device.cuda == "fixture"
+                && evidence.device.name == "deterministic-one-h100-fixture"
+                && evidence.device.total_memory_bytes == 80 * 1_024 * 1_024 * 1_024
         }
+    };
+    let runtime_valid = match (&evidence.runtime, evidence.mode, expected_variant) {
+        (
+            StudentRuntimeProbe::Train {
+                schema_version,
+                platform,
+                prime_rl_version,
+                accelerate_version,
+                peft_version,
+                torch_cuda_version,
+            },
+            StudentGpuMode::H100,
+            None,
+        ) => {
+            schema_version == "dragontales.student-train-image-probe.v1"
+                && platform == "linux/amd64"
+                && prime_rl_version == STUDENT_PRIME_RL_VERSION
+                && accelerate_version == STUDENT_ACCELERATE_VERSION
+                && peft_version == STUDENT_PEFT_VERSION
+                && torch_cuda_version == STUDENT_TRAIN_TORCH_CUDA_VERSION
+                && evidence.device.cuda == *torch_cuda_version
+        }
+        (
+            StudentRuntimeProbe::Train {
+                schema_version,
+                platform,
+                prime_rl_version,
+                accelerate_version,
+                peft_version,
+                torch_cuda_version,
+            },
+            StudentGpuMode::Fixture,
+            None,
+        ) => {
+            schema_version == "dragontales.student-train-image-probe.v1"
+                && platform == "fixture"
+                && prime_rl_version == "fixture"
+                && accelerate_version == "fixture"
+                && peft_version == "fixture"
+                && torch_cuda_version == "fixture"
+        }
+        (
+            StudentRuntimeProbe::Branch {
+                schema_version,
+                platform,
+                vllm_version,
+                vllm_metadata_sha256,
+                compressed_tensors_version,
+                compressed_tensors_wheel_sha256,
+                fp8_dynamic_supported,
+                fp8_static_supported,
+            },
+            StudentGpuMode::H100,
+            Some(_),
+        ) => {
+            schema_version == "dragontales.h100-fp8-image-probe.v2"
+                && platform == "linux/amd64"
+                && vllm_version == STUDENT_VLLM_VERSION
+                && vllm_metadata_sha256 == STUDENT_VLLM_METADATA_SHA256
+                && compressed_tensors_version == STUDENT_COMPRESSED_TENSORS_VERSION
+                && compressed_tensors_wheel_sha256 == STUDENT_COMPRESSED_TENSORS_WHEEL_SHA256
+                && *fp8_dynamic_supported
+                && *fp8_static_supported
+                && evidence.device.cuda.starts_with("12.9")
+        }
+        (
+            StudentRuntimeProbe::Branch {
+                schema_version,
+                platform,
+                vllm_version,
+                vllm_metadata_sha256,
+                compressed_tensors_version,
+                compressed_tensors_wheel_sha256,
+                fp8_dynamic_supported,
+                fp8_static_supported,
+            },
+            StudentGpuMode::Fixture,
+            Some(_),
+        ) => {
+            schema_version == "dragontales.h100-fp8-image-probe.v2"
+                && platform == "fixture"
+                && vllm_version == "fixture"
+                && vllm_metadata_sha256 == &hex_digest(&Sha256::digest(b"fixture-vllm").into())
+                && compressed_tensors_version == "fixture"
+                && compressed_tensors_wheel_sha256
+                    == &hex_digest(&Sha256::digest(b"fixture-compressed-tensors").into())
+                && *fp8_dynamic_supported
+                && *fp8_static_supported
+        }
+        _ => false,
+    };
+    if !device_valid || !runtime_valid {
+        bail!("student GPU evidence differs from its stage-specific runtime");
+    }
+    let kernel_count_valid = match expected_variant {
+        None => evidence.kernels.is_empty() && !require_candidate_kernel,
+        Some(_) => {
+            evidence.kernels.len() <= 1
+                && (!require_candidate_kernel || evidence.kernels.len() == 1)
+        }
+    };
+    if !kernel_count_valid {
+        bail!("student GPU evidence has the wrong stage-specific kernel count");
     }
     let mut seen = HashSet::new();
     for kernel in &evidence.kernels {
@@ -15217,14 +15322,8 @@ fn join_student_results(
     fanout: Option<&StudentFanoutClaim>,
     branches: &[StudentBranchResult],
 ) -> Result<StoredStudentResult> {
-    let max_train_gpu_seconds = parent
-        .definition
-        .max_train_gpu_seconds
-        .context("staged student claim has no train GPU bound")?;
-    let max_total_gpu_seconds = parent
-        .definition
-        .max_total_gpu_seconds
-        .context("staged student claim has no total GPU bound")?;
+    let max_train_gpu_seconds = parent.definition.max_train_gpu_seconds;
+    let max_total_gpu_seconds = parent.definition.max_total_gpu_seconds;
     if train.observed_gpu_seconds > max_train_gpu_seconds
         || train.observed_gpu_seconds > max_total_gpu_seconds
     {
@@ -15436,12 +15535,19 @@ fn student_claim_write(
     let student_job_id = decode_hex_digest(&claim.student_job_id)
         .expect("validated student claim contains a SHA-256 job ID");
     StudentJobClaimWrite {
-        schema_version: "dragontales.student-job-claim-receipt.v2",
+        schema_version: "dragontales.student-job-claim-receipt.v3",
         student_job_id: claim.student_job_id.clone(),
         claim_object_key: student_job_claim_key(&claim.scope, &student_job_id),
         claim_sha256: hex_digest(&Sha256::digest(payload).into()),
         counts: claim.definition.counts,
-        runtime_image_reference: claim.definition.runtime_image_reference.clone(),
+        student_train_runtime_image_reference: claim
+            .definition
+            .student_train_runtime_image_reference
+            .clone(),
+        student_branch_runtime_image_reference: claim
+            .definition
+            .student_branch_runtime_image_reference
+            .clone(),
         state,
     }
 }
@@ -16391,16 +16497,16 @@ fn student_train_gpu_launch_outbox(
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_job_claim_key(scope, &student_job_id),
             claim_sha256,
-            runtime_image_reference: claim.definition.runtime_image_reference.clone(),
+            runtime_image_reference: claim
+                .definition
+                .student_train_runtime_image_reference
+                .clone(),
             created_at: claim.started_at,
             expires_at: claim.definition.expires_at,
             operation: GpuLaunchOperation::StudentTrainMerge {
                 student_job_id: claim.student_job_id.clone(),
                 counts: claim.definition.counts,
-                max_gpu_seconds: claim
-                    .definition
-                    .max_train_gpu_seconds
-                    .context("student train claim has no GPU bound")?,
+                max_gpu_seconds: claim.definition.max_train_gpu_seconds,
             },
         },
     ))
@@ -16424,7 +16530,7 @@ fn student_fanout_gpu_launch_outbox(
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_fanout_claim_key(scope, student_job_id),
             claim_sha256,
-            runtime_image_reference: claim.runtime_image_reference.clone(),
+            runtime_image_reference: claim.student_branch_runtime_image_reference.clone(),
             created_at: claim.created_at,
             expires_at: claim.expires_at,
             operation: GpuLaunchOperation::StudentFanout {
@@ -16452,7 +16558,7 @@ fn student_winner_deployment_gpu_launch_outbox(
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_winner_deployment_claim_key(scope, &student_job_id),
             claim_sha256,
-            runtime_image_reference: claim.runtime_image_reference.clone(),
+            runtime_image_reference: claim.student_branch_runtime_image_reference.clone(),
             created_at: claim.claimed_at,
             expires_at: claim.expires_at,
             operation: GpuLaunchOperation::StudentWinnerDeployment {
@@ -16509,7 +16615,7 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
                     .iter()
                     .zip(student_variants())
                     .all(|(branch, variant)| {
-                        branch.schema_version == "dragontales.student-branch-claim.v1"
+                        branch.schema_version == "dragontales.student-branch-claim.v2"
                             && branch.variant == variant
                             && branch.max_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
                             && valid_lowercase_sha256(&branch.branch_id)
@@ -16818,9 +16924,13 @@ mod tests {
     use object_store::{
         GetOptions, GetResult, ListResult, PutMultipartOptions, PutResult, UploadPart,
     };
-    const TEST_STUDENT_RUNTIME_IMAGE_REFERENCE: &str = concat!(
-        "ghcr.io/milkinfrastructure/milk-student@sha256:",
+    const TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE: &str = concat!(
+        "ghcr.io/milkinfrastructure/milk-student-train@sha256:",
         "4444444444444444444444444444444444444444444444444444444444444444"
+    );
+    const TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE: &str = concat!(
+        "ghcr.io/milkinfrastructure/milk-student-branch@sha256:",
+        "6666666666666666666666666666666666666666666666666666666666666666"
     );
     const TEST_TEACHER_RUNTIME_IMAGE_REFERENCE: &str = concat!(
         "ghcr.io/milkinfrastructure/milk-teacher-gpt-oss@sha256:",
@@ -17145,7 +17255,7 @@ mod tests {
         expires_at: DateTime<Utc>,
     ) -> (StudentJobClaim, Vec<u8>) {
         let definition = StudentJobDefinition {
-            schema_version: "dragontales.student-job-definition.v3".to_owned(),
+            schema_version: "dragontales.student-job-definition.v4".to_owned(),
             teacher_provider_binding_sha256: hex_digest(&[1; 32]),
             teacher_results: vec![StudentTeacherResultRef {
                 teacher_job_id: hex_digest(&[2; 32]),
@@ -17160,23 +17270,24 @@ mod tests {
                 calibration: 128,
             },
             recipe_sha256: hex_digest(&[6; 32]),
-            runtime_image_reference: TEST_STUDENT_RUNTIME_IMAGE_REFERENCE.to_owned(),
-            max_gpu_seconds: None,
-            max_train_gpu_seconds: Some(STUDENT_MAX_TRAIN_GPU_SECONDS),
-            max_branch_gpu_seconds: Some(STUDENT_MAX_BRANCH_GPU_SECONDS),
-            max_total_gpu_seconds: Some(STUDENT_MAX_TOTAL_GPU_SECONDS),
+            student_train_runtime_image_reference: TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE
+                .to_owned(),
+            student_branch_runtime_image_reference: TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
+                .to_owned(),
+            max_train_gpu_seconds: STUDENT_MAX_TRAIN_GPU_SECONDS,
+            max_branch_gpu_seconds: STUDENT_MAX_BRANCH_GPU_SECONDS,
+            max_total_gpu_seconds: STUDENT_MAX_TOTAL_GPU_SECONDS,
             quality: StudentQualityGates {
                 min_mean_score_bps: STUDENT_MIN_MEAN_SCORE_BPS,
                 max_mean_loss_vs_bf16_bps: STUDENT_MAX_MEAN_LOSS_VS_BF16_BPS,
                 max_p95_latency_ms: STUDENT_MAX_P95_LATENCY_MS,
             },
             expires_at,
-            initial_stage: Some(StudentInitialStage::TrainMerge),
         };
         let student_job_id: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&definition).unwrap()).into();
         let claim = StudentJobClaim {
-            schema_version: "dragontales.student-job-claim.v3".to_owned(),
+            schema_version: "dragontales.student-job-claim.v4".to_owned(),
             scope: scope.clone(),
             student_job_id: hex_digest(&student_job_id),
             definition,
@@ -17485,7 +17596,7 @@ mod tests {
             StudentVariant::StaticFp8 => StudentModelVerificationVariant::Static,
         };
         StudentGpuEvidence {
-            schema_version: "dragontales.student-gpu-evidence.v1".to_owned(),
+            schema_version: "dragontales.student-gpu-evidence.v2".to_owned(),
             student_job_id: student_job_id.to_owned(),
             mode: StudentGpuMode::H100,
             recipe_sha256: recipe_sha256.to_owned(),
@@ -17496,7 +17607,7 @@ mod tests {
                 compute_capability: [9, 0],
                 total_memory_bytes: 80 * 1_024 * 1_024 * 1_024,
             },
-            runtime: StudentRuntimeProbe {
+            runtime: StudentRuntimeProbe::Branch {
                 schema_version: "dragontales.h100-fp8-image-probe.v2".to_owned(),
                 platform: "linux/amd64".to_owned(),
                 vllm_version: STUDENT_VLLM_VERSION.to_owned(),
@@ -17520,6 +17631,100 @@ mod tests {
                 occurrences: u64::from(variant != StudentVariant::Bf16),
             }],
         }
+    }
+
+    #[test]
+    fn student_gpu_evidence_is_bound_to_its_train_or_branch_runtime() {
+        let student_job_id = hex_digest(&[0x31; 32]);
+        let recipe_sha256 = hex_digest(&[0x32; 32]);
+        let train = StudentGpuEvidence {
+            schema_version: "dragontales.student-gpu-evidence.v2".to_owned(),
+            student_job_id: student_job_id.clone(),
+            mode: StudentGpuMode::H100,
+            recipe_sha256: recipe_sha256.clone(),
+            device: StudentGpuDevice {
+                uuid: Some("GPU-1234567890abcdef".to_owned()),
+                cuda: "12.8".to_owned(),
+                name: "NVIDIA H100".to_owned(),
+                compute_capability: [9, 0],
+                total_memory_bytes: 80 * 1_024 * 1_024 * 1_024,
+            },
+            runtime: StudentRuntimeProbe::Train {
+                schema_version: "dragontales.student-train-image-probe.v1".to_owned(),
+                platform: "linux/amd64".to_owned(),
+                prime_rl_version: STUDENT_PRIME_RL_VERSION.to_owned(),
+                accelerate_version: STUDENT_ACCELERATE_VERSION.to_owned(),
+                peft_version: STUDENT_PEFT_VERSION.to_owned(),
+                torch_cuda_version: STUDENT_TRAIN_TORCH_CUDA_VERSION.to_owned(),
+            },
+            kernels: Vec::new(),
+        };
+        validate_student_stage_gpu_evidence(
+            &student_job_id,
+            &recipe_sha256,
+            &train,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            validate_student_stage_gpu_evidence(
+                &student_job_id,
+                &recipe_sha256,
+                &train,
+                false,
+                Some(StudentVariant::Bf16),
+                true,
+            )
+            .is_err()
+        );
+
+        let branch =
+            winner_test_gpu_evidence(&student_job_id, &recipe_sha256, StudentVariant::Bf16);
+        validate_student_stage_gpu_evidence(
+            &student_job_id,
+            &recipe_sha256,
+            &branch,
+            false,
+            Some(StudentVariant::Bf16),
+            true,
+        )
+        .unwrap();
+        assert!(
+            validate_student_stage_gpu_evidence(
+                &student_job_id,
+                &recipe_sha256,
+                &branch,
+                false,
+                None,
+                false,
+            )
+            .is_err()
+        );
+
+        let mut failed_before_kernel = branch;
+        failed_before_kernel.kernels.clear();
+        validate_student_stage_gpu_evidence(
+            &student_job_id,
+            &recipe_sha256,
+            &failed_before_kernel,
+            false,
+            Some(StudentVariant::Bf16),
+            false,
+        )
+        .unwrap();
+        assert!(
+            validate_student_stage_gpu_evidence(
+                &student_job_id,
+                &recipe_sha256,
+                &failed_before_kernel,
+                false,
+                Some(StudentVariant::Bf16),
+                true,
+            )
+            .is_err()
+        );
     }
 
     async fn persist_gpu_launch_test_winner(
@@ -17567,7 +17772,8 @@ mod tests {
             scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             started_at,
             &sources,
         )
@@ -17795,13 +18001,14 @@ mod tests {
 
     fn winner_test_authority(now: DateTime<Utc>) -> WinnerDeploymentAuthority {
         WinnerDeploymentAuthority {
-            schema_version: "dragontales.winner-deployment-authority.v1".to_owned(),
+            schema_version: "dragontales.winner-deployment-authority.v2".to_owned(),
             provider_policy: WinnerProviderPolicy {
                 primary: crate::route::WINNER_PRIMARY_PROVIDER.to_owned(),
                 fallback: crate::route::WINNER_FALLBACK_PROVIDER.to_owned(),
             },
             provider_terms_sha256: hex_digest(&[0x41; 32]),
-            runtime_image_reference: TEST_STUDENT_RUNTIME_IMAGE_REFERENCE.to_owned(),
+            student_branch_runtime_image_reference: TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
+                .to_owned(),
             admission_program_sha256: hex_digest(&[0x42; 32]),
             authorization_not_after: now + TimeDelta::hours(4),
             max_wall_seconds: 3_600,
@@ -17925,7 +18132,9 @@ mod tests {
                 model_alias: "winner-model".to_owned(),
                 model_alias_sha256: hex_digest(&Sha256::digest(b"winner-model").into()),
                 candidate_api_key_sha256: hex_digest(&Sha256::digest(b"candidate-key").into()),
-                runtime_image_reference: claim.runtime_image_reference.clone(),
+                student_branch_runtime_image_reference: claim
+                    .student_branch_runtime_image_reference
+                    .clone(),
                 admission_program_sha256: claim.authority.admission_program_sha256.clone(),
                 execution_id: "winner-execution-1".to_owned(),
                 execution_name: "winner-deployment".to_owned(),
@@ -18150,14 +18359,14 @@ mod tests {
         let claim_receipt_json = serde_json::to_string(&claim_receipt).unwrap();
         assert!(
             claim_receipt_json
-                .contains("\"schema_version\":\"dragontales.student-job-claim-receipt.v2\"")
+                .contains("\"schema_version\":\"dragontales.student-job-claim-receipt.v3\"")
         );
         assert!(claim_receipt_json.contains(
-            "\"counts\":{\"train\":50,\"dev\":73,\"calibration\":128},\"runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"state\":\"claimed\""
+            "\"counts\":{\"train\":50,\"dev\":73,\"calibration\":128},\"student_train_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-train@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"state\":\"claimed\""
         ));
         let definition_json = serde_json::to_string(&parent.definition).unwrap();
         assert!(definition_json.contains(
-            "\"recipe_sha256\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"max_train_gpu_seconds\":1800,\"max_branch_gpu_seconds\":1800,\"max_total_gpu_seconds\":7200,\"quality\""
+            "\"recipe_sha256\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"student_train_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-train@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"max_train_gpu_seconds\":1800,\"max_branch_gpu_seconds\":1800,\"max_total_gpu_seconds\":7200,\"quality\""
         ));
         assert!(!definition_json.contains("\"max_gpu_seconds\":"));
         let train = StudentTrainResult {
@@ -18177,21 +18386,21 @@ mod tests {
         };
         let fanout = prepare_student_fanout_claim(&parent, &train, train.finished_at).unwrap();
         let fanout_json = serde_json::to_string(&fanout).unwrap();
-        assert!(fanout_json.contains("\"schema_version\":\"dragontales.student-fanout-claim.v3\""));
+        assert!(fanout_json.contains("\"schema_version\":\"dragontales.student-fanout-claim.v4\""));
         assert!(fanout_json.contains(
-            "\"recipe_sha256\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"max_total_gpu_seconds\":7200,\"created_at\""
+            "\"recipe_sha256\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"max_total_gpu_seconds\":7200,\"created_at\""
         ));
         let launch =
             student_fanout_launch_write(&fanout, fanout_json.as_bytes(), "fanout.json".to_owned());
         let launch_json = serde_json::to_string(&launch).unwrap();
         assert!(
-            launch_json.contains("\"schema_version\":\"dragontales.student-fanout-launch.v2\"")
+            launch_json.contains("\"schema_version\":\"dragontales.student-fanout-launch.v3\"")
         );
         assert!(launch_json.contains(
-            "\"runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"branches\""
+            "\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"branches\""
         ));
         let mut obsolete_fanout = fanout.clone();
-        obsolete_fanout.schema_version = "dragontales.student-fanout-claim.v2".to_owned();
+        obsolete_fanout.schema_version = "dragontales.student-fanout-claim.v3".to_owned();
         let obsolete_fanout_payload = serde_json::to_vec(&obsolete_fanout).unwrap();
         assert!(
             validate_student_fanout_claim(
@@ -18279,7 +18488,7 @@ mod tests {
         );
 
         let mut aggregate_parent = parent.clone();
-        aggregate_parent.definition.max_total_gpu_seconds = Some(239);
+        aggregate_parent.definition.max_total_gpu_seconds = 239;
         let mut aggregate_fanout = fanout.clone();
         aggregate_fanout.max_total_gpu_seconds = 239;
         assert!(
@@ -18439,7 +18648,8 @@ mod tests {
             &scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             now,
             &first,
         )
@@ -18492,7 +18702,8 @@ mod tests {
             &scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             now + TimeDelta::seconds(1),
             &frontier,
         )
@@ -18553,7 +18764,8 @@ mod tests {
             &scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             now,
             &sources,
         )
@@ -18613,7 +18825,8 @@ mod tests {
             &scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             started_at,
             &sources,
         )
@@ -18706,7 +18919,8 @@ mod tests {
             &scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             now,
             &sources,
         )
@@ -18729,7 +18943,8 @@ mod tests {
             &scope,
             &provider_binding_sha256,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             now,
             &sources,
         )
@@ -18745,7 +18960,8 @@ mod tests {
                 &scope,
                 &provider_binding_sha256,
                 &recipe_sha256,
-                TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+                TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
                 now,
                 &insufficient,
             )
@@ -18768,7 +18984,8 @@ mod tests {
                 &scope,
                 &provider_binding_sha256,
                 &recipe_sha256,
-                TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+                TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
                 now,
                 &duplicate_sources,
             )
@@ -18792,7 +19009,8 @@ mod tests {
                 &scope,
                 &provider_binding_sha256,
                 &recipe_sha256,
-                TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+                TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
                 now,
                 &duplicate_sources,
             )
@@ -18801,13 +19019,18 @@ mod tests {
         );
 
         assert_eq!(
-            claim.definition.runtime_image_reference,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE
+            claim.definition.student_train_runtime_image_reference,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE
+        );
+        assert_eq!(
+            claim.definition.student_branch_runtime_image_reference,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
         );
         validate_student_execution_authority(
             &claim,
             &recipe_sha256,
-            TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
         )
         .unwrap();
         assert!(
@@ -18815,9 +19038,56 @@ mod tests {
                 &claim,
                 &recipe_sha256,
                 concat!(
-                    "ghcr.io/milkinfrastructure/milk-student@sha256:",
+                    "ghcr.io/milkinfrastructure/milk-student-train@sha256:",
                     "5555555555555555555555555555555555555555555555555555555555555555"
                 ),
+                TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
+            )
+            .is_err()
+        );
+        let changed_branch_reference = concat!(
+            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:",
+            "7777777777777777777777777777777777777777777777777777777777777777"
+        );
+        let same_digest_branch_reference = concat!(
+            "ghcr.io/another-owner/another-image@sha256:",
+            "4444444444444444444444444444444444444444444444444444444444444444"
+        );
+        assert!(
+            prepare_student_job_claim(
+                &scope,
+                &provider_binding_sha256,
+                &recipe_sha256,
+                TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                same_digest_branch_reference,
+                now,
+                &sources,
+            )
+            .is_err()
+        );
+        let mut same_digest_claim = claim.clone();
+        same_digest_claim
+            .definition
+            .student_branch_runtime_image_reference = same_digest_branch_reference.to_owned();
+        let same_digest_job_id: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&same_digest_claim.definition).unwrap()).into();
+        same_digest_claim.student_job_id = hex_digest(&same_digest_job_id);
+        let same_digest_payload = serde_json::to_vec(&same_digest_claim).unwrap();
+        assert!(
+            validate_student_job_claim(
+                &scope,
+                &same_digest_job_id,
+                &same_digest_claim,
+                &same_digest_payload,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_student_execution_authority(
+                &claim,
+                &recipe_sha256,
+                TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                changed_branch_reference,
             )
             .is_err()
         );
@@ -18826,9 +19096,10 @@ mod tests {
             &provider_binding_sha256,
             &recipe_sha256,
             concat!(
-                "ghcr.io/milkinfrastructure/milk-student@sha256:",
+                "ghcr.io/milkinfrastructure/milk-student-train@sha256:",
                 "5555555555555555555555555555555555555555555555555555555555555555"
             ),
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
             now,
             &sources,
         )
@@ -18836,12 +19107,38 @@ mod tests {
         .unwrap()
         .0;
         assert_ne!(changed_image.student_job_id, claim.student_job_id);
+        let changed_branch_image = prepare_student_job_claim(
+            &scope,
+            &provider_binding_sha256,
+            &recipe_sha256,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+            changed_branch_reference,
+            now,
+            &sources,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_ne!(changed_branch_image.student_job_id, claim.student_job_id);
         assert!(
             prepare_student_job_claim(
                 &scope,
                 &provider_binding_sha256,
                 &recipe_sha256,
-                "ghcr.io/milkinfrastructure/milk-student:latest",
+                "ghcr.io/milkinfrastructure/milk-student-train:latest",
+                TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
+                now,
+                &sources,
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_student_job_claim(
+                &scope,
+                &provider_binding_sha256,
+                &recipe_sha256,
+                TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                "ghcr.io/milkinfrastructure/milk-student-branch:latest",
                 now,
                 &sources,
             )
@@ -19689,6 +19986,10 @@ mod tests {
         );
         assert_eq!(launch.max_wall_seconds, authority.max_wall_seconds);
         assert_eq!(launch.max_cost_microusd, authority.max_cost_microusd);
+        assert_eq!(
+            launch.student_branch_runtime_image_reference,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
+        );
 
         let mut rotated = authority;
         rotated.provider_terms_sha256 = hex_digest(&[0x51; 32]);
@@ -19711,6 +20012,10 @@ mod tests {
         );
         let (_, outbox) =
             student_winner_deployment_gpu_launch_outbox(&scope, &claim, &claim_payload).unwrap();
+        assert_eq!(
+            outbox.runtime_image_reference,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
+        );
         let dispatch_id = decode_hex_digest(&outbox.dispatch_id).unwrap();
         let frontier_key = gpu_launch_frontier_key(&scope, outbox.expires_at, &dispatch_id);
         assert!(store.exists(&frontier_key).await.unwrap());
@@ -20618,6 +20923,10 @@ mod tests {
             student_train_gpu_launch_outbox(&scope, &student, &student_payload).unwrap();
         let student_claim_sha256 = hex_digest(&Sha256::digest(&student_payload).into());
         assert_eq!(train_outbox.dispatch_id, student_claim_sha256);
+        assert_eq!(
+            train_outbox.runtime_image_reference,
+            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE
+        );
         assert!(matches!(
             train_outbox.operation,
             GpuLaunchOperation::StudentTrainMerge {
@@ -20656,6 +20965,10 @@ mod tests {
         let fanout_claim_sha256 = hex_digest(&Sha256::digest(&fanout_payload).into());
         assert_eq!(fanout_outbox.dispatch_id, fanout_claim_sha256);
         assert_eq!(fanout_outbox.claim_sha256, fanout_claim_sha256);
+        assert_eq!(
+            fanout_outbox.runtime_image_reference,
+            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
+        );
         assert!(matches!(
             &fanout_outbox.operation,
             GpuLaunchOperation::StudentFanout {
@@ -22523,7 +22836,8 @@ mod tests {
                     &scope,
                     &current_provider,
                     &[9; 32],
-                    TEST_STUDENT_RUNTIME_IMAGE_REFERENCE,
+                    TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
+                    TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
                     now,
                 )
                 .await
