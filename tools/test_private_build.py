@@ -390,6 +390,12 @@ class PrivateBuildScriptTests(unittest.TestCase):
         self.test_root = Path(self.temporary.name)
         self.bin = self.test_root / "bin"
         self.bin.mkdir()
+        self.buildx_plugin = (
+            self.test_root / "home" / ".docker" / "cli-plugins" / "docker-buildx"
+        )
+        self.buildx_plugin.parent.mkdir(parents=True)
+        self.buildx_plugin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.buildx_plugin.chmod(0o700)
         self.command_log = self.test_root / "commands.log"
         self.revision = "4" * 40
         self.source_context = self.test_root / "source-context.tar"
@@ -532,7 +538,10 @@ class PrivateBuildScriptTests(unittest.TestCase):
                 printf 'docker' >>"$TEST_COMMAND_LOG"
                 for argument do printf '|%s' "$argument" >>"$TEST_COMMAND_LOG"; done
                 printf '\n' >>"$TEST_COMMAND_LOG"
-                if [ "${1:-}" = --config ]; then shift 2; fi
+                if [ "${1:-}" = --config ]; then
+                  [ -x "$2/cli-plugins/docker-buildx" ] || exit 94
+                  shift 2
+                fi
                 case "${1:-} ${2:-}" in
                   'context show') printf '%s\n' 'desktop-linux' ;;
                   'context inspect') printf '%s\n' "${TEST_ENDPOINT:-unix:///tmp/test-docker.sock}" ;;
@@ -641,6 +650,16 @@ class PrivateBuildScriptTests(unittest.TestCase):
         self.assertIn("/milk-gateway-release.", build_line)
         self.assertEqual(commands.count("|buildx|create|"), 1)
         self.assertEqual(commands.count("|buildx|rm|"), 1)
+        version_lines = [line for line in commands.splitlines() if "|buildx|version" in line]
+        self.assertEqual(len(version_lines), 2)
+        self.assertTrue(any("|--config|" in line for line in version_lines))
+
+    def test_requires_buildx_plugin_in_a_standard_location(self):
+        self.buildx_plugin.unlink()
+        result, evidence = self._run("missing-buildx-plugin")
+        self.assertEqual(result.returncode, 69, result.stderr)
+        self.assertIn("plugin is unavailable in standard locations", result.stderr)
+        self.assertFalse(evidence.exists())
 
     def test_public_preexisting_package_fails_before_build(self):
         result, evidence = self._run(
