@@ -1,0 +1,56 @@
+{
+  "listen": "127.0.0.1:8080",
+  "traffic_keys": [
+    {
+      "api_key_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "cohort_id": "production-cohort-v1"
+    }
+  ],
+  "outcome_key_id": "00000000-0000-4000-8000-000000000002",
+  "outcome_key_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "tenant_id": "00000000-0000-4000-8000-000000000010",
+  "project_id": "00000000-0000-4000-8000-000000000011",
+  "environment_id": "00000000-0000-4000-8000-000000000012",
+  "workload_id": "00000000-0000-4000-8000-000000000013",
+  "max_request_bytes": 8388608,
+  "max_in_flight": 4,
+  "max_outcomes_in_flight": 2,
+  "max_active_body_bytes": 201326592,
+  "request_body_timeout_ms": 10000,
+  "connect_timeout_ms": 5000,
+  "read_timeout_ms": 120000,
+  "total_timeout_ms": 120000,
+  "storage_timeout_ms": 10000,
+  "capture_mode": "whole_body_authorized",
+  "capture_basis_points": 1000,
+  "capture_response_bytes": 8388608,
+  "capture_record_bytes": 16777216,
+  "capture_queue_bytes": 67108864,
+  "capture_policy_version": "self-host-owner-v1",
+  "capture_rights_state": "owner_authorized",
+  "capture_retention_days": 30,
+  "outcome_kind": "corrected_output",
+  "outcome_verifier_id": "customer-correction-v1",
+  "outcome_rights_state": "contract-reviewed-v1",
+  "outcome_retention_days": 30,
+  "allow_student_fixture": false,
+  "stores": {
+    "capture": {
+      "type": "local",
+      "root": "/var/lib/dragontales/capture"
+    },
+    "control": {
+      "type": "local",
+      "root": "/var/lib/dragontales/control"
+    },
+    "routes": {
+      "type": "local",
+      "root": "/var/lib/dragontales/routes"
+    }
+  },
+  "baseline": {
+    "chat_completions_url": "https://api.openai.com/v1/chat/completions",
+    "allow_loopback_http": false
+  },
+  "route": null
+}

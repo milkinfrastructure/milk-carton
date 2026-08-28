@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!crates/
+!crates/dragontales-gateway/
+!crates/dragontales-gateway/**
+!deploy/
+!deploy/cloudflare/
+!deploy/cloudflare/Dockerfile
+!deploy/licenses/
+!deploy/licenses/bundle-rust.sh

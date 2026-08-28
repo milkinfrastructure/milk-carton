@@ -1,0 +1,5 @@
+/.build-context/
+/.wrangler/
+.dev.vars*
+node_modules/
+wrangler-account.json

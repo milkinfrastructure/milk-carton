@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+REPOSITORY = "ghcr.io/milkinfrastructure/milk-gateway"
+SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-gateway"
+GITHUB_USERNAME = "ShantanuJoshi"
+BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
+BUILDKIT_VERSION = "v0.23.2"
+DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+BUILDKIT_BUILD_TYPE = "https://mobyproject.org/buildkit@v1"
+BASE_IMAGE_SHA256 = {
+    "6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1",
+    "d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a",
+}
+SLSA_V1 = "https://slsa.dev/provenance/v1"
+SPDX = "https://spdx.dev/Document"
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+TAGGED = re.compile(r"ghcr\.io/milkinfrastructure/milk-gateway:source-[0-9a-f]{40}\Z")
+COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+MAX_TOKEN_BYTES = 8_192
+MAX_AUTH_BYTES = 1_048_576
+MAX_BLOB_BYTES = 67_108_864
+
+
+def _object(raw, label):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise ValueError(f"{label} contains a duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _digest(raw):
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _descriptor(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} is not a descriptor")
+    digest = value.get("digest")
+    size = value.get("size")
+    media_type = value.get("mediaType")
+    if DIGEST.fullmatch(digest if isinstance(digest, str) else "") is None:
+        raise ValueError(f"{label} digest is invalid")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise ValueError(f"{label} size is invalid")
+    if not isinstance(media_type, str) or not media_type:
+        raise ValueError(f"{label} media type is invalid")
+    return digest, size, media_type
+
+
+def _run(*arguments):
+    return subprocess.run(
+        arguments,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        redirected = super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+        if redirected is None:
+            return None
+        old_host = urllib.parse.urlsplit(request.full_url).hostname
+        new_host = urllib.parse.urlsplit(new_url).hostname
+        if old_host != new_host:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def _open_bytes(request, limit, label):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SafeRedirect())
+    try:
+        with opener.open(request, timeout=60) as response:
+            if urllib.parse.urlsplit(response.url).scheme != "https":
+                raise ValueError(f"{label} left HTTPS")
+            declared = response.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    declared_size = int(declared)
+                except ValueError as error:
+                    raise ValueError(f"{label} Content-Length is invalid") from error
+                if declared_size < 0 or declared_size > limit:
+                    raise ValueError(f"{label} exceeds its byte limit")
+            raw = response.read(limit + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise ValueError(f"cannot fetch {label}") from None
+    if len(raw) > limit:
+        raise ValueError(f"{label} exceeds its byte limit")
+    return raw
+
+
+def _registry_bearer(github_token):
+    query = urllib.parse.urlencode(
+        {
+            "service": "ghcr.io",
+            "scope": "repository:milkinfrastructure/milk-gateway:pull",
+        }
+    )
+    basic = base64.b64encode(
+        f"{GITHUB_USERNAME}:{github_token}".encode("ascii")
+    ).decode("ascii")
+    request = urllib.request.Request(
+        "https://ghcr.io/token?" + query,
+        headers={
+            "Accept": "application/json",
+            "Authorization": "Basic " + basic,
+            "User-Agent": "milk-gateway-release/1",
+        },
+    )
+    response = _object(_open_bytes(request, MAX_AUTH_BYTES, "GHCR authorization"), "GHCR authorization")
+    bearer = response.get("token", response.get("access_token"))
+    if not isinstance(bearer, str) or not bearer or len(bearer) > MAX_TOKEN_BYTES:
+        raise ValueError("GHCR authorization returned no bounded token")
+    return bearer
+
+
+def _registry_blob(bearer, digest):
+    if DIGEST.fullmatch(digest) is None:
+        raise ValueError("registry blob digest is invalid")
+    request = urllib.request.Request(
+        "https://ghcr.io/v2/milkinfrastructure/milk-gateway/blobs/"
+        + urllib.parse.quote(digest, safe=":"),
+        headers={
+            "Accept": "application/octet-stream",
+            "Authorization": "Bearer " + bearer,
+            "User-Agent": "milk-gateway-release/1",
+        },
+    )
+    raw = _open_bytes(request, MAX_BLOB_BYTES, "GHCR content blob")
+    if _digest(raw) != digest:
+        raise ValueError("GHCR content blob differs from its descriptor digest")
+    return raw
+
+
+def _subject_binds(statement, child_digest):
+    subjects = statement.get("subject")
+    if not isinstance(subjects, list) or not subjects:
+        return False
+    child_sha256 = child_digest.removeprefix("sha256:")
+    return any(
+        isinstance(subject, dict)
+        and isinstance(subject.get("digest"), dict)
+        and subject["digest"].get("sha256") == child_sha256
+        for subject in subjects
+    )
+
+
+def _write_new(path, raw):
+    with path.open("xb") as output:
+        output.write(raw)
+
+
+def _validate_slsa(predicate, arguments):
+    if set(predicate) != {"buildDefinition", "runDetails"}:
+        raise ValueError("SLSA v1 provenance predicate is not strict")
+    definition = predicate["buildDefinition"]
+    details = predicate["runDetails"]
+    if not isinstance(definition, dict) or set(definition) != {
+        "buildType", "externalParameters", "internalParameters", "resolvedDependencies",
+    }:
+        raise ValueError("SLSA v1 build definition is invalid")
+    if definition["buildType"] != BUILDKIT_BUILD_TYPE:
+        raise ValueError("SLSA v1 build type is not BuildKit")
+    external = definition["externalParameters"]
+    if not isinstance(external, dict) or set(external) != {
+        "source", "frontend", "args", "locals",
+    }:
+        raise ValueError("SLSA v1 external parameters are invalid")
+    if external["source"] is not None or external["frontend"] != "dockerfile.v0":
+        raise ValueError("SLSA v1 frontend parameters are invalid")
+    locals_ = external["locals"]
+    if (
+        not isinstance(locals_, list)
+        or sorted(item.get("name", "") for item in locals_ if isinstance(item, dict))
+        != ["context", "dockerfile"]
+        or any(not isinstance(item, dict) or set(item) != {"name"} for item in locals_)
+    ):
+        raise ValueError("SLSA v1 local inputs are invalid")
+    expected = {
+        "build-arg:BUILDKIT_SYNTAX": DOCKERFILE_FRONTEND,
+        "build-arg:MILK_BUILDKIT_IMAGE_REFERENCE": BUILDKIT_IMAGE,
+        "build-arg:MILK_SOURCE_COMMIT": arguments.source_commit,
+        "build-arg:MILK_SOURCE_CONTEXT_SHA256": arguments.source_context_sha256,
+        "build-arg:SOURCE_DATE_EPOCH": str(arguments.source_date_epoch),
+        "label:org.opencontainers.image.revision": arguments.source_commit,
+        "label:org.opencontainers.image.source": SOURCE_REPOSITORY,
+    }
+    parameters = external["args"]
+    if not isinstance(parameters, dict) or any(
+        not isinstance(key, str)
+        or not isinstance(value, str)
+        or len(key) > 256
+        or len(value) > 4096
+        for key, value in parameters.items()
+    ):
+        raise ValueError("SLSA v1 build arguments are invalid")
+    if any(parameters.get(key) != value for key, value in expected.items()):
+        raise ValueError("SLSA v1 build arguments do not bind release inputs")
+    if any(
+        key.startswith("build-arg:") and key not in expected
+        or key.startswith("label:") and key not in expected
+        for key in parameters
+    ):
+        raise ValueError("SLSA v1 build arguments contain unauthorized parameters")
+    if not isinstance(definition["internalParameters"], dict):
+        raise ValueError("SLSA v1 internal parameters are invalid")
+    dependencies = definition["resolvedDependencies"]
+    if not isinstance(dependencies, list) or not 3 <= len(dependencies) <= 32:
+        raise ValueError("SLSA v1 resolved dependencies are invalid")
+    dependency_sha256 = set()
+    dependency_uris = set()
+    for dependency in dependencies:
+        if not isinstance(dependency, dict) or not set(dependency).issubset({
+            "name", "uri", "digest", "content", "downloadLocation", "mediaType", "annotations",
+        }):
+            raise ValueError("SLSA v1 resolved dependency is invalid")
+        uri = dependency.get("uri")
+        digests = dependency.get("digest")
+        if (
+            not isinstance(uri, str)
+            or not 1 <= len(uri) <= 4096
+            or uri in dependency_uris
+            or not isinstance(digests, dict)
+            or set(digests) != {"sha256"}
+            or SHA256.fullmatch(digests["sha256"] if isinstance(digests["sha256"], str) else "") is None
+        ):
+            raise ValueError("SLSA v1 resolved dependency identity is invalid")
+        dependency_uris.add(uri)
+        dependency_sha256.add(digests["sha256"])
+    expected_dependencies = BASE_IMAGE_SHA256 | {DOCKERFILE_FRONTEND.rsplit("@sha256:", 1)[1]}
+    if not expected_dependencies.issubset(dependency_sha256):
+        raise ValueError("SLSA v1 dependencies do not bind the frontend and base images")
+
+    if not isinstance(details, dict) or not {"builder", "metadata"}.issubset(details) or not set(
+        details
+    ).issubset({"builder", "metadata", "byproducts"}):
+        raise ValueError("SLSA v1 run details are invalid")
+    builder = details["builder"]
+    metadata = details["metadata"]
+    if (
+        not isinstance(builder, dict)
+        or set(builder) != {"id"}
+        or not isinstance(builder["id"], str)
+        or not 1 <= len(builder["id"]) <= 4096
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"invocationId", "startedOn", "finishedOn"}
+        or any(not isinstance(metadata[key], str) or not metadata[key] for key in (
+            "invocationId", "startedOn", "finishedOn"
+        ))
+        or ("byproducts" in details and not isinstance(details["byproducts"], list))
+    ):
+        raise ValueError("SLSA v1 run details are incomplete")
+
+
+def _validate_spdx(predicate):
+    if (
+        not isinstance(predicate.get("spdxVersion"), str)
+        or predicate["spdxVersion"] != "SPDX-2.3"
+        or predicate.get("SPDXID") != "SPDXRef-DOCUMENT"
+    ):
+        raise ValueError("SPDX document identity is invalid")
+    packages = predicate.get("packages")
+    if (
+        not isinstance(packages, list)
+        or not 1 <= len(packages) <= 50_000
+    ):
+        raise ValueError("SPDX document packages are incomplete")
+    package_ids = set()
+    sha256_checksums = 0
+    for package in packages:
+        if not isinstance(package, dict):
+            raise ValueError("SPDX package is invalid")
+        identifier = package.get("SPDXID")
+        if (
+            not isinstance(identifier, str)
+            or not identifier.startswith("SPDXRef-")
+            or identifier in package_ids
+            or not isinstance(package.get("name"), str)
+            or not package["name"]
+        ):
+            raise ValueError("SPDX package identity is invalid")
+        package_ids.add(identifier)
+        checksums = package.get("checksums", [])
+        if not isinstance(checksums, list):
+            raise ValueError("SPDX package checksums are invalid")
+        for checksum in checksums:
+            if not isinstance(checksum, dict) or set(checksum) != {"algorithm", "checksumValue"}:
+                raise ValueError("SPDX package checksum is invalid")
+            if checksum["algorithm"] == "SHA256":
+                if SHA256.fullmatch(checksum["checksumValue"] if isinstance(checksum["checksumValue"], str) else "") is None:
+                    raise ValueError("SPDX package SHA-256 is invalid")
+                sha256_checksums += 1
+    files = predicate.get("files", [])
+    if not isinstance(files, list) or len(files) > 100_000:
+        raise ValueError("SPDX file inventory is invalid")
+    for file_ in files:
+        if not isinstance(file_, dict) or not isinstance(file_.get("checksums", []), list):
+            raise ValueError("SPDX file checksum inventory is invalid")
+        for checksum in file_.get("checksums", []):
+            if not isinstance(checksum, dict) or set(checksum) != {"algorithm", "checksumValue"}:
+                raise ValueError("SPDX file checksum is invalid")
+            if checksum["algorithm"] == "SHA256":
+                if SHA256.fullmatch(checksum["checksumValue"] if isinstance(checksum["checksumValue"], str) else "") is None:
+                    raise ValueError("SPDX file SHA-256 is invalid")
+                sha256_checksums += 1
+    if sha256_checksums == 0:
+        raise ValueError("SPDX document has no image-bound SHA-256 checksum")
+
+
+def verify(arguments, github_token):
+    if TAGGED.fullmatch(arguments.tagged_reference) is None:
+        raise ValueError("tagged reference is invalid")
+    if COMMIT.fullmatch(arguments.source_commit) is None:
+        raise ValueError("source commit is invalid")
+    expected_tag = REPOSITORY + ":source-" + arguments.source_commit
+    if arguments.tagged_reference != expected_tag:
+        raise ValueError("tagged reference does not bind the source commit")
+    if not isinstance(arguments.source_date_epoch, int) or arguments.source_date_epoch <= 0:
+        raise ValueError("source date epoch is invalid")
+    if SHA256.fullmatch(arguments.source_context_sha256) is None:
+        raise ValueError("source context digest is invalid")
+    if not arguments.evidence_dir.is_absolute() or not arguments.evidence_dir.is_dir():
+        raise ValueError("evidence directory must be an existing absolute directory")
+    if not arguments.docker_config.is_absolute() or not arguments.docker_config.is_dir():
+        raise ValueError("Docker configuration must be an existing absolute directory")
+    if not arguments.metadata.is_file():
+        raise ValueError("build metadata is missing")
+
+    metadata = _object(arguments.metadata.read_bytes(), "build metadata")
+    index_digest = metadata.get("containerimage.digest")
+    if DIGEST.fullmatch(index_digest if isinstance(index_digest, str) else "") is None:
+        raise ValueError("build metadata has no immutable index digest")
+    immutable_reference = REPOSITORY + "@" + index_digest
+    docker_prefix = ("docker", "--config", str(arguments.docker_config), "buildx", "imagetools", "inspect", "--raw")
+
+    raw_index = _run(*docker_prefix, immutable_reference)
+    if _digest(raw_index) != index_digest:
+        raise ValueError("registry index differs from the build digest")
+    index = _object(raw_index, "registry index")
+    if index.get("schemaVersion") != 2:
+        raise ValueError("registry index schema is invalid")
+    if index.get("mediaType") not in {
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+    }:
+        raise ValueError("registry index media type is invalid")
+    manifests = index.get("manifests")
+    if not isinstance(manifests, list):
+        raise ValueError("registry index has no descriptor list")
+    runnable = []
+    attestations = []
+    for descriptor in manifests:
+        _descriptor(descriptor, "registry index descriptor")
+        platform = descriptor.get("platform")
+        annotations = descriptor.get("annotations")
+        if platform == {"architecture": "amd64", "os": "linux"}:
+            runnable.append(descriptor)
+        elif (
+            platform == {"architecture": "unknown", "os": "unknown"}
+            and isinstance(annotations, dict)
+            and annotations.get("vnd.docker.reference.type") == "attestation-manifest"
+        ):
+            attestations.append(descriptor)
+        else:
+            raise ValueError("registry index contains an unauthorized descriptor")
+    if len(runnable) != 1 or len(attestations) != 1:
+        raise ValueError("registry index must contain one runnable image and one attestation manifest")
+    child_digest, child_size, _ = _descriptor(runnable[0], "runnable image")
+    attestation_digest, attestation_size, _ = _descriptor(attestations[0], "attestation manifest")
+    if attestations[0]["annotations"].get("vnd.docker.reference.digest") != child_digest:
+        raise ValueError("attestation manifest does not bind the runnable image")
+
+    raw_manifest = _run(*docker_prefix, REPOSITORY + "@" + child_digest)
+    if _digest(raw_manifest) != child_digest or len(raw_manifest) != child_size:
+        raise ValueError("runnable manifest differs from its descriptor")
+    manifest = _object(raw_manifest, "runnable manifest")
+    if manifest.get("schemaVersion") != 2:
+        raise ValueError("runnable manifest schema is invalid")
+    config_descriptor = manifest.get("config")
+    config_digest, config_size, _ = _descriptor(config_descriptor, "runtime configuration")
+    layers = manifest.get("layers")
+    if not isinstance(layers, list):
+        raise ValueError("runnable manifest has no layer list")
+    for layer in layers:
+        _descriptor(layer, "runnable layer")
+
+    raw_attestation = _run(*docker_prefix, REPOSITORY + "@" + attestation_digest)
+    if _digest(raw_attestation) != attestation_digest or len(raw_attestation) != attestation_size:
+        raise ValueError("attestation manifest differs from its descriptor")
+    attestation = _object(raw_attestation, "attestation manifest")
+    if attestation.get("schemaVersion") != 2:
+        raise ValueError("attestation manifest schema is invalid")
+    if attestation.get("artifactType") != "application/vnd.docker.attestation.manifest.v1+json":
+        raise ValueError("attestation artifact type is invalid")
+    attestation_subject = attestation.get("subject")
+    if attestation_subject is not None and (
+        not isinstance(attestation_subject, dict)
+        or attestation_subject.get("digest") != child_digest
+    ):
+        raise ValueError("attestation manifest subject is invalid")
+    attestation_layers = attestation.get("layers")
+    if not isinstance(attestation_layers, list) or len(attestation_layers) != 2:
+        raise ValueError("attestation manifest must contain exactly two statements")
+
+    bearer = _registry_bearer(github_token)
+    raw_config = _registry_blob(bearer, config_digest)
+    if len(raw_config) != config_size:
+        raise ValueError("runtime configuration size differs from its descriptor")
+    config = _object(raw_config, "runtime configuration")
+    if config.get("architecture") != "amd64" or config.get("os") != "linux":
+        raise ValueError("runtime configuration platform is not linux/amd64")
+    runtime = config.get("config")
+    if not isinstance(runtime, dict):
+        raise ValueError("runtime configuration payload is missing")
+    if runtime.get("User") != "65532:65532":
+        raise ValueError("gateway runtime user is not 65532:65532")
+    if runtime.get("Entrypoint") != ["/usr/local/bin/dragontales-gateway"]:
+        raise ValueError("gateway runtime entrypoint is invalid")
+    if runtime.get("Cmd") != ["serve"]:
+        raise ValueError("gateway runtime command is invalid")
+    labels = runtime.get("Labels")
+    if not isinstance(labels, dict):
+        raise ValueError("gateway runtime labels are missing")
+    if labels.get("org.opencontainers.image.source") != SOURCE_REPOSITORY:
+        raise ValueError("gateway source label is invalid")
+    if labels.get("org.opencontainers.image.revision") != arguments.source_commit:
+        raise ValueError("gateway revision label is invalid")
+    rootfs = config.get("rootfs")
+    if not isinstance(rootfs, dict) or rootfs.get("type") != "layers":
+        raise ValueError("gateway root filesystem is invalid")
+    diff_ids = rootfs.get("diff_ids")
+    if not isinstance(diff_ids, list) or len(diff_ids) != len(layers):
+        raise ValueError("gateway root filesystem does not bind every layer")
+    if any(DIGEST.fullmatch(item if isinstance(item, str) else "") is None for item in diff_ids):
+        raise ValueError("gateway root filesystem digest is invalid")
+
+    statements = []
+    statement_raw = {}
+    for layer in attestation_layers:
+        layer_digest, layer_size, layer_media_type = _descriptor(layer, "attestation statement")
+        annotations = layer.get("annotations")
+        if layer_media_type != "application/vnd.in-toto+json" or not isinstance(annotations, dict):
+            raise ValueError("attestation statement descriptor is invalid")
+        declared_predicate = annotations.get("in-toto.io/predicate-type")
+        if declared_predicate not in {SLSA_V1, SPDX}:
+            raise ValueError("attestation statement predicate is unauthorized")
+        raw_statement = _registry_blob(bearer, layer_digest)
+        if len(raw_statement) != layer_size:
+            raise ValueError("attestation statement size differs from its descriptor")
+        statement = _object(raw_statement, "attestation statement")
+        if statement.get("_type") != "https://in-toto.io/Statement/v0.1":
+            raise ValueError("attestation statement type is invalid")
+        if statement.get("predicateType") != declared_predicate:
+            raise ValueError("attestation statement predicate differs from its descriptor")
+        if not _subject_binds(statement, child_digest):
+            raise ValueError("attestation statement does not bind the runnable image")
+        predicate = statement.get("predicate")
+        if not isinstance(predicate, dict):
+            raise ValueError("attestation statement predicate payload is missing")
+        if declared_predicate == SLSA_V1:
+            _validate_slsa(predicate, arguments)
+        else:
+            _validate_spdx(predicate)
+        if declared_predicate in statement_raw:
+            raise ValueError("attestation predicate is duplicated")
+        statement_raw[declared_predicate] = raw_statement
+        statements.append(
+            {
+                "layer_sha256": layer_digest.removeprefix("sha256:"),
+                "predicate_type": declared_predicate,
+            }
+        )
+    if set(statement_raw) != {SLSA_V1, SPDX}:
+        raise ValueError("SLSA v1 provenance and SPDX SBOM are both required")
+    statements.sort(key=lambda item: (item["predicate_type"], item["layer_sha256"]))
+
+    visibility = _run(
+        "gh",
+        "api",
+        "--hostname",
+        "github.com",
+        "/orgs/milkinfrastructure/packages/container/milk-gateway",
+        "--jq",
+        ".visibility",
+    ).decode("utf-8", errors="strict").strip()
+    if visibility != "private":
+        raise ValueError("Milk gateway package is not private")
+
+    build_log = _object(
+        arguments.evidence_dir.joinpath("build-log.json").read_bytes(),
+        "build log observation",
+    )
+    if (
+        build_log.get("schema_version") != "milk.content-free-build-log.v1"
+        or build_log.get("artifact") != "gateway"
+        or build_log.get("exit_code") != 0
+        or build_log.get("content_retained") is not False
+        or SHA256.fullmatch(build_log.get("sha256", "")) is None
+        or not isinstance(build_log.get("bytes"), int)
+        or isinstance(build_log.get("bytes"), bool)
+        or build_log["bytes"] < 0
+    ):
+        raise ValueError("build log observation is invalid")
+    build_log_raw = arguments.evidence_dir.joinpath("build-log.json").read_bytes()
+    ops_log_raw = arguments.evidence_dir.joinpath("ops-log-reference.json").read_bytes()
+    ops_log_reference = _object(ops_log_raw, "private ops-log reference")
+    if ops_log_reference != {
+        "schema_version": "milk.private-ops-log-reference.v1",
+        "authority": "private-release-evidence",
+        "reference": "build-log.json",
+        "receipt_sha256": hashlib.sha256(build_log_raw).hexdigest(),
+        "immutable": True,
+        "content_retained": False,
+    }:
+        raise ValueError("private ops-log reference is invalid")
+
+    _write_new(arguments.evidence_dir / "index.json", raw_index)
+    _write_new(arguments.evidence_dir / "amd64-manifest.json", raw_manifest)
+    _write_new(arguments.evidence_dir / "config.json", raw_config)
+    _write_new(arguments.evidence_dir / "attestation-manifest.json", raw_attestation)
+    _write_new(arguments.evidence_dir / "slsa-provenance.json", statement_raw[SLSA_V1])
+    _write_new(arguments.evidence_dir / "spdx-sbom.json", statement_raw[SPDX])
+
+    receipt = {
+        "schema_version": "milk.private-gateway-image-build.v1",
+        "artifact": "gateway",
+        "source_commit": arguments.source_commit,
+        "source_date_epoch": arguments.source_date_epoch,
+        "source_repository": SOURCE_REPOSITORY,
+        "tagged_reference": arguments.tagged_reference,
+        "image_reference": immutable_reference,
+        "index_sha256": index_digest.removeprefix("sha256:"),
+        "amd64_manifest_sha256": child_digest.removeprefix("sha256:"),
+        "attestation_manifest_sha256": attestation_digest.removeprefix("sha256:"),
+        "attestation_predicates": [item["predicate_type"] for item in statements],
+        "config_sha256": config_digest.removeprefix("sha256:"),
+        "gateway_image_reference": None,
+        "build_log": build_log,
+        "ops_log_reference": ops_log_reference,
+        "ops_log_reference_sha256": hashlib.sha256(ops_log_raw).hexdigest(),
+        "visibility": "private",
+        "build_authority": "local-socket",
+        "buildkit_image_reference": BUILDKIT_IMAGE,
+        "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
+        "platform": "linux/amd64",
+        "provenance": "max",
+        "provenance_version": "v1",
+        "sbom": True,
+    }
+    receipt_raw = json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    _write_new(arguments.evidence_dir / "receipt.json", receipt_raw.encode("utf-8"))
+
+    admission = {
+        "schema_version": "milk.private-image-admission.v1",
+        "artifact": "gateway",
+        "repository": REPOSITORY,
+        "image_reference": immutable_reference,
+        "source_repository": SOURCE_REPOSITORY,
+        "source_commit": arguments.source_commit,
+        "source_context_method": "git-archive-tar-v1",
+        "source_context_sha256": arguments.source_context_sha256,
+        "gateway_image_reference": None,
+        "index_sha256": index_digest.removeprefix("sha256:"),
+        "amd64_manifest_sha256": child_digest.removeprefix("sha256:"),
+        "config_sha256": config_digest.removeprefix("sha256:"),
+        "attestation_manifest_sha256": attestation_digest.removeprefix("sha256:"),
+        "attestations": statements,
+        "platform": "linux/amd64",
+        "visibility": "private",
+        "builder": {
+            "authority": "local-socket",
+            "driver": "docker-container",
+            "endpoint_kind": "local-socket",
+            "buildkit_image_reference": BUILDKIT_IMAGE,
+            "buildkit_version": BUILDKIT_VERSION,
+            "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
+            "provenance_mode": "max",
+            "provenance_version": "v1",
+            "sbom": True,
+        },
+    }
+    admission_raw = json.dumps(admission, sort_keys=True, separators=(",", ":")) + "\n"
+    _write_new(arguments.evidence_dir / "admission.json", admission_raw.encode("utf-8"))
+    return immutable_reference, hashlib.sha256(admission_raw.encode("utf-8")).hexdigest()
+
+
+def _parse_arguments(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tagged-reference", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--source-date-epoch", type=int, required=True)
+    parser.add_argument("--source-context-sha256", required=True)
+    parser.add_argument("--metadata", type=Path, required=True)
+    parser.add_argument("--docker-config", type=Path, required=True)
+    parser.add_argument("--evidence-dir", type=Path, required=True)
+    parser.add_argument("--registry-token-stdin", action="store_true", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    try:
+        arguments = _parse_arguments(argv)
+        raw_token = sys.stdin.buffer.read(MAX_TOKEN_BYTES + 1)
+        if len(raw_token) > MAX_TOKEN_BYTES:
+            raise ValueError("registry credential exceeds its byte limit")
+        token_bytes = raw_token.strip()
+        if (
+            not token_bytes
+            or any(byte < 33 or byte > 126 for byte in token_bytes)
+            or b"\n" in token_bytes
+            or b"\r" in token_bytes
+        ):
+            raise ValueError("registry credential is invalid")
+        github_token = token_bytes.decode("ascii")
+        image_reference, admission_sha256 = verify(arguments, github_token)
+        print(image_reference + "\t" + admission_sha256)
+        return 0
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+        print(f"verify-private-gateway: {error}", file=sys.stderr)
+        return 70
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,11 @@
+{
+  "name": "dragontales",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --check tools/openai-production-smoke.mjs"
+  },
+  "dependencies": {
+    "openai": "6.33.0"
+  }
+}

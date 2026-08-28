@@ -1,0 +1,12 @@
+/target/
+/node_modules/
+/evidence-local/
+/deploy/cloudflare/node_modules/
+/deploy/cloudflare/.build-context/
+/deploy/cloudflare/.wrangler/
+/deploy/cloudflare/.dev.vars
+/deploy/cloudflare/.dev.vars.*
+/deploy/cloudflare/wrangler-account.json
+.DS_Store
+__pycache__/
+*.py[cod]

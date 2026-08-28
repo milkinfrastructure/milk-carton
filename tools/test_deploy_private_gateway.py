@@ -1,0 +1,710 @@
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "tools/deploy-private-gateway.sh"
+ACCOUNT = "a" * 32
+APPLICATION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+APPLICATION_NAME = "dragontales-gateway-dragontalesgateway"
+COMMIT = "1" * 40
+PREVIOUS_WORKER = "11111111-1111-1111-1111-111111111111"
+CURRENT_WORKER = "22222222-2222-2222-2222-222222222222"
+PREVIOUS_IMAGE = f"registry.cloudflare.com/{ACCOUNT}/legacy-gateway:previous"
+BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
+DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+BOOTSTRAP_SECRETS = {
+    "DRAGONTALES_CONFIG_JSON": '{"schema_version":"dragontales.config.v1"}',
+    "DRAGONTALES_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
+    "DRAGONTALES_OPENAI_API_KEY": "bootstrap-openai-private",
+    "DRAGONTALES_ROUTE_SECRET_HEX": "0" * 64,
+    "MILK_CAPTURE_STORE_ACCESS_KEY_ID": "bootstrap-capture-access-private",
+    "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY": "bootstrap-capture-secret-private",
+    "MILK_ROUTE_STORE_ACCESS_KEY_ID": "bootstrap-route-access-private",
+    "MILK_ROUTE_STORE_SECRET_ACCESS_KEY": "bootstrap-route-secret-private",
+}
+
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def sha256(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def make_release(directory):
+    config_raw = canonical({"architecture": "amd64", "os": "linux"})
+    config_sha = sha256(config_raw)
+    layer_digests = ["sha256:" + sha256(b"layer-one"), "sha256:" + sha256(b"layer-two")]
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:" + config_sha,
+            "size": len(config_raw),
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": value,
+                "size": index + 10,
+            }
+            for index, value in enumerate(layer_digests)
+        ],
+    }
+    manifest_raw = canonical(manifest)
+    manifest_sha = sha256(manifest_raw)
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:" + manifest_sha,
+                "size": len(manifest_raw),
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }
+        ],
+    }
+    index_raw = canonical(index)
+    index_sha = sha256(index_raw)
+    image_reference = f"ghcr.io/milkinfrastructure/milk-gateway@sha256:{index_sha}"
+    admission = {
+        "schema_version": "milk.private-image-admission.v1",
+        "artifact": "gateway",
+        "repository": "ghcr.io/milkinfrastructure/milk-gateway",
+        "image_reference": image_reference,
+        "source_repository": "https://github.com/milkinfrastructure/milk-gateway",
+        "source_commit": COMMIT,
+        "source_context_method": "git-archive-tar-v1",
+        "source_context_sha256": "2" * 64,
+        "gateway_image_reference": None,
+        "index_sha256": index_sha,
+        "amd64_manifest_sha256": manifest_sha,
+        "config_sha256": config_sha,
+        "attestation_manifest_sha256": "3" * 64,
+        "attestations": [
+            {"layer_sha256": "4" * 64, "predicate_type": "https://slsa.dev/provenance/v1"},
+            {"layer_sha256": "5" * 64, "predicate_type": "https://spdx.dev/Document"},
+        ],
+        "platform": "linux/amd64",
+        "visibility": "private",
+        "builder": {
+            "authority": "local-socket",
+            "driver": "docker-container",
+            "endpoint_kind": "local-socket",
+            "buildkit_image_reference": BUILDKIT_IMAGE,
+            "buildkit_version": "v0.23.2",
+            "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
+            "provenance_mode": "max",
+            "provenance_version": "v1",
+            "sbom": True,
+        },
+    }
+    admission_raw = canonical(admission)
+    build_log_raw = canonical({
+        "schema_version": "milk.content-free-build-log.v1",
+        "artifact": "gateway",
+        "exit_code": 0,
+        "content_retained": False,
+    })
+    ops_log_raw = canonical({
+        "schema_version": "milk.private-ops-log-reference.v1",
+        "authority": "private-release-evidence",
+        "reference": "build-log.json",
+        "receipt_sha256": sha256(build_log_raw),
+        "immutable": True,
+        "content_retained": False,
+    })
+    release = {
+        "schema_version": "milk.private-gateway-release.v1",
+        "source_commit": COMMIT,
+        "source_date_epoch": 1700000000,
+        "source_repository": "https://github.com/milkinfrastructure/milk-gateway",
+        "buildkit_image_reference": BUILDKIT_IMAGE,
+        "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
+        "build_authority": "local-socket",
+        "platform": "linux/amd64",
+        "ops_log_reference_sha256": sha256(ops_log_raw),
+        "image": {
+            "admission_sha256": sha256(admission_raw),
+            "artifact": "gateway",
+            "image_reference": image_reference,
+        },
+        "started_at": "2026-08-27T00:00:00Z",
+        "completed_at": "2026-08-27T00:01:00Z",
+    }
+    for name, raw in {
+        "release.json": canonical(release),
+        "admission.json": admission_raw,
+        "index.json": index_raw,
+        "amd64-manifest.json": manifest_raw,
+        "config.json": config_raw,
+        "build-log.json": build_log_raw,
+        "ops-log-reference.json": ops_log_raw,
+    }.items():
+        (directory / name).write_bytes(raw)
+    return manifest, manifest_sha
+
+
+FAKE_COMMAND = r'''#!/usr/bin/env python3
+import copy
+import json
+import os
+import sys
+from pathlib import Path
+
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+state_path = Path(os.environ["FAKE_STATE"])
+state = json.loads(state_path.read_text())
+state.setdefault("commands", []).append({"command": name, "arguments": args})
+
+def save():
+    state_path.write_text(json.dumps(state, sort_keys=True))
+
+def done(code=0):
+    save()
+    raise SystemExit(code)
+
+def without_global(values):
+    result = list(values)
+    while "--config" in result:
+        index = result.index("--config")
+        del result[index:index + 2]
+    while "--host" in result:
+        index = result.index("--host")
+        del result[index:index + 2]
+    return result
+
+if name == "git":
+    if args[:2] == ["rev-parse", "--show-toplevel"]:
+        print(os.environ["FAKE_REPO"])
+    elif args[:2] == ["rev-parse", "--verify"]:
+        print(state["commit"])
+    elif args[:2] == ["status", "--porcelain=v1"]:
+        if state["mode"] == "dirty":
+            print(" M deploy/cloudflare/wrangler.jsonc")
+    elif args[:3] == ["remote", "get-url", "origin"]:
+        print("https://github.com/milkinfrastructure/milk-gateway.git")
+    elif args[:3] == ["ls-remote", "--exit-code", "origin"]:
+        commit = "9" * 40 if state["mode"] == "unpublished" else state["commit"]
+        print(commit + "\tHEAD")
+    else:
+        done(2)
+    done()
+
+if name == "gh":
+    if args == ["auth", "token", "--hostname", "github.com"]:
+        print("github-test-token")
+        done()
+    done(2)
+
+if name == "node":
+    if state["mode"] in {"sdk_fail", "bootstrap_sdk_fail", "bootstrap_cleanup_fail"}:
+        done(70)
+    print(json.dumps({
+        "authenticated": True,
+        "choice_count": 1,
+        "content_retained": False,
+        "endpoint_sha256": "6" * 64,
+        "finish_reason": "stop",
+        "http_status": 200,
+        "request_sha256": "7" * 64,
+        "response_bytes": 123,
+        "response_sha256": "8" * 64,
+        "schema_version": "milk.official-openai-sdk-smoke.v1",
+        "sdk": "openai-node",
+        "sdk_version": "6.33.0",
+        "succeeded": True,
+    }, sort_keys=True, separators=(",", ":")))
+    done()
+
+if name == "sleep":
+    done()
+
+if name == "curl":
+    output = Path(args[args.index("--output") + 1])
+    failed = state["mode"] in {"health_fail", "rollback_fail"} and state["deployment"] == "deployed"
+    output.write_text('{"status":"degraded","provider":"uncontrolled"}' if failed else '{"status":"ok","provider":"uncontrolled"}')
+    print("503" if failed else "200", end="")
+    done()
+
+if name == "docker":
+    values = without_global(args)
+    if values == ["context", "show"]:
+        print("default")
+    elif values[:2] == ["context", "inspect"]:
+        print("unix:///fake/docker.sock")
+    elif values[:2] == ["buildx", "version"]:
+        print("github.com/docker/buildx v0.23.0")
+    elif values and values[0] == "login":
+        sys.stdin.buffer.read()
+    elif values[:2] == ["buildx", "imagetools"]:
+        manifest = copy.deepcopy(state["remote_manifest"])
+        if state["mode"] == "remote_mismatch":
+            manifest["config"]["digest"] = "sha256:" + "0" * 64
+        print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+    elif values and values[0] in {"pull", "tag", "push"}:
+        pass
+    else:
+        done(2)
+    done()
+
+if name == "wrangler":
+    if args == ["--version"]:
+        print("4.126.0")
+        done()
+    values = without_global(args)
+    if values[:2] == ["secret", "list"]:
+        worker_missing = state.get("bootstrap", False) and state["mode"] != "bootstrap_preexisting_worker" and (
+            state["deployment"] == "initial" or state.get("worker_deleted", False)
+        )
+        if worker_missing:
+            print('Worker "dragontales-gateway" not found.', file=sys.stderr)
+            done(1)
+        names = state.get("installed_secret_names", [])
+        print(json.dumps([{"name": value, "type": "secret_text"} for value in names]))
+    elif values[:2] == ["secret", "bulk"]:
+        if state["mode"] == "bootstrap_secret_fail":
+            done(1)
+        supplied = json.loads(sys.stdin.read())
+        state["installed_secret_names"] = sorted(supplied)
+    elif values[:2] == ["deployments", "status"]:
+        version = state["previous_worker"] if state["deployment"] in {"initial", "rollback"} else state["current_worker"]
+        print(json.dumps({"id": "deployment", "source": "api", "strategy": "percentage", "versions": [{"percentage": 100, "version_id": version}]}))
+    elif values[:2] == ["containers", "list"]:
+        present = (
+            not state.get("bootstrap", False)
+            or state["deployment"] != "initial"
+            or state["mode"] == "bootstrap_preexisting_app"
+        ) and not state.get("application_deleted", False)
+        values = []
+        if present:
+            values.append({
+                "id": state["application"], "name": state["application_name"],
+                "state": "active", "instances": 1, "image": state.get("target_image", state["previous_image"]),
+                "version": 8, "updated_at": "2026-08-27T00:00:00Z",
+                "created_at": "2026-08-27T00:00:00Z",
+            })
+        print(json.dumps(values))
+    elif values[:2] == ["containers", "info"]:
+        if state["deployment"] in {"deployed", "partial"}:
+            image, version = state["target_image"], 8
+        elif state["deployment"] == "rollback":
+            image, version = state["previous_image"], 9
+        else:
+            image, version = state["previous_image"], 7
+        print(json.dumps({
+            "id": state["application"], "account_id": state["account"], "name": state["application_name"],
+            "version": version, "configuration": {"image": image}, "jobs": False,
+        }))
+    elif values[:3] == ["containers", "images", "list"]:
+        milk_tags = list(state.get("milk_tags", []))
+        if state["mode"] == "collision" and not milk_tags:
+            intent = json.loads((Path(os.environ["FAKE_EVIDENCE"]) / "intent.json").read_text())
+            milk_tags.append(intent["target_image"].rsplit(":", 1)[1])
+        images = [{"name": "legacy-gateway", "tags": ["previous"]}]
+        if milk_tags:
+            images.append({"name": "milk-gateway", "tags": milk_tags})
+        print(json.dumps(images))
+    elif values[:2] == ["containers", "push"]:
+        tag = values[2].rsplit(":", 1)[1]
+        state.setdefault("milk_tags", []).append(tag)
+    elif values[:3] == ["containers", "registries", "credentials"]:
+        print(json.dumps({
+            "account_id": state["account"], "registry_host": "registry.cloudflare.com",
+            "username": "temporary-user", "password": "temporary-password",
+        }))
+    elif values and values[0] == "deploy":
+        config_path = Path(args[args.index("--config") + 1])
+        config = json.loads(config_path.read_text())
+        state["deploy_config"] = config
+        state["target_image"] = config["containers"][0]["image"]
+        state["deployment"] = "partial" if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"} else "deployed"
+        if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"}:
+            done(1)
+    elif values and values[0] == "rollback":
+        if state["mode"] == "rollback_fail":
+            done(1)
+        state["deployment"] = "rollback"
+    elif values[:2] == ["containers", "instances"]:
+        version = 9 if state["deployment"] == "rollback" else 8
+        print(json.dumps([{
+            "id": "33333333-3333-3333-3333-333333333333", "state": "running",
+            "location": "sfo06", "version": version, "created": "2026-08-27T00:00:00Z",
+        }]))
+    elif values[:2] == ["containers", "delete"]:
+        if state["mode"] == "bootstrap_cleanup_fail":
+            done(1)
+        state["application_deleted"] = True
+    elif values and values[0] == "delete":
+        state["worker_deleted"] = True
+    else:
+        done(2)
+    done()
+
+done(2)
+'''
+
+
+class Fixture:
+    def __init__(self, mode="success", bootstrap=False):
+        self.temporary = tempfile.TemporaryDirectory(prefix="milk-deploy-test.")
+        self.root = Path(self.temporary.name)
+        self.release = self.root / "release"
+        self.release.mkdir()
+        remote_manifest, child_sha = make_release(self.release)
+        self.evidence = self.root / "deploy-evidence"
+        self.state_path = self.root / "state.json"
+        self.state_path.write_text(json.dumps({
+            "mode": mode,
+            "commit": COMMIT,
+            "account": ACCOUNT,
+            "application": APPLICATION,
+            "application_name": APPLICATION_NAME,
+            "bootstrap": bootstrap,
+            "previous_worker": PREVIOUS_WORKER,
+            "current_worker": CURRENT_WORKER,
+            "previous_image": PREVIOUS_IMAGE,
+            "deployment": "initial",
+            "remote_manifest": remote_manifest,
+            "child_sha": child_sha,
+            "commands": [],
+            "milk_tags": [],
+            "installed_secret_names": [],
+        }))
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        command = self.bin / "command"
+        command.write_text(textwrap.dedent(FAKE_COMMAND))
+        command.chmod(0o755)
+        for name in ("curl", "docker", "gh", "git", "node", "sleep", "wrangler"):
+            os.link(command, self.bin / name)
+        self.credential = self.root / "gateway-credential.json"
+        self.credential.write_text(
+            '{"api_key":"dt_live_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee_private-test-secret","model":"test-model"}\n'
+        )
+        self.credential.chmod(0o600)
+        self.bootstrap_secrets = self.root / "bootstrap-secrets.json"
+        self.bootstrap_secrets.write_bytes(canonical({
+            "schema_version": "milk.gateway-bootstrap-secrets.v1",
+            "secrets": BOOTSTRAP_SECRETS,
+        }))
+        self.bootstrap_secrets.chmod(0o600)
+        self.bootstrap = bootstrap
+        python_directory = str(Path(sys.executable).resolve().parent)
+        self.environment = {
+            "PATH": str(self.bin) + os.pathsep + python_directory + os.pathsep + "/usr/bin:/bin",
+            "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+            "CLOUDFLARE_API_TOKEN": "cloudflare-test-token",
+            "FAKE_STATE": str(self.state_path),
+            "FAKE_REPO": str(ROOT),
+            "FAKE_EVIDENCE": str(self.evidence),
+        }
+
+    def run(self):
+        arguments = [
+            str(SCRIPT), str(self.release), APPLICATION, str(self.evidence),
+            str(self.credential),
+        ]
+        if self.bootstrap:
+            arguments = [
+                str(SCRIPT), "--bootstrap", str(self.release), str(self.evidence),
+                str(self.credential), str(self.bootstrap_secrets),
+            ]
+        return subprocess.run(
+            arguments,
+            cwd=ROOT,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    @property
+    def state(self):
+        return json.loads(self.state_path.read_text())
+
+    def terminal(self):
+        return json.loads((self.evidence / "terminal.json").read_text())
+
+    def close(self):
+        self.temporary.cleanup()
+
+
+class DeployPrivateGatewayTests(unittest.TestCase):
+    def test_success_uses_only_admitted_prebuilt_image_and_content_free_evidence(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        state = fixture.state
+        commands = state["commands"]
+        self.assertTrue(any(
+            item["command"] == "docker"
+            and "pull" in item["arguments"]
+            and "--platform" in item["arguments"]
+            and "linux/amd64" in item["arguments"]
+            and "@sha256:" in " ".join(item["arguments"])
+            for item in commands
+        ))
+        deploy = next(
+            item for item in commands
+            if item["command"] == "wrangler" and "deploy" in item["arguments"]
+        )
+        self.assertIn("--strict", deploy["arguments"])
+        self.assertIn("--containers-rollout", deploy["arguments"])
+        self.assertIn("immediate", deploy["arguments"])
+        deployed_config = state["deploy_config"]
+        self.assertEqual(
+            deployed_config["main"],
+            str(ROOT / "deploy/cloudflare/worker.js"),
+        )
+        self.assertRegex(
+            deployed_config["containers"][0]["image"],
+            rf"^registry\.cloudflare\.com/{ACCOUNT}/milk-gateway:sha256-[0-9a-f]{{64}}-op-[0-9a-f]{{24}}$",
+        )
+        self.assertIn(f":sha256-{state['child_sha']}-op-", deployed_config["containers"][0]["image"])
+        self.assertNotIn("Dockerfile", json.dumps(deployed_config))
+        self.assertNotIn("image_build_context", json.dumps(deployed_config))
+        self.assertEqual(fixture.terminal()["outcome"], "succeeded")
+        self.assertFalse(any("delete" in item["arguments"] for item in commands))
+
+        evidence_raw = b"".join(path.read_bytes() for path in fixture.evidence.rglob("*") if path.is_file())
+        for secret in (
+            b"cloudflare-test-token", b"github-test-token", b"temporary-password",
+            b"private-test-secret",
+        ):
+            self.assertNotIn(secret, evidence_raw)
+        self.assertNotIn(b'"provider":"uncontrolled"', evidence_raw)
+        self.assertNotIn(b'"prompt"', evidence_raw)
+        self.assertNotIn(b'"model_output"', evidence_raw)
+        logs = sorted((fixture.evidence / "logs").glob("*.json"))
+        self.assertEqual(len(logs), len(commands))
+        for path in logs:
+            observation = json.loads(path.read_text())
+            self.assertIs(observation["content_retained"], False)
+        registry_copy = json.loads((fixture.evidence / "registry-copy.json").read_text())
+        self.assertIs(registry_copy["verified"], True)
+        self.assertEqual(len(registry_copy["ordered_layer_sha256"]), 2)
+        manifest_raw = (fixture.evidence / "manifest.json").read_bytes()
+        terminal = fixture.terminal()
+        self.assertEqual(terminal["manifest_sha256"], sha256(manifest_raw))
+        self.assertRegex(terminal["ops_log_reference_sha256"], r"^[0-9a-f]{64}$")
+        sdk_smoke = json.loads(
+            (fixture.evidence / "official-openai-sdk-smoke.json").read_text()
+        )
+        self.assertIs(sdk_smoke["authenticated"], True)
+        self.assertIs(sdk_smoke["content_retained"], False)
+        manifest = json.loads(manifest_raw)
+        for item in manifest["files"]:
+            raw = (fixture.evidence / item["path"]).read_bytes()
+            self.assertEqual(item["bytes"], len(raw))
+            self.assertEqual(item["sha256"], sha256(raw))
+
+    def test_remote_copy_mismatch_fails_before_deploy(self):
+        fixture = Fixture("remote_mismatch")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        commands = fixture.state["commands"]
+        self.assertFalse(any(
+            item["command"] == "wrangler" and (
+                "deploy" in item["arguments"] or "rollback" in item["arguments"]
+            ) for item in commands
+        ))
+        terminal = fixture.terminal()
+        self.assertEqual(terminal["outcome"], "predeploy_failed")
+        self.assertEqual(terminal["failure_stage"], "cloudflare-copy-verification")
+
+    def test_partial_deploy_failure_is_rolled_back_and_still_fails(self):
+        fixture = Fixture("deploy_fail")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fixture.state["deployment"], "rollback")
+        rollback = json.loads((fixture.evidence / "rollback.json").read_text())
+        self.assertIs(rollback["command_succeeded"], True)
+        self.assertIs(rollback["accepted"], True)
+        self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
+
+    def test_official_sdk_smoke_failure_rolls_back(self):
+        fixture = Fixture("sdk_fail")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fixture.state["deployment"], "rollback")
+        self.assertEqual(fixture.terminal()["failure_stage"], "official-sdk-smoke")
+        self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
+
+    def test_failed_rollback_is_a_distinct_terminal_failure(self):
+        fixture = Fixture("rollback_fail")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        rollback = json.loads((fixture.evidence / "rollback.json").read_text())
+        self.assertIs(rollback["command_succeeded"], False)
+        self.assertIs(rollback["accepted"], False)
+        self.assertEqual(fixture.terminal()["outcome"], "rollback_failed")
+
+    def test_existing_target_tag_fails_before_registry_or_deploy_mutation(self):
+        fixture = Fixture("collision")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        commands = fixture.state["commands"]
+        self.assertFalse(any(item["command"] == "gh" for item in commands))
+        self.assertFalse(any(
+            item["command"] == "wrangler"
+            and any(value in item["arguments"] for value in ("push", "deploy", "rollback"))
+            for item in commands
+        ))
+        self.assertEqual(fixture.terminal()["outcome"], "predeploy_failed")
+
+    def test_empty_account_bootstrap_installs_exact_secrets_before_acceptance(self):
+        fixture = Fixture(bootstrap=True)
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        state = fixture.state
+        self.assertEqual(state["installed_secret_names"], sorted(BOOTSTRAP_SECRETS))
+        commands = state["commands"]
+        deploy_index = next(
+            index for index, item in enumerate(commands)
+            if item["command"] == "wrangler" and "deploy" in item["arguments"]
+        )
+        bulk_index = next(
+            index for index, item in enumerate(commands)
+            if item["command"] == "wrangler"
+            and item["arguments"][:2] == ["secret", "bulk"]
+        )
+        acceptance_index = next(
+            index for index, item in enumerate(commands)
+            if item["command"] == "curl"
+        )
+        self.assertLess(deploy_index, bulk_index)
+        self.assertLess(bulk_index, acceptance_index)
+        self.assertFalse(any("delete" in item["arguments"] for item in commands))
+
+        intent = json.loads((fixture.evidence / "intent.json").read_text())
+        self.assertIs(intent["bootstrap"], True)
+        self.assertIsNone(intent["application_id"])
+        created = json.loads((fixture.evidence / "bootstrap-created.json").read_text())
+        self.assertEqual(created["application_id"], APPLICATION)
+        self.assertEqual(created["application_name"], APPLICATION_NAME)
+        self.assertEqual(created["secret_count"], len(BOOTSTRAP_SECRETS))
+        self.assertIn(f":sha256-{state['child_sha']}-op-", created["image"])
+        self.assertEqual(fixture.terminal()["outcome"], "succeeded")
+
+        evidence_raw = b"".join(
+            path.read_bytes() for path in fixture.evidence.rglob("*") if path.is_file()
+        )
+        for secret in BOOTSTRAP_SECRETS.values():
+            self.assertNotIn(secret.encode(), evidence_raw)
+
+    def test_bootstrap_rejects_preexisting_worker_or_exact_application(self):
+        for mode in ("bootstrap_preexisting_worker", "bootstrap_preexisting_app"):
+            with self.subTest(mode=mode):
+                fixture = Fixture(mode, bootstrap=True)
+                self.addCleanup(fixture.close)
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                commands = fixture.state["commands"]
+                self.assertFalse(any(item["command"] == "gh" for item in commands))
+                self.assertFalse(any(
+                    item["command"] == "wrangler"
+                    and any(value in item["arguments"] for value in ("push", "deploy", "delete"))
+                    for item in commands
+                ))
+                self.assertEqual(fixture.terminal()["failure_stage"], "bootstrap-preflight")
+                self.assertEqual(fixture.terminal()["outcome"], "predeploy_failed")
+
+    def test_partial_bootstrap_failure_deletes_only_new_worker_and_application(self):
+        fixture = Fixture("bootstrap_deploy_fail", bootstrap=True)
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        state = fixture.state
+        self.assertIs(state.get("worker_deleted"), True)
+        self.assertIs(state.get("application_deleted"), True)
+        commands = state["commands"]
+        self.assertTrue(any(
+            item["command"] == "wrangler"
+            and item["arguments"][:2] == ["delete", "dragontales-gateway"]
+            for item in commands
+        ))
+        self.assertTrue(any(
+            item["command"] == "wrangler"
+            and item["arguments"][:2] == ["containers", "delete"]
+            and APPLICATION in item["arguments"]
+            for item in commands
+        ))
+        cleanup = json.loads((fixture.evidence / "bootstrap-cleanup.json").read_text())
+        self.assertIs(cleanup["absence_proved"], True)
+        self.assertEqual(fixture.terminal()["outcome"], "bootstrap_failed_cleaned")
+        self.assertFalse(any(
+            item["command"] == "wrangler"
+            and item["arguments"][:3] == ["containers", "images", "delete"]
+            for item in commands
+        ))
+
+    def test_failed_bootstrap_cleanup_is_a_distinct_terminal_failure(self):
+        fixture = Fixture("bootstrap_cleanup_fail", bootstrap=True)
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        cleanup = json.loads((fixture.evidence / "bootstrap-cleanup.json").read_text())
+        self.assertIs(cleanup["absence_proved"], False)
+        self.assertEqual(fixture.terminal()["outcome"], "bootstrap_cleanup_failed")
+
+    def test_bootstrap_secrets_file_must_be_canonical_owner_only_mode_0600(self):
+        for defect in ("mode", "noncanonical"):
+            with self.subTest(defect=defect):
+                fixture = Fixture(bootstrap=True)
+                self.addCleanup(fixture.close)
+                if defect == "mode":
+                    fixture.bootstrap_secrets.chmod(0o640)
+                else:
+                    fixture.bootstrap_secrets.write_text(json.dumps({
+                        "schema_version": "milk.gateway-bootstrap-secrets.v1",
+                        "secrets": BOOTSTRAP_SECRETS,
+                    }, indent=2) + "\n")
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(fixture.evidence.exists())
+                self.assertEqual(fixture.state["commands"], [])
+
+    def test_dirty_checkout_fails_before_any_provider_mutation(self):
+        fixture = Fixture("dirty")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        commands = fixture.state["commands"]
+        self.assertFalse(any(item["command"] in {"gh", "docker", "wrangler", "curl"} for item in commands))
+        self.assertEqual(fixture.terminal()["failure_stage"], "source-authority")
+
+    def test_committed_config_is_a_fail_closed_prebuilt_template(self):
+        config_raw = (ROOT / "deploy/cloudflare/wrangler.jsonc").read_text()
+        config = json.loads(config_raw)
+        self.assertEqual(config["main"], ".milk-private-deploy-script-required")
+        self.assertEqual(config["containers"][0]["image"], "MILK_PRIVATE_GATEWAY_ADMITTED_IMAGE_REQUIRED")
+        self.assertEqual(config["observability"], {"enabled": True})
+        self.assertNotIn("Dockerfile", config_raw)
+        self.assertNotIn("image_build_context", config_raw)
+        script_raw = SCRIPT.read_text()
+        self.assertNotIn("containers images delete", script_raw)
+        self.assertIn('"containers", "delete", matches[0]', script_raw)
+
+
+if __name__ == "__main__":
+    unittest.main()

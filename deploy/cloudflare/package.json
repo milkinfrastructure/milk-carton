@@ -1,0 +1,15 @@
+{
+  "name": "dragontales-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "../../tools/deploy-private-gateway.sh",
+    "test": "python3 test_contract.py"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
+  "devDependencies": {
+    "wrangler": "4.126.0"
+  }
+}
