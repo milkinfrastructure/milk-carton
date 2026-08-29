@@ -816,7 +816,7 @@ def main():
     script = Path(sys.argv[1]).resolve(strict=True)
     repository = script.parent.parent.resolve(strict=True)
     sys.path.insert(0, str(repository / "tools"))
-    from github_registry import read_token
+    from github_registry import read_token, write_docker_config
     registry_stream = os.fdopen(3, "rb", closefd=False) if registry_token_stdin else None
     github_token = bytearray(read_token(registry_token_file, repository, registry_stream))
     if bootstrap:
@@ -1352,21 +1352,20 @@ def main():
                 "image_retained": True,
             })
 
-        stage = "ghcr-pull"
+        stage = "ghcr-auth"
         try:
-            docker(
-                "github-registry-login", "login", "ghcr.io", "--username", "ShantanuJoshi", "--password-stdin",
-                input_bytes=bytes(github_token) + b"\n",
-            )
+            write_docker_config(docker_config, bytes(github_token))
         finally:
             for index in range(len(github_token)):
                 github_token[index] = 0
+        stage = "ghcr-pull"
         docker(
             "pull-admitted-amd64-child", "pull", "--platform", "linux/amd64", admitted["child_reference"],
             timeout=900,
         )
         local_image = f"milk-gateway:{image_tag}"
         docker("tag-admitted-child", "tag", admitted["child_reference"], local_image)
+        docker_config.joinpath("config.json").unlink()
 
         stage = "cloudflare-push"
         docker_wrapper = scratch / "docker"
@@ -1613,6 +1612,8 @@ def main():
         print(f"private gateway deployment verified at {evidence_directory}")
         return 0
     except BaseException as error:
+        for index in range(len(github_token)):
+            github_token[index] = 0
         for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
             signal.signal(signal_number, signal.SIG_IGN)
         failure_stage = stage

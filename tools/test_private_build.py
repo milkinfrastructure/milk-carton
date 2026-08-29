@@ -64,6 +64,22 @@ class GitHubRegistryHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not private"):
                 GITHUB_REGISTRY.read_token(token, repository)
 
+    def test_docker_config_is_exact_owner_only_ghcr_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "docker-config"
+            config.mkdir(mode=0o700)
+            path = GITHUB_REGISTRY.write_docker_config(config, b"bounded-token")
+            self.assertEqual(path, config / "config.json")
+            self.assertEqual(
+                json.loads(path.read_bytes()),
+                {"auths": {"ghcr.io": {"auth": base64.b64encode(
+                    b"ShantanuJoshi:bounded-token"
+                ).decode()}}},
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                GITHUB_REGISTRY.write_docker_config(config, b"bounded-token")
+
 
 class VerifierFixture:
     def __init__(self, root, *, bad_predicate=False, extra_descriptor=False):
@@ -614,6 +630,12 @@ class PrivateBuildScriptTests(unittest.TestCase):
                 set -eu
                 case " $* " in
                   *' credential '*) printf '%s\n' 'ephemeral-test-password' ;;
+                  *' docker-config '*)
+                    for directory do :; done
+                    printf '%s\n' '{"auths":{"ghcr.io":{"auth":"U2hhbnRhbnVKb3NoaTplcGhlbWVyYWwtdGVzdC1wYXNzd29yZA=="}}}' \
+                      >"$directory/config.json"
+                    chmod 0600 "$directory/config.json"
+                    ;;
                   *' package-visibility '* )
                     if [ "${TEST_PUBLIC_PACKAGE:-0}" -eq 1 ]; then
                       printf 'public\n'
@@ -642,10 +664,6 @@ class PrivateBuildScriptTests(unittest.TestCase):
                   'context show') printf '%s\n' 'desktop-linux' ;;
                   'context inspect') printf '%s\n' "${TEST_ENDPOINT:-unix:///tmp/test-docker.sock}" ;;
                   'buildx version') printf '%s\n' 'github.com/docker/buildx v0.25.0' ;;
-                  'login ghcr.io')
-                    read -r password
-                    [ "$password" = ephemeral-test-password ]
-                    ;;
                   'buildx create') printf '%s\n' 'test-builder' ;;
                   'buildx inspect')
                     printf '%s\n' \
@@ -803,6 +821,11 @@ class PrivateBuildScriptTests(unittest.TestCase):
         self.assertIn("--build-arg|SOURCE_DATE_EPOCH=1700000000", commands)
         self.assertIn("--push", commands)
         self.assertNotIn("--load", commands)
+        self.assertNotIn("|login|ghcr.io", commands)
+        self.assertNotIn("ephemeral-test-password", commands)
+        config_line = next(line for line in commands.splitlines() if "|--config|" in line)
+        config_path = Path(config_line.split("|--config|", 1)[1].split("|", 1)[0])
+        self.assertFalse(config_path.exists())
         build_line = next(line for line in commands.splitlines() if "|build|" in line)
         self.assertNotIn("|" + str(ROOT), build_line)
         self.assertIn("/milk-gateway-release.", build_line)

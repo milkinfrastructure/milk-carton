@@ -315,13 +315,10 @@ case "$package_visibility" in
   *) fail 'an existing milk-gateway package is not private' 77 ;;
 esac
 
-failure_stage=registry-login
-if ! "$python" "$repo/tools/github_registry.py" --repository "$repo" \
-  --token-file "$registry_token" credential | \
-  "$docker" --config "$docker_config" login ghcr.io \
-    --username ShantanuJoshi --password-stdin >/dev/null; then
-  fail 'private GHCR login failed' 77
-fi
+failure_stage=registry-auth
+"$python" "$repo/tools/github_registry.py" --repository "$repo" \
+  --token-file "$registry_token" docker-config "$docker_config" || \
+  fail 'cannot materialize private GHCR authentication' 77
 
 failure_stage=builder-create
 "$docker" --config "$docker_config" buildx create \
