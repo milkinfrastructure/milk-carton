@@ -380,7 +380,7 @@ if name == "wrangler":
             image, version = state["previous_image"], 7
         print(json.dumps({
             "id": state["application"], "account_id": state["account"], "name": state["application_name"],
-            "version": version, "configuration": {"image": image}, "jobs": False,
+            "version": version, "configuration": {"image": image},
         }))
     elif values[:3] == ["containers", "images", "list"]:
         milk_tags = list(state.get("milk_tags", []))
