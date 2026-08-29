@@ -271,6 +271,8 @@ assert.equal(wrongModelTransportCalls, 0);
 const mechanicsPlan = generatedMechanicsPlan(PRODUCTION_PROOF.model);
 assert.equal(mechanicsPlan.length, 320);
 assert.equal(mechanicsPlan[0].request.max_completion_tokens, 128);
+assert.equal(new Set(mechanicsPlan.map((row) => row.sessionId)).size, 320);
+assert.match(mechanicsPlan[0].sessionId, /^milk-mechanics-[0-9]{4}$/);
 assert.deepEqual(
   mechanicsPlan.slice(0, 251).reduce(
     (counts, row) => ({ ...counts, [row.partition]: counts[row.partition] + 1 }),
@@ -280,6 +282,7 @@ assert.deepEqual(
 );
 let mechanicsCalls = 0;
 let mechanicsHealthCalls = 0;
+const mechanicsSessions = new Set();
 const mechanics = await runGeneratedMechanics(
   new URL("https://carton.example/v1"),
   {
@@ -296,11 +299,17 @@ const mechanics = await runGeneratedMechanics(
     const call = mechanicsCalls;
     mechanicsCalls += 1;
     assert.equal(request.url, "https://carton.example/v1/chat/completions");
+    assert.match(
+      request.headers.get("x-milk-session-id") ?? "",
+      /^milk-mechanics-[0-9]{4}$/,
+    );
+    mechanicsSessions.add(request.headers.get("x-milk-session-id"));
     return mechanicsResponse(call);
   },
 );
 assert.equal(mechanicsCalls, 320);
 assert.equal(mechanicsHealthCalls, 2);
+assert.equal(mechanicsSessions.size, 320);
 assert.equal(mechanics.schema_version, "milk.official-openai-sdk-generated-mechanics.v2");
 assert.equal(mechanics.proof_step, "generated_mechanics");
 assert.equal(mechanics.model, PRODUCTION_PROOF.model);
