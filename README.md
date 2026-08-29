@@ -115,7 +115,7 @@ A one-request paid teacher run qualifies only the teacher/provider path, not the
 ## Development
 
 ```sh
-cargo +1.95.0 test --locked --offline --workspace
+RUST_MIN_STACK=16777216 cargo +1.95.0 test --locked --offline --workspace
 cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 python3 tools/test_deploy_private_gateway.py
 ```

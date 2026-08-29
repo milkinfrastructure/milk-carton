@@ -86,7 +86,7 @@ This is deliberately a full single-tenant deploy, not a live config plane: confi
 Run offline checks:
 
 ```sh
-cargo +1.95.0 test --locked --offline --workspace
+RUST_MIN_STACK=16777216 cargo +1.95.0 test --locked --offline --workspace
 cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 ```
 
