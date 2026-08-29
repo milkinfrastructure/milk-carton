@@ -476,14 +476,14 @@ class Fixture:
             "FAKE_EVIDENCE": str(self.evidence),
         }
 
-    def run(self):
+    def run(self, script=SCRIPT):
         arguments = [
-            str(SCRIPT), str(self.release), APPLICATION, str(self.evidence),
+            str(script), str(self.release), APPLICATION, str(self.evidence),
             str(self.credential), str(self.gateway_config),
         ]
         if self.bootstrap:
             arguments = [
-                str(SCRIPT), "--bootstrap", str(self.release), str(self.evidence),
+                str(script), "--bootstrap", str(self.release), str(self.evidence),
                 str(self.credential), str(self.bootstrap_secrets),
             ]
         return subprocess.run(
@@ -834,7 +834,20 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         fixture = Fixture()
         self.addCleanup(fixture.close)
         fixture.buildx_plugin.unlink()
-        result = fixture.run()
+        source = SCRIPT.read_text(encoding="utf-8")
+        isolated_tools = fixture.root / "missing-plugin-repo/tools"
+        isolated_tools.mkdir(parents=True)
+        for candidate in (
+            "/opt/homebrew/lib/docker/cli-plugins/docker-buildx",
+            "/usr/local/lib/docker/cli-plugins/docker-buildx",
+            "/usr/libexec/docker/cli-plugins/docker-buildx",
+            "/usr/lib/docker/cli-plugins/docker-buildx",
+        ):
+            source = source.replace(candidate, str(fixture.root / candidate.removeprefix("/")))
+        script = isolated_tools / SCRIPT.name
+        script.write_text(source, encoding="utf-8")
+        script.chmod(0o700)
+        result = fixture.run(script)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"buildx plugin is unavailable", result.stderr)
         self.assertFalse(fixture.evidence.exists())
