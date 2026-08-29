@@ -1323,7 +1323,7 @@ def main():
             [commands["docker"], "--config", str(docker_config), "--host", docker_endpoint, "buildx", "version"],
         )
 
-        image_tag = f"sha256-{admitted['child_sha256']}-op-{operation_id}"
+        image_tag = f"milk-{admitted['child_sha256']}-op-{operation_id}"
         remote_image = f"{REGISTRY}/{account_id}/milk-carton:{image_tag}"
         evidence.write("intent.json", {
             "schema_version": "milk.private-gateway-deploy-intent.v1",
