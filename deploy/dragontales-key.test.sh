@@ -32,7 +32,7 @@ token=$(<"$TEST_DIR/private/traffic.token")
 actual_sha=$(printf '%s' "$token" | "$OPENSSL" dgst -sha256 -r)
 actual_sha=${actual_sha%% *}
 [[ $actual_sha == "$expected_sha" ]] || fail "token verifier does not cover exact token bytes"
-mode=$(stat -f '%Lp' "$TEST_DIR/private/traffic.token" 2>/dev/null || stat -c '%a' -- "$TEST_DIR/private/traffic.token")
+mode=$(stat -c '%a' -- "$TEST_DIR/private/traffic.token" 2>/dev/null || stat -f '%Lp' "$TEST_DIR/private/traffic.token")
 [[ $mode == 400 ]] || fail "token file mode is not 0400"
 
 expect_failure "$RUNNER" "$OPENSSL" "$UUIDGEN" "$TEST_DIR/private/traffic.token"
