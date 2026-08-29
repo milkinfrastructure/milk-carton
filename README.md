@@ -2,7 +2,7 @@
 
 Milk Gateway is a small OpenAI-compatible proxy that turns real application traffic into bounded, auditable evaluation work.
 
-An application changes only its OpenAI base URL and API key. The gateway forwards the request to the configured upstream model, returns the normal response, and captures only traffic explicitly admitted for evaluation. It does not run a model locally and it does not require a GPU.
+For the hosted product, an application changes only its official OpenAI SDK base URL and API key. The gateway forwards the request to the configured upstream model, returns the normal response, and captures only traffic explicitly admitted for evaluation. It does not run a model locally and it does not require a GPU.
 
 ```python
 from openai import OpenAI
@@ -18,7 +18,9 @@ response = client.chat.completions.create(
 )
 ```
 
-The repository is MIT licensed. The production OCI image is currently private while the first hosted release is being qualified.
+The customer supplies the `base_url` and one `dt_live_...` key. Milk Infrastructure owns the hosted eval configuration, object stores, upstream/provider credentials, and route policy. Self-hosters run the same gateway and supply their own JSON configuration and environment secrets.
+
+The code is MIT licensed, but this source repository and the production OCI image remain private while the first hosted release is qualified and reviewed. This is not yet a public open-source release.
 
 ## What it owns
 
@@ -27,11 +29,11 @@ The repository is MIT licensed. The production OCI image is currently private wh
 - `status`: reports bounded counts without returning prompts, responses, or credentials.
 - Immutable claims, results, launch records, and signed route state in object storage.
 
-The gateway never holds Modal or Baseten credentials. Provider execution lives in [`milk-harness`](https://github.com/milkinfrastructure/milk-harness).
+The gateway never holds Modal or Baseten credentials. Provider execution lives in [`milk-harness`](https://github.com/milkinfrastructure/milk-harness), which watches captured traffic and stops new eval generation at the configured per-eval limit.
 
-## Configuration
+## Self-hosted configuration
 
-Supply one strict JSON configuration through `--config /path/to/config.json` or `DRAGONTALES_CONFIG_JSON`. Start from [`deploy/dragontales-config.example.json`](deploy/dragontales-config.example.json).
+Hosted customers do not manage this configuration. Self-hosters supply one strict JSON document through `--config /path/to/config.json` or `DRAGONTALES_CONFIG_JSON`. Start from [`deploy/dragontales-config.example.json`](deploy/dragontales-config.example.json).
 
 The important settings are:
 
@@ -92,9 +94,23 @@ target/release/dragontales-gateway --config "$PWD/dragontales.json" status
 
 Production deploys an admitted `linux/amd64` image to a Cloudflare Worker and Container. The deployer copies the exact image layers into Cloudflare's registry, installs the eight Worker secrets, checks one healthy instance, and runs the official OpenAI SDK smoke. A failed update rolls back automatically.
 
+The CPU-only gateway release is 12.02 MiB compressed and contains no shell, package manager, Python, Node, GPU runtime, or model weights.
+
 Release evidence is digest-addressed and content-free. Prompts, model outputs, API keys, and raw build logs are not release artifacts.
 
 See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.md) for the full command and authority contract.
+
+## Production qualification
+
+The hosted release is production-qualified only after one cloud run proves the complete chain:
+
+1. An official SDK request returns normally and persists its completed trace.
+2. Real captured traffic reaches the fixed 251-request student corpus: 50 TRAIN, 73 DEV, and 128 CALIBRATION. Generated traffic does not count.
+3. One student is trained and merged, then BF16, dynamic FP8, and static FP8 branches are evaluated on the same ordered DEV set.
+4. The deterministic winner passes authenticated canary and baseline-fallback checks.
+5. A signed zero route becomes active and Baseten and Modal are both observed at zero compute.
+
+A one-request paid teacher run qualifies only the teacher/provider path, not the product.
 
 ## Development
 
@@ -103,5 +119,3 @@ cargo +1.95.0 test --locked --offline --workspace
 cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 python3 tools/test_deploy_private_gateway.py
 ```
-
-The first hosted release is not production-qualified until real captured traffic reaches the fixed student-data gate, all three student branches are evaluated, the winner passes canary and fallback checks, a signed zero route is active, and every provider is observed at zero compute. A one-request paid teacher run qualifies only that provider path.
