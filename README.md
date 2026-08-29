@@ -105,6 +105,8 @@ Build and verify one private image from a clean published checkout:
 tools/build-private-gateway.sh /absolute/new/gateway-release-evidence
 ```
 
+The private image build and deploy scripts are Milk-operator release tools with fixed Milk registry and Cloudflare contracts. Forks can build the Rust binary locally, but custom hosted deployment is not turnkey.
+
 Bootstrap the first application, or update an existing application, with the same guarded deploy command:
 
 ```sh
