@@ -38,6 +38,7 @@ assert "candidate_requests: 2" in production_smoke
 assert "generated_request_timeout_ms: 30_000" in production_smoke
 assert "timeout: PRODUCTION_PROOF.generated_request_timeout_ms" in production_smoke
 assert "AbortSignal.timeout(PRODUCTION_PROOF.generated_health_timeout_ms)" in production_smoke
+assert 'headers: { "x-milk-session-id": planned.sessionId }' in production_smoke
 assert "short_max_completion_tokens: 128" in production_smoke
 assert "saturation_max_completion_tokens: 3_840" in production_smoke
 assert "proof_contract_sha256" in production_smoke
@@ -58,7 +59,7 @@ assert config["routes"] == [
 assert config["containers"] == [
     {
         "class_name": "MilkCarton",
-        "image": "MILK_CARTON_ADMITTED_IMAGE_REQUIRED",
+        "image": "registry.invalid/milk-carton:admitted-image-required",
         "instance_type": "lite",
         "max_instances": 1,
     }

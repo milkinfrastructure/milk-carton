@@ -104,12 +104,20 @@ export function generatedMechanicsPlan(model) {
       nonce += 1;
       if (counts[partition] >= target[partition]) continue;
       counts[partition] += 1;
-      plan.push({ partition, request, requestSha256, raw, nonce: currentNonce });
+      plan.push({
+        partition,
+        request,
+        requestSha256,
+        raw,
+        nonce: currentNonce,
+        sessionId: `milk-mechanics-${String(currentNonce).padStart(4, "0")}`,
+      });
     }
     assert.deepEqual(counts, target);
   }
   assert.equal(plan.length, PRODUCTION_PROOF.generated_mechanics_requests);
   assert.equal(new Set(plan.map((row) => row.requestSha256)).size, plan.length);
+  assert.equal(new Set(plan.map((row) => row.sessionId)).size, plan.length);
   assert.deepEqual(partitionCounts(plan.slice(0, 251)), MECHANICS_PHASES[0]);
   assert.deepEqual(partitionCounts(plan.slice(251)), MECHANICS_PHASES[1]);
   assert.deepEqual(partitionCounts(plan), { train: 63, dev: 91, calibration: 166 });
@@ -411,6 +419,7 @@ export async function runGeneratedMechanics(
       assert.ok(planned);
       assert.equal(raw.equals(planned.raw), true);
       assert.equal(partition, planned.partition);
+      assert.equal(outgoing.headers.get("x-milk-session-id"), planned.sessionId);
       assert.equal(transported.has(requestSha256), false);
       const response = await transport(outgoing);
       transported.add(requestSha256);
@@ -428,7 +437,9 @@ export async function runGeneratedMechanics(
       let httpStatus = null;
       try {
         const { data, response } = await client.chat.completions
-          .create(planned.request)
+          .create(planned.request, {
+            headers: { "x-milk-session-id": planned.sessionId },
+          })
           .withResponse();
         const responseRaw = JSON.stringify(data);
         httpStatus = response.status;
