@@ -5,7 +5,7 @@ Private Milk Infrastructure repository for the blue path in the directly inspect
 Milk has exactly two private repositories:
 
 - [`milkinfrastructure/milk-gateway`](https://github.com/milkinfrastructure/milk-gateway): request data plane, immutable claims/results/routes, GPU launch outbox, and worker contracts.
-- [`milkinfrastructure/milk-harness`](https://github.com/milkinfrastructure/milk-harness): self-iteration harness, one-shot jobs executor, and purple/teal GPU worker source.
+- [`milkinfrastructure/milk-harness`](https://github.com/milkinfrastructure/milk-harness): one-shot jobs executor, purple/teal GPU worker source, and a typed extension for the existing Exo harness.
 
 It owns:
 
@@ -30,12 +30,12 @@ The winner run ID is provider-neutral and binds the claim, outbox, operation, bu
 
 A winner admission does not free its GPU launch slot. Publishing the signed zero route creates one durable provider-teardown authorization and control frontier; expiry creates the same authority when no route rollback arrived. The route-triggered authority embeds the exact verified canary and zero receipts, so jobs needs no route-store credential. Jobs tears the provider down and writes content-free evidence in its private store; a gateway-owned scheduler pass ingests the exact evidence-addressed result. Until verified provider billing is part of the contract, the teardown result must conservatively account for the full accepted reservation. Only that verified zero result removes the teardown frontier and the original GPU launch pointer. Jobs never writes control or routes.
 
-This repository does not own GPU worker implementations, autonomous planning, image release credentials, provider credentials, or a standing manager service.
+This repository does not own GPU worker implementations, autonomous planning, image release credentials, provider credentials, or a standing manager service. Exo can trigger the separately credentialed workflow through a fixed three-action Milk tool; it is not in the request or scheduling data path.
 
 Release policy:
 
 - repository visibility is private;
-- images are built from this local checkout for `linux/amd64`;
+- images are built from a clean checkout for `linux/amd64` on a CPU-only x86 host; the local Mac GPU is not used;
 - the canonical image is private `ghcr.io/milkinfrastructure/milk-gateway@sha256:...`;
 - the exact local image is copied to Cloudflare's private registry for deployment, never rebuilt there;
 - no tag is admitted as runtime authority; every claim and route binds an immutable digest.
@@ -48,6 +48,6 @@ Build and deploy receipts contain no command output. They bind content-free log 
 
 Baseten winner admission uses the transient gateway-owned `tools/manage-candidate-credential.py serve-baseten` process. Its required `--socket-path` must be absolute, absent, and directly inside an existing non-symlink directory owned by the helper's effective UID with exact mode 0700. The workflow mounts that socket into the jobs container at its fixed `/run/milk-candidate-key.sock` path under the same UID. The helper accepts one canonical install, recovery-verify, or authorized-remove request, returns one hash-only acknowledgement, removes the exact socket inode, and exits. The candidate key exists only in socket/process memory and the Cloudflare secret binding. `DRAGONTALES_CONTAINER_ADMIN_KEY` is a permanent Worker-only secret supplied to the helper on a separate pipe or socket descriptor; it is never forwarded to the container. `DRAGONTALES_CANDIDATE_API_KEY` is helper-managed and optional outside an admitted winner interval. Wrangler is pinned to 4.126.0, and its dedicated API token may manage only this Worker's secrets and read the exact Worker/container identity. Neither key may enter arguments, environment variables, files, stdout, deployment evidence, logs, or R2.
 
-Qualification status on 2026-08-28: the private repository is published and Actions remain disabled. A prior gateway revision has a verified private image admission, but this split train/branch contract revision has not been rebuilt or deployed. Offline gateway, provider-handoff, and teardown tests pass; no hosted end-to-end proof has run. This repository is not production-qualified.
+Qualification status on 2026-08-28: gateway release source commit `1e6ac86b9806486a7fdfa88051e2f8446bf884c0` and its private `linux/amd64` image are independently verified. The matching harness v3 release is also verified and remains usable without rebuilding the GPU images. Production R2 authorities, Cloudflare deployment, GitHub environments, paid execution, canary, rollback, and zero-GPU teardown remain unproven. This repository is not production-qualified.
 
 See the [crate operator notes](crates/dragontales-gateway/README.md).
