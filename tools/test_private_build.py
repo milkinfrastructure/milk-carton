@@ -718,7 +718,28 @@ class PrivateBuildScriptTests(unittest.TestCase):
 
     def test_requires_buildx_plugin_in_a_standard_location(self):
         self.buildx_plugin.unlink()
-        result, evidence = self._run("missing-buildx-plugin")
+        source = (ROOT / "tools/build-private-gateway.sh").read_text(encoding="utf-8")
+        isolated_repo = self.test_root / "missing-plugin-repo"
+        isolated_tools = isolated_repo / "tools"
+        isolated_tools.mkdir(parents=True)
+        for candidate in (
+            "/opt/homebrew/lib/docker/cli-plugins/docker-buildx",
+            "/usr/local/lib/docker/cli-plugins/docker-buildx",
+            "/usr/libexec/docker/cli-plugins/docker-buildx",
+            "/usr/lib/docker/cli-plugins/docker-buildx",
+        ):
+            source = source.replace(candidate, str(self.test_root / candidate.removeprefix("/")))
+        script = isolated_tools / "build-private-gateway.sh"
+        script.write_text(source, encoding="utf-8")
+        script.chmod(0o700)
+        evidence = self.test_root / "missing-buildx-plugin"
+        result = subprocess.run(
+            [str(script), str(evidence)],
+            env=self._environment(TEST_REPO=isolated_repo.resolve()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         self.assertEqual(result.returncode, 69, result.stderr)
         self.assertIn("plugin is unavailable in standard locations", result.stderr)
         self.assertFalse(evidence.exists())
