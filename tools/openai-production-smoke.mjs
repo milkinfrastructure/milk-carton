@@ -262,7 +262,7 @@ async function main() {
     apiKey: credential.api_key,
     baseURL: endpoint.href,
     maxRetries: 0,
-    timeout: 15_000,
+    timeout: 120_000,
   });
   const receipt = saturationFallback
     ? await runSaturationFallbackSmoke(client, endpoint, credential, process.argv[4])

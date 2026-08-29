@@ -104,4 +104,4 @@ cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 python3 tools/test_deploy_private_gateway.py
 ```
 
-The first hosted release is not production-qualified until the gateway, one paid eval result, and verified zero-GPU teardown have all been observed in cloud state.
+The first hosted release is not production-qualified until real captured traffic reaches the fixed student-data gate, all three student branches are evaluated, the winner passes canary and fallback checks, a signed zero route is active, and every provider is observed at zero compute. A one-request paid teacher run qualifies only that provider path.

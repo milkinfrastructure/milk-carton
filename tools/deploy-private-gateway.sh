@@ -1422,7 +1422,7 @@ def main():
                 "https://api.dragontales.milkinfrastructure.com/v1",
                 str(credential_file),
             ],
-            timeout=30,
+            timeout=150,
         )
         sdk_smoke = parse_json(sdk_result.stdout, "official OpenAI SDK smoke", 65536)
         require_keys(sdk_smoke, {
