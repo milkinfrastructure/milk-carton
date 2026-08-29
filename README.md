@@ -100,6 +100,12 @@ Release evidence is digest-addressed and content-free. Prompts, model outputs, A
 
 See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.md) for the full command and authority contract.
 
+### Cloud-mechanics proof
+
+The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=10`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. Milk stops scheduling new paid work at $850 of cumulative spend, and $1,000 is the hard ceiling.
+
+This check proves the deployment, capture, provider, training, short canary, fallback, signed-zero, teardown, and zero-compute mechanics. Because its traffic is generated, it cannot production-qualify the release or admit the resulting candidate for real application traffic.
+
 ## Production qualification
 
 The hosted release is production-qualified only after one cloud run proves the complete chain:
