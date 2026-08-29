@@ -702,9 +702,9 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         )
         self.assertRegex(
             deployed_config["containers"][0]["image"],
-            rf"^registry\.cloudflare\.com/{ACCOUNT}/milk-carton:sha256-[0-9a-f]{{64}}-op-[0-9a-f]{{24}}$",
+            rf"^registry\.cloudflare\.com/{ACCOUNT}/milk-carton:milk-[0-9a-f]{{64}}-op-[0-9a-f]{{24}}$",
         )
-        self.assertIn(f":sha256-{state['child_sha']}-op-", deployed_config["containers"][0]["image"])
+        self.assertIn(f":milk-{state['child_sha']}-op-", deployed_config["containers"][0]["image"])
         self.assertNotIn("Dockerfile", json.dumps(deployed_config))
         self.assertNotIn("image_build_context", json.dumps(deployed_config))
         self.assertEqual(fixture.terminal()["outcome"], "succeeded")
@@ -945,7 +945,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(created["application_id"], APPLICATION)
         self.assertEqual(created["application_name"], APPLICATION_NAME)
         self.assertEqual(created["secret_count"], len(BOOTSTRAP_SECRETS))
-        self.assertIn(f":sha256-{state['child_sha']}-op-", created["image"])
+        self.assertIn(f":milk-{state['child_sha']}-op-", created["image"])
         self.assertEqual(fixture.terminal()["outcome"], "succeeded")
 
         evidence_raw = b"".join(
