@@ -34,7 +34,7 @@ Milk Carton is MIT-licensed. The hosted cloud proof has not run, so there is no 
 - `status`: reports bounded counts without returning prompts, responses, or credentials.
 - Immutable claims, results, launch records, and signed route state in object storage.
 
-The maintained system is this gateway, [`milk-harness`](https://github.com/milkinfrastructure/milk-harness), and object storage. It adds no Milk database, queue, or resident manager service. The gateway receives only the scoped key needed to call an admitted Baseten winner; Baseten management and training credentials remain in the one-shot harness process.
+The maintained products are this Carton and [`milk-man`](https://github.com/milkinfrastructure/milk-man). Object storage is their durable memory, not a third service. Milk Man invokes fixed one-shot jobs; it cannot publish routes or choose credentials, provider settings, or spend. Carton receives only the scoped key needed to call an admitted winner, while provider management credentials remain outside the data plane.
 
 ## Self-hosted configuration
 
@@ -149,7 +149,7 @@ The final argument is the operator-owned public API base URL. It must be a lower
 
 The bootstrap secret document includes `MILK_CAPTURE_SAMPLING_KEY_HEX` as 64 lowercase hexadecimal characters and a bounded `MILK_CAPTURE_SAMPLING_KEY_VERSION`. Both are passed into the Container on every start.
 
-The [`milk-harness` production runbook](https://github.com/milkinfrastructure/milk-harness/blob/main/docs/reference/production-runbook.md) continues from this deployment through eval admission, five-minute reconciliation, one-use paid dispatches, signed zero, and verified zero compute.
+[`milk-man`](https://github.com/milkinfrastructure/milk-man) invokes the fixed reconciliation job that continues from captured traffic through summary statistics, readiness, eval generation, and an unsigned route proposal. Route signing and publication remain explicit operator actions outside the agent.
 
 The release contract keeps the gateway image CPU-only, with no shell, package manager, Python, Node, GPU runtime, model weights, or local GPU dependency.
 
@@ -183,7 +183,7 @@ The fixed proof model is `zai-org/GLM-5.3-Flash`. The contract SHA-256 is `086ce
 | Saturation fallback | 2 | 1 | 1 | 3,840 |
 | **Total** | **324** | **322** | **2** |  |
 
-Every v2 receipt carries that contract hash plus its exact step, model, request count, route split, and token cap. The stateless SDK driver enforces each invocation. The harness owns the durable one-use mechanics intent and content-free receipt, so an ambiguous run is not replayed.
+Every v2 receipt carries that contract hash plus its exact step, model, request count, route split, and token cap. The stateless SDK driver enforces each invocation. Milk Man's fixed job owns the durable one-use mechanics intent and content-free receipt, so an ambiguous run is not replayed.
 
 The verified deployment's `current.json` is v2 and binds the canonical deployment-baseline receipt SHA-256 and the fixed proof-contract SHA-256. Deployment finalization re-reads both records before sealing the evidence manifest.
 
