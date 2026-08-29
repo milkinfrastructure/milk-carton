@@ -2,7 +2,7 @@
 
 Milk Gateway is a small OpenAI-compatible proxy that turns real application traffic into bounded, auditable evaluation work.
 
-For the hosted product, an application changes only its official OpenAI SDK base URL and API key. The gateway forwards the request to the configured upstream model, returns the normal response, and captures only traffic explicitly admitted for evaluation. It does not run a model locally and it does not require a GPU.
+For the hosted product, an application changes only its official OpenAI SDK base URL and API key. The SDK sends that key through the standard `Authorization: Bearer` header. The gateway forwards the request to the configured upstream model, returns the normal response, and captures only traffic explicitly admitted for evaluation. It does not run a model locally and it does not require a GPU.
 
 ```python
 from openai import OpenAI
@@ -18,9 +18,9 @@ response = client.chat.completions.create(
 )
 ```
 
-The customer supplies the `base_url` and one `dt_live_...` key. Milk Infrastructure owns the hosted eval configuration, object stores, upstream/provider credentials, and route policy. Self-hosters run the same gateway and supply their own JSON configuration and environment secrets.
+The hosted surface is deliberately narrow: the customer supplies the `base_url` and one `dt_live_...` key, which the SDK sends as `Authorization: Bearer dt_live_...`. Milk Infrastructure owns the hosted eval configuration, object stores, upstream and provider credentials, and route policy. Self-hosters run the same gateway and supply their own JSON configuration and environment secrets.
 
-The code is MIT licensed, but this source repository and the production OCI image remain private while the first hosted release is qualified and reviewed. This is not yet a public open-source release.
+Milk Gateway is MIT-licensed. Source publication does not imply a live hosted endpoint or a production-qualified release; those require the cloud proof below.
 
 ## What it owns
 
@@ -41,7 +41,7 @@ The important settings are:
 - accepted request-key hashes and stable traffic cohorts;
 - `capture_allowed` for each request key;
 - capture, control, and route object stores;
-- one strict eval identity, its isolated object namespace, and its hard decision/call limits;
+- one stable 64-character lowercase `eval_id`, its `dt/v3`-isolated object namespace, and its hard decision/call limits;
 - immutable teacher, student, and image identities.
 
 Secrets stay in environment variables:
@@ -77,11 +77,11 @@ export DRAGONTALES_OPENAI_API_KEY='...'
 target/release/dragontales-gateway --config "$PWD/dragontales.json" serve
 ```
 
-The local path can use three private directories. Production uses three separately credentialed R2 buckets.
+The local path can use three owner-only directories. The hosted configuration uses three separately credentialed R2 buckets.
 
 ## Bounded evaluation loop
 
-`tick --once` reads captured traffic and the current eval configuration. Its required `eval_id` is the 64-character lowercase campaign identity admitted with the canonical eval document. That ID is embedded in every durable scope and object key. It acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached for that eval. Existing reconciliation and teardown continue even after the limit.
+`tick --once` reads captured traffic and the current eval configuration. Its required `eval_id` is a stable 64-character lowercase campaign identity. For a Milk-managed campaign, `gateway_config.eval_id` must equal `manifest.campaign_id`. The SHA-256 of the canonical outer `milk.eval.v1` document is separate and is the exact one-use paid-confirmation and pass-receipt value. Durable data is isolated under `dt/v3/<eval_id>/<tenant>/<project>/<environment>/<workload>/...`. The command acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached for that eval. Existing reconciliation and teardown continue even after the limit.
 
 The object store is authoritative. A scheduler, Exo, or a local shell may invoke the command, but none of them can manufacture a claim or authorize provider spend.
 
@@ -92,9 +92,9 @@ target/release/dragontales-gateway --config "$PWD/dragontales.json" status
 
 ## Production deployment
 
-Production deploys an admitted `linux/amd64` image to a Cloudflare Worker and Container. The non-bootstrap deploy includes the reviewed `DRAGONTALES_CONFIG_JSON` in the same versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update rolls the Worker version and config binding back together.
+The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudflare Worker and Container. A non-bootstrap deployment uploads code and the reviewed `DRAGONTALES_CONFIG_JSON` in one atomic, versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update restores the prior Worker version and config binding together, then verifies that live health reports the exact pre-deploy config digest.
 
-The CPU-only gateway release is 12.02 MiB compressed and contains no shell, package manager, Python, Node, GPU runtime, or model weights.
+The release contract keeps the gateway image CPU-only, with no shell, package manager, Python, Node, GPU runtime, model weights, or local GPU dependency.
 
 Release evidence is digest-addressed and content-free. Prompts, model outputs, API keys, and raw build logs are not release artifacts.
 
