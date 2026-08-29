@@ -654,6 +654,10 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         rollback = json.loads((fixture.evidence / "rollback.json").read_text())
         self.assertIs(rollback["command_succeeded"], True)
         self.assertIs(rollback["accepted"], True)
+        self.assertEqual(
+            rollback["previous_gateway_config_sha256"],
+            fixture.state["previous_config_sha256"],
+        )
         self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
 
     def test_official_sdk_smoke_failure_rolls_back(self):

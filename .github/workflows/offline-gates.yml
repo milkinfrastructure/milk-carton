@@ -32,6 +32,8 @@ jobs:
 
       - id: rust
         name: Rust fmt, tests, and clippy
+        env:
+          RUST_MIN_STACK: "16777216"
         run: |
           cargo +1.95.0 fetch --locked
           cargo +1.95.0 fmt --all -- --check

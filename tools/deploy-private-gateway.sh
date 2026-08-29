@@ -961,7 +961,7 @@ def main():
         })
         return succeeded
 
-    def probe_health(phase, attempt, expected_config_sha256):
+    def probe_health(phase, attempt):
         body_path = scratch / f"health-{phase}-{attempt}.json"
         result = runner.run(
             f"{phase}-health-{attempt:02d}",
@@ -986,14 +986,7 @@ def main():
                 candidate_config_sha256 = value.get("config_sha256") if isinstance(value, dict) else None
                 if isinstance(candidate_config_sha256, str) and SHA256.fullmatch(candidate_config_sha256):
                     active_config_sha256 = candidate_config_sha256
-                healthy = (
-                    isinstance(value, dict)
-                    and value.get("status") == "ok"
-                    and (
-                        expected_config_sha256 is None
-                        or active_config_sha256 == expected_config_sha256
-                    )
-                )
+                healthy = isinstance(value, dict) and value.get("status") == "ok"
         except (ContractFailure, UnicodeError):
             healthy = False
         finally:
@@ -1005,6 +998,8 @@ def main():
 
     def poll(phase, expected_image, expected_worker, worker_must_differ,
              expected_config_sha256):
+        if SHA256.fullmatch(expected_config_sha256 or "") is None:
+            raise ContractFailure("expected gateway config SHA-256 is invalid")
         last = {
             "http_status": None,
             "health_ready": False,
@@ -1020,7 +1015,11 @@ def main():
                 last["http_status"],
                 last["health_ready"],
                 last["config_sha256"],
-            ) = probe_health(phase, attempt, expected_config_sha256)
+            ) = probe_health(phase, attempt)
+            last["health_ready"] = (
+                last["health_ready"]
+                and last["config_sha256"] == expected_config_sha256
+            )
             try:
                 status = wrangler(
                     f"{phase}-worker-status-{attempt:02d}",
@@ -1073,11 +1072,7 @@ def main():
                     "phase": phase,
                     "attempts": attempt,
                     "http_status": last["http_status"],
-                    "health_contract": (
-                        "status-ok-config-sha256"
-                        if expected_config_sha256 is not None
-                        else "status-ok"
-                    ),
+                    "health_contract": "status-ok-config-sha256",
                     "config_sha256": last["config_sha256"],
                     "content_retained": False,
                     "active_instances": last["active_instances"],
@@ -1097,11 +1092,7 @@ def main():
             "phase": phase,
             "attempts": POLL_ATTEMPTS,
             "http_status": last["http_status"],
-            "health_contract": (
-                "status-ok-config-sha256"
-                if expected_config_sha256 is not None
-                else "status-ok"
-            ),
+            "health_contract": "status-ok-config-sha256",
             "config_sha256": last["config_sha256"],
             "content_retained": False,
             "active_instances": last["active_instances"],
@@ -1247,6 +1238,15 @@ def main():
                 "previous-container-info", "containers", "info", application_id, "--json",
             )
             previous_image, previous_app_version = parse_application(app_info.stdout, application_id, account_id)
+            previous_health_status, previous_health_ready, previous_config_sha256 = probe_health(
+                "previous", 1,
+            )
+            if (
+                previous_health_status != 200
+                or not previous_health_ready
+                or SHA256.fullmatch(previous_config_sha256 or "") is None
+            ):
+                raise ContractFailure("previous gateway config is not healthy and observable")
             previous_repository, previous_tag = split_cloudflare_image(previous_image, account_id)
             images = parse_images(wrangler(
                 "preflight-image-list", "containers", "images", "list", "--json",
@@ -1259,6 +1259,7 @@ def main():
                 "worker_version_id": previous_worker,
                 "image": previous_image,
                 "application_version": previous_app_version,
+                "config_sha256": previous_config_sha256,
             }
             evidence.write("previous.json", {
                 "schema_version": "milk.private-gateway-previous-deployment.v1",
@@ -1267,6 +1268,7 @@ def main():
                 "application_id": application_id,
                 "application_version": previous_app_version,
                 "image": previous_image,
+                "gateway_config_sha256": previous_config_sha256,
                 "image_retained": True,
             })
 
@@ -1549,7 +1551,7 @@ def main():
                 rollback_command_succeeded = True
                 _, _, rollback_app_version = poll(
                     "rollback", previous["image"], previous["worker_version_id"], False,
-                    None,
+                    previous["config_sha256"],
                 )
                 rollback_accepted = True
                 outcome = "deployment_failed_rolled_back"
@@ -1560,6 +1562,7 @@ def main():
                 "operation_id": operation_id,
                 "previous_worker_version_id": previous["worker_version_id"],
                 "previous_image": previous["image"],
+                "previous_gateway_config_sha256": previous["config_sha256"],
                 "application_id": application_id,
                 "application_version": rollback_app_version,
                 "command_succeeded": rollback_command_succeeded,
