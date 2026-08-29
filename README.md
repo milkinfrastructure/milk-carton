@@ -19,7 +19,7 @@ response = client.chat.completions.create(
 The public contract is deliberately narrow:
 
 - The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK sends it through the standard `Authorization: Bearer` header and receives the normal response.
-- The hosted operator owns the gateway and eval configuration, separately credentialed R2 stores, upstream and GPU-provider credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
+- The hosted operator owns the gateway and eval configuration, separately credentialed R2 stores, upstream and Baseten credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
 
 During the single-tenant pilot, Milk issues, rotates, and revokes `dt_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `dragontales-gateway`, `DRAGONTALES_*`, and `dt_live_...` remain the stable binary, environment, and wire identifiers.
 
@@ -34,7 +34,7 @@ Milk Gateway is MIT-licensed. The hosted cloud proof has not run, so there is no
 - `status`: reports bounded counts without returning prompts, responses, or credentials.
 - Immutable claims, results, launch records, and signed route state in object storage.
 
-The maintained system is this gateway, [`milk-harness`](https://github.com/milkinfrastructure/milk-harness), and object storage. It adds no Milk database, queue, or resident manager service. The gateway never receives Modal or Baseten credentials. The one-shot harness verifies immutable launch records and calls the selected GPU provider with separately scoped credentials.
+The maintained system is this gateway, [`milk-harness`](https://github.com/milkinfrastructure/milk-harness), and object storage. It adds no Milk database, queue, or resident manager service. The gateway receives only the scoped key needed to call an admitted Baseten winner; Baseten management and training credentials remain in the one-shot harness process.
 
 ## Self-hosted configuration
 
@@ -134,9 +134,9 @@ See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.m
 
 ### Cloud-mechanics proof
 
-The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=20`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. The first Baseten-selected 20-call job must pass the exact admitted teacher profile before another provider create is authorized. Its separately confirmed all-in envelope is `$175`: `$160` of GPU reservations plus `$15` for the external services used by the proof. The provider ledger's `$1,000` ceiling and `$850` launch cutoff remain additional GPU controls.
+The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=20`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. The Baseten-only 20-call job must pass the exact admitted teacher profile before any later paid create is authorized. Its separately confirmed all-in envelope is `$175`: `$160` of GPU reservations plus `$15` for the external services used by the proof. The provider ledger's `$1,000` ceiling and `$850` launch cutoff remain additional GPU controls.
 
-This check proves the deployment, capture, provider, training, short canary, fallback, signed-zero, teardown, and zero-compute mechanics. Because its traffic is generated, it cannot production-qualify the release or admit the resulting candidate for real application traffic.
+This check proves the deployment, capture, Baseten execution, training, short canary, baseline route fallback, signed-zero, teardown, and zero-compute mechanics. Because its traffic is generated, it cannot production-qualify the release or admit the resulting candidate for real application traffic.
 
 Run the pinned official-SDK driver with an owner-only credential for the dedicated capture-enabled mechanics key:
 
@@ -174,7 +174,7 @@ The hosted release is production-qualified only after one cloud run proves the c
 2. Real captured traffic produces at least 251 retained teacher results: 50 TRAIN, 73 DEV, and 128 CALIBRATION. Partitioning or skipped traffic can require more requests. Generated traffic does not count.
 3. One student is trained and merged, then BF16, dynamic FP8, and static FP8 branches are evaluated on the same ordered DEV set.
 4. The deterministic winner passes authenticated canary and baseline-fallback checks.
-5. A signed zero route becomes active and Baseten and Modal are both observed at zero compute.
+5. A signed zero route becomes active and Baseten is observed at zero compute.
 
 A passing 20-call teacher job qualifies only that teacher/provider path, not the product.
 

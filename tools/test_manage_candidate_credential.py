@@ -23,19 +23,6 @@ ADMIN_KEY = "milk_admin_" + "A" * 48
 CANDIDATE_KEY = "bt_candidate_test_secret_123456789"
 CANDIDATE_SHA = hashlib.sha256(CANDIDATE_KEY.encode()).hexdigest()
 CLOUDFLARE_TOKEN = "D" * 40
-MODAL_ADMISSION_SHA = "4" * 64
-MODAL_RESULT_SHA = "3" * 64
-MODAL_RESULT_OBJECT_SHA = "8" * 64
-MODAL_SERVICE_NOT_AFTER = "2030-08-27T20:00:00Z"
-GATEWAY_ANCHOR = {
-    "source_commit": "c" * 40,
-    "image_admission_sha256": "d" * 64,
-    "release_sha256": "e" * 64,
-    "application_id": APPLICATION,
-    "application_version": 7,
-    "container_image": IMAGE,
-    "worker_version_id": PREVIOUS_WORKER,
-}
 
 
 def canonical(value):
@@ -75,36 +62,6 @@ def verify_request(frame=None):
         "schema_version": "milk.baseten-candidate-key-delivery-verify.v1",
         "team_name": delivery["team_name"],
     })
-
-
-def modal_request(schema, **extra):
-    value = {
-        "candidate_key_sha256": CANDIDATE_SHA,
-        "gateway_anchor": GATEWAY_ANCHOR,
-        "gateway_result_sha256": MODAL_RESULT_SHA,
-        "run_id": "b" * 64,
-        "schema_version": schema,
-        "selected_provider": "modal",
-        "service_not_after": MODAL_SERVICE_NOT_AFTER,
-        "winner_admission_sha256": MODAL_ADMISSION_SHA,
-    }
-    value.update(extra)
-    return canonical(value)
-
-
-def modal_install_request(candidate_sha=CANDIDATE_SHA):
-    return modal_request(
-        "milk.modal-candidate-key-install.v1",
-        candidate_key_sha256=candidate_sha,
-    )
-
-
-def modal_verify_request(ack=None):
-    return modal_request(
-        "milk.modal-candidate-key-verify.v1",
-        gateway_release_id=None if ack is None else ack["gateway_release_id"],
-        gateway_release_sha256=None if ack is None else ack["gateway_release_sha256"],
-    )
 
 
 def route_receipt(revision, basis_points, previous_revision=None):
@@ -166,42 +123,6 @@ def remove_request(installed_ack, trigger=None):
         "team_name": installed_ack["team_name"],
         "trigger": trigger,
     })
-
-
-def modal_remove_request(installed_ack, trigger=None):
-    trigger = trigger or {
-        "kind": "service_expired",
-        "service_not_after": MODAL_SERVICE_NOT_AFTER,
-    }
-    authorization = {
-        "schema_version": "dragontales.provider-teardown-authorization.v1",
-        "scope": {
-            "tenant_id": "10000000-0000-0000-0000-000000000001",
-            "project_id": "20000000-0000-0000-0000-000000000002",
-            "environment_id": "30000000-0000-0000-0000-000000000003",
-            "workload_id": "40000000-0000-0000-0000-000000000004",
-            "eval_id": "e" * 64,
-        },
-        "student_job_id": "1" * 64,
-        "claim_sha256": "2" * 64,
-        "winner_result_object_key": "control/winner-result.json",
-        "winner_result_sha256": MODAL_RESULT_OBJECT_SHA,
-        "provider_acceptance_sha256": "4" * 64,
-        "run_id": "b" * 64,
-        "selected_provider": "modal",
-        "execution_id": "execution-1",
-        "trigger": trigger,
-        "authorized_at": "2026-08-27T20:00:00Z",
-    }
-    return modal_request(
-        "milk.modal-candidate-key-remove.v1",
-        gateway_cleanup_authorization=authorization,
-        gateway_cleanup_authorization_sha256=hashlib.sha256(
-            gateway(authorization)
-        ).hexdigest(),
-        gateway_release_id=installed_ack["gateway_release_id"],
-        gateway_release_sha256=installed_ack["gateway_release_sha256"],
-    )
 
 
 FAKE_COMMAND = r'''#!/usr/bin/env python3
@@ -435,83 +356,23 @@ class Fixture:
         stdout, stderr = process.communicate(timeout=10)
         return process.returncode, bytes(response), stdout, stderr
 
-    def start_modal(self, mode, request, candidate=CANDIDATE_KEY.encode(), regular_candidate=False):
-        request_path = self.root / f"{mode}-{time.monotonic_ns()}.json"
-        request_path.write_bytes(request)
-        admin_read, admin_write = os.pipe()
-        os.write(admin_write, ADMIN_KEY.encode())
-        os.close(admin_write)
-        descriptors = [admin_read]
-        arguments = [
-            sys.executable,
-            str(SCRIPT),
-            mode,
-            "--request",
-            str(request_path),
-            "--admin-key-fd",
-            str(admin_read),
-        ]
-        if mode == "install-modal":
-            if regular_candidate:
-                candidate_path = self.root / "candidate.key"
-                candidate_path.write_bytes(candidate)
-                candidate_read = os.open(candidate_path, os.O_RDONLY)
-            else:
-                candidate_read, candidate_write = os.pipe()
-                os.write(candidate_write, candidate)
-                os.close(candidate_write)
-            descriptors.append(candidate_read)
-            arguments.extend(["--candidate-key-fd", str(candidate_read)])
-        environment = {
-            "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
-            "CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN": CLOUDFLARE_TOKEN,
-            "PATH": f"{self.bin}:{os.environ['PATH']}",
-        }
-        process = subprocess.Popen(
-            arguments,
-            cwd=ROOT,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            pass_fds=tuple(descriptors),
-        )
-        for descriptor in descriptors:
-            os.close(descriptor)
-        return process
-
-    def transact_modal(
-        self,
-        mode,
-        request,
-        candidate=CANDIDATE_KEY.encode(),
-        regular_candidate=False,
-    ):
-        process = self.start_modal(mode, request, candidate, regular_candidate)
-        stdout, stderr = process.communicate(timeout=10)
-        return process.returncode, stdout, stderr
-
-    def crash_modal_install_after_secret_put(self):
-        process = self.start_modal(
-            "install-modal",
-            modal_install_request(),
-        )
-        marker = self.root / "request-accepted"
-        deadline = time.monotonic() + 5
-        while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if not marker.exists():
-            process.kill()
-            process.communicate(timeout=5)
-            raise AssertionError("Modal secret write did not become observable")
-        process.kill()
-        (self.root / "continue-request").write_text("continue")
-        process.communicate(timeout=5)
-
     def close(self):
         self.temporary.cleanup()
 
 
 class CandidateCredentialHelperTests(unittest.TestCase):
+    def test_only_baseten_socket_mode_is_exposed(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"serve-baseten", result.stdout)
+        for removed in (b"install-modal", b"verify-modal", b"remove-modal"):
+            self.assertNotIn(removed, result.stdout)
+
     def test_socket_install_verify_remove_are_canonical_and_secret_free(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
@@ -741,174 +602,6 @@ class CandidateCredentialHelperTests(unittest.TestCase):
             self.assertEqual((response, stdout), (b"", b""))
             self.assertEqual(stderr, b"candidate credential operation failed\n")
         self.assertEqual(fixture.state["commands"], [])
-
-    def test_modal_install_verify_remove_are_canonical_idempotent_and_secret_free(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        code, installed_raw, stderr = fixture.transact_modal(
-            "install-modal", modal_install_request()
-        )
-        self.assertEqual((code, stderr), (0, b""))
-        installed = json.loads(installed_raw)
-        self.assertEqual(installed_raw, canonical(installed))
-        self.assertEqual(installed["schema_version"], "milk.modal-candidate-key-ack.v1")
-        self.assertEqual(installed["state"], "installed")
-        self.assertEqual(installed["gateway_anchor"], GATEWAY_ANCHOR)
-        self.assertEqual(installed["gateway_release_id"], INSTALLED_WORKER)
-        self.assertRegex(installed["gateway_release_sha256"], r"^[0-9a-f]{64}$")
-
-        code, verified_raw, stderr = fixture.transact_modal(
-            "verify-modal", modal_verify_request(installed)
-        )
-        self.assertEqual((code, stderr), (0, b""))
-        verified = json.loads(verified_raw)
-        self.assertEqual(verified["state"], "installed")
-        self.assertEqual(verified["gateway_release_id"], INSTALLED_WORKER)
-        self.assertNotEqual(
-            verified["gateway_release_sha256"], installed["gateway_release_sha256"]
-        )
-
-        request = modal_remove_request(verified)
-        code, removed_raw, stderr = fixture.transact_modal("remove-modal", request)
-        self.assertEqual((code, stderr), (0, b""))
-        removed = json.loads(removed_raw)
-        self.assertEqual(removed["state"], "absent")
-        self.assertEqual(removed["gateway_release_id"], REMOVED_WORKER)
-        self.assertRegex(removed["gateway_release_sha256"], r"^[0-9a-f]{64}$")
-        self.assertFalse(fixture.state["candidate_installed"])
-
-        code, repeated_raw, stderr = fixture.transact_modal("remove-modal", request)
-        self.assertEqual((code, stderr), (0, b""))
-        self.assertEqual(json.loads(repeated_raw)["state"], "absent")
-        for raw in (installed_raw, verified_raw, removed_raw, repeated_raw, fixture.state_path.read_bytes()):
-            self.assertNotIn(CANDIDATE_KEY.encode(), raw)
-            self.assertNotIn(ADMIN_KEY.encode(), raw)
-        for command in fixture.state["commands"]:
-            arguments = " ".join(command["arguments"])
-            self.assertNotIn(CANDIDATE_KEY, arguments)
-            self.assertNotIn(ADMIN_KEY, arguments)
-
-    def test_modal_digest_mismatch_and_regular_candidate_file_fail_before_commands(self):
-        for request, regular_candidate in (
-            (modal_install_request("0" * 64), False),
-            (modal_install_request(), True),
-        ):
-            fixture = Fixture()
-            self.addCleanup(fixture.close)
-            code, stdout, stderr = fixture.transact_modal(
-                "install-modal",
-                request,
-                regular_candidate=regular_candidate,
-            )
-            self.assertEqual(code, 1)
-            self.assertEqual(stdout, b"")
-            self.assertEqual(stderr, b"candidate credential operation failed\n")
-            self.assertFalse(fixture.state["candidate_installed"])
-            self.assertEqual(fixture.state["commands"], [])
-
-    def test_modal_ambiguous_secret_write_rolls_back_to_proven_absence(self):
-        fixture = Fixture("put_ambiguous")
-        self.addCleanup(fixture.close)
-        code, stdout, stderr = fixture.transact_modal(
-            "install-modal", modal_install_request()
-        )
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, b"")
-        self.assertEqual(stderr, b"candidate credential operation failed\n")
-        self.assertFalse(fixture.state["candidate_installed"])
-        operations = [
-            argument.split(": ", 1)[1]
-            for command in fixture.state["commands"]
-            if command["command"] == "curl"
-            for argument in command["arguments"]
-            if argument.startswith("x-milk-candidate-operation: ")
-        ]
-        self.assertEqual(operations, ["verify", "remove"])
-
-    def test_modal_crash_after_secret_write_recovers_without_plaintext(self):
-        fixture = Fixture("hold_after_put")
-        self.addCleanup(fixture.close)
-        fixture.crash_modal_install_after_secret_put()
-        self.assertTrue(fixture.state["candidate_installed"])
-        code, recovered_raw, stderr = fixture.transact_modal(
-            "verify-modal", modal_verify_request()
-        )
-        self.assertEqual((code, stderr), (0, b""))
-        recovered = json.loads(recovered_raw)
-        self.assertEqual(recovered["state"], "installed")
-        self.assertEqual(recovered["gateway_release_id"], INSTALLED_WORKER)
-        self.assertNotIn(CANDIDATE_KEY.encode(), recovered_raw)
-        self.assertNotIn(ADMIN_KEY.encode(), recovered_raw)
-
-    def test_modal_ambiguous_delete_is_recovered_and_returns_absence_proof(self):
-        fixture = Fixture("delete_ambiguous")
-        self.addCleanup(fixture.close)
-        code, installed_raw, _stderr = fixture.transact_modal(
-            "install-modal", modal_install_request()
-        )
-        self.assertEqual(code, 0)
-        installed = json.loads(installed_raw)
-        code, verified_raw, _stderr = fixture.transact_modal(
-            "verify-modal", modal_verify_request(installed)
-        )
-        self.assertEqual(code, 0)
-        code, removed_raw, stderr = fixture.transact_modal(
-            "remove-modal", modal_remove_request(json.loads(verified_raw))
-        )
-        self.assertEqual((code, stderr), (0, b""))
-        removed = json.loads(removed_raw)
-        self.assertEqual(removed["state"], "absent")
-        self.assertEqual(removed["gateway_release_id"], REMOVED_WORKER)
-        self.assertFalse(fixture.state["candidate_installed"])
-
-    def test_modal_remove_is_replay_safe_after_secret_delete_failure(self):
-        fixture = Fixture("delete_fail_once")
-        self.addCleanup(fixture.close)
-        code, installed_raw, _stderr = fixture.transact_modal(
-            "install-modal", modal_install_request()
-        )
-        self.assertEqual(code, 0)
-        code, verified_raw, _stderr = fixture.transact_modal(
-            "verify-modal", modal_verify_request(json.loads(installed_raw))
-        )
-        self.assertEqual(code, 0)
-        request = modal_remove_request(json.loads(verified_raw))
-
-        code, stdout, stderr = fixture.transact_modal("remove-modal", request)
-        self.assertEqual((code, stdout), (1, b""))
-        self.assertEqual(stderr, b"candidate credential operation failed\n")
-        self.assertTrue(fixture.state["candidate_installed"])
-        self.assertEqual(fixture.state["container_last_change"], 1200)
-
-        code, removed_raw, stderr = fixture.transact_modal("remove-modal", request)
-        self.assertEqual((code, stderr), (0, b""))
-        self.assertEqual(json.loads(removed_raw)["state"], "absent")
-        self.assertFalse(fixture.state["candidate_installed"])
-
-    def test_modal_remove_requires_exact_gateway_expiry_authorization(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        code, installed_raw, _stderr = fixture.transact_modal(
-            "install-modal", modal_install_request()
-        )
-        self.assertEqual(code, 0)
-        installed = json.loads(installed_raw)
-        code, verified_raw, _stderr = fixture.transact_modal(
-            "verify-modal", modal_verify_request(installed)
-        )
-        self.assertEqual(code, 0)
-        wrong_trigger = {
-            "kind": "service_expired",
-            "service_not_after": "2030-08-27T20:00:01Z",
-        }
-        code, stdout, stderr = fixture.transact_modal(
-            "remove-modal",
-            modal_remove_request(json.loads(verified_raw), wrong_trigger),
-        )
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, b"")
-        self.assertEqual(stderr, b"candidate credential operation failed\n")
-        self.assertTrue(fixture.state["candidate_installed"])
 
     @staticmethod
     def state_path_bytes(fixture):
