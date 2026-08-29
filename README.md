@@ -1,8 +1,6 @@
 # Milk Gateway
 
-Milk Gateway is a small OpenAI-compatible proxy that turns real application traffic into bounded, auditable evaluation work.
-
-For the hosted product, an application changes only its official OpenAI SDK base URL and API key. The SDK sends that key through the standard `Authorization: Bearer` header. The gateway forwards the request to the configured upstream model, returns the normal response, and captures only traffic explicitly admitted for evaluation. It does not run a model locally and it does not require a GPU.
+Milk Gateway is a small, CPU-only OpenAI-compatible proxy. A hosted customer changes only the official OpenAI SDK base URL and API key. No SDK wrapper, custom authentication header, routing header, local model, or local GPU is required.
 
 ```python
 from openai import OpenAI
@@ -18,18 +16,23 @@ response = client.chat.completions.create(
 )
 ```
 
-The hosted surface is deliberately narrow: the customer supplies the `base_url` and one `dt_live_...` key, which the SDK sends as `Authorization: Bearer dt_live_...`. Milk Infrastructure owns the hosted eval configuration, object stores, upstream and provider credentials, and route policy. Self-hosters run the same gateway and supply their own JSON configuration and environment secrets.
+The public contract is deliberately narrow:
+
+- The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK sends it through the standard `Authorization: Bearer` header and receives the normal response.
+- The hosted operator owns the gateway and eval configuration, separately credentialed R2 stores, upstream and GPU-provider credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
+
+The gateway records only completed traffic admitted by the operator's capture policy. It loads one strict startup configuration, reports its SHA-256, and polls signed, revisioned route state while retaining the last verified route after a failed refresh.
 
 Milk Gateway is MIT-licensed. Source publication does not imply a live hosted endpoint or a production-qualified release; those require the cloud proof below.
 
-## What it owns
+## Product boundary
 
-- `serve`: authenticates, proxies, and asynchronously records selected completed requests.
-- `tick --once`: converts captured traffic into at most one safe control-plane action.
+- `serve`: authenticates, proxies, captures admitted completed requests, and follows verified route state.
+- `tick --once`: converts captured traffic and eval configuration into at most one safe control-plane action.
 - `status`: reports bounded counts without returning prompts, responses, or credentials.
 - Immutable claims, results, launch records, and signed route state in object storage.
 
-The gateway never holds Modal or Baseten credentials. Provider execution lives in [`milk-harness`](https://github.com/milkinfrastructure/milk-harness), which watches captured traffic and stops new eval generation at the configured per-eval limit.
+The maintained system is this gateway, [`milk-harness`](https://github.com/milkinfrastructure/milk-harness), and object storage. It adds no Milk database, queue, or resident manager service. The gateway never receives Modal or Baseten credentials. The one-shot harness verifies immutable launch records and calls the selected GPU provider with separately scoped credentials.
 
 ## Self-hosted configuration
 
