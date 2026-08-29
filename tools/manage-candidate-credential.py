@@ -187,7 +187,7 @@ AUTH_KEYS = (
     "provider_acceptance_sha256", "run_id", "selected_provider",
     "execution_id", "trigger", "authorized_at",
 )
-SCOPE_KEYS = ("tenant_id", "project_id", "environment_id", "workload_id")
+SCOPE_KEYS = ("tenant_id", "project_id", "environment_id", "workload_id", "eval_id")
 ROUTE_RECEIPT_KEYS = (
     "schema_version", "route_revision", "student_job_id", "student_result_sha256",
     "model_manifest_sha256", "dev_receipt_sha256", "previous_route_revision",
@@ -280,7 +280,11 @@ def ordered_authorization(value, metadata):
     authorization["trigger"] = ordered_trigger(authorization["trigger"])
     if (
         authorization["schema_version"] != TEARDOWN_SCHEMA
-        or any(UUID.fullmatch(authorization["scope"][key] or "") is None for key in SCOPE_KEYS)
+        or any(
+            UUID.fullmatch(authorization["scope"][key] or "") is None
+            for key in SCOPE_KEYS[:-1]
+        )
+        or SHA256.fullmatch(authorization["scope"]["eval_id"] or "") is None
         or SHA256.fullmatch(authorization["student_job_id"] or "") is None
         or SHA256.fullmatch(authorization["claim_sha256"] or "") is None
         or not bounded_text(authorization["winner_result_object_key"], 1024)

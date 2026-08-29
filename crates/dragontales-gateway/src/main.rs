@@ -233,6 +233,7 @@ struct FileConfig {
     project_id: Uuid,
     environment_id: Uuid,
     workload_id: Uuid,
+    eval_id: String,
     max_request_bytes: usize,
     max_in_flight: usize,
     max_outcomes_in_flight: usize,
@@ -1867,6 +1868,7 @@ fn config_scope(config: &FileConfig) -> Scope {
         project_id: config.project_id,
         environment_id: config.environment_id,
         workload_id: config.workload_id,
+        eval_id: config.eval_id.clone(),
     }
 }
 
@@ -1876,6 +1878,7 @@ fn config_route_scope(config: &FileConfig) -> RouteScope {
         project_id: config.project_id,
         environment_id: config.environment_id,
         workload_id: config.workload_id,
+        eval_id: config.eval_id.clone(),
     }
 }
 
@@ -2076,6 +2079,7 @@ fn validate_serve_config_owner(config: &FileConfig, owner: InputOwner) -> Result
 }
 
 fn validate_config_identity(config: &FileConfig) -> Result<()> {
+    records::validate_eval_id(&config.eval_id)?;
     let identities = [
         config.outcome_key_id,
         config.tenant_id,

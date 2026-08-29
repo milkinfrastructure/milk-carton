@@ -149,6 +149,7 @@ pub(crate) struct Scope {
     pub(crate) project_id: Uuid,
     pub(crate) environment_id: Uuid,
     pub(crate) workload_id: Uuid,
+    pub(crate) eval_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -703,21 +704,22 @@ fn conditional_update_version(meta: &ObjectMeta, object: &str) -> Result<UpdateV
 
 fn classify_store_path(location: &ObjectPath) -> object_store::Result<StorePartition> {
     let parts = location.as_ref().split('/').collect::<Vec<_>>();
-    if parts.len() < 7
+    if parts.len() < 8
         || parts[0] != "dt"
-        || parts[1] != "v2"
-        || parts[2..6].iter().any(|part| {
+        || parts[1] != "v3"
+        || !valid_lowercase_hex(parts[2], 64)
+        || parts[3..7].iter().any(|part| {
             Uuid::parse_str(part).map_or(true, |value| value.is_nil() || value.to_string() != *part)
         })
     {
         return Err(store_permission_error(
             location,
-            "object key is outside a scoped dt/v2 authority",
+            "object key is outside a scoped dt/v3 eval authority",
         ));
     }
-    Ok(match parts[6] {
+    Ok(match parts[7] {
         "stats" | "traces" | "outcomes" | "tombstones" | "expiry-index" => StorePartition::Capture,
-        "frontier" if parts.get(7) == Some(&"snapshots") => StorePartition::Capture,
+        "frontier" if parts.get(8) == Some(&"snapshots") => StorePartition::Capture,
         "routes" => StorePartition::Routes,
         _ => StorePartition::Control,
     })
@@ -2432,6 +2434,7 @@ struct SortedProviderTeardownAuthorization<'a> {
 #[derive(Serialize)]
 struct SortedScope<'a> {
     environment_id: &'a Uuid,
+    eval_id: &'a str,
     project_id: &'a Uuid,
     tenant_id: &'a Uuid,
     workload_id: &'a Uuid,
@@ -3908,6 +3911,7 @@ impl Records {
         scope: Scope,
         capture_basis_points: u16,
     ) -> Result<Self> {
+        validate_scope(&scope)?;
         if queue_max_bytes == 0 || queue_max_bytes > u32::MAX as usize {
             bail!("queue_max_bytes must be in 1..=u32::MAX");
         }
@@ -3966,6 +3970,7 @@ impl Records {
                 project_id: Uuid::new_v4(),
                 environment_id: Uuid::new_v4(),
                 workload_id: Uuid::new_v4(),
+                eval_id: "11".repeat(32),
             },
             capture_basis_points: 0,
             counters: StatsCounters::default(),
@@ -12691,7 +12696,7 @@ pub(crate) fn validate_cloudflare_r2_identity(account_id: &str, bucket: &str) ->
 }
 
 pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Result<()> {
-    let prefix = ObjectPath::from(format!("dt/v2/_r2_probe/{}", Uuid::new_v4()));
+    let prefix = ObjectPath::from(format!("dt/v3/_r2_probe/{}", Uuid::new_v4()));
     let object = prefix.child("semantics");
     let first_payload = PutPayload::from_static(b"dragontales-r2-probe-v1");
     let second_payload = PutPayload::from_static(b"dragontales-r2-probe-v2");
@@ -12780,7 +12785,7 @@ pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Resul
 }
 
 pub(crate) async fn probe_cloudflare_r2_read(objects: &Arc<dyn ObjectStore>) -> Result<()> {
-    let prefix = ObjectPath::from("dt/v2");
+    let prefix = ObjectPath::from("dt/v3");
     let mut listed = objects.list(Some(&prefix));
     if let Some(result) = listed.next().await {
         result?;
@@ -13765,9 +13770,28 @@ fn valid_lowercase_hex(value: &str, length: usize) -> bool {
 
 fn scope_prefix(scope: &Scope) -> String {
     format!(
-        "dt/v2/{}/{}/{}/{}",
-        scope.tenant_id, scope.project_id, scope.environment_id, scope.workload_id
+        "dt/v3/{}/{}/{}/{}/{}",
+        scope.eval_id, scope.tenant_id, scope.project_id, scope.environment_id, scope.workload_id
     )
+}
+
+fn validate_scope(scope: &Scope) -> Result<()> {
+    if scope.tenant_id.is_nil()
+        || scope.project_id.is_nil()
+        || scope.environment_id.is_nil()
+        || scope.workload_id.is_nil()
+        || validate_eval_id(&scope.eval_id).is_err()
+    {
+        bail!("scope UUIDs and eval ID are invalid");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_eval_id(eval_id: &str) -> Result<()> {
+    if !valid_lowercase_hex(eval_id, 64) {
+        bail!("eval_id must be exactly 64 lowercase hexadecimal characters");
+    }
+    Ok(())
 }
 
 fn hour_start(value: DateTime<Utc>) -> DateTime<Utc> {
@@ -14705,10 +14729,7 @@ fn validate_student_job_claim(
     if serde_json::to_vec(claim)? != payload
         || !valid_version
         || claim.scope != *scope
-        || scope.tenant_id.is_nil()
-        || scope.project_id.is_nil()
-        || scope.environment_id.is_nil()
-        || scope.workload_id.is_nil()
+        || validate_scope(scope).is_err()
         || claim.student_job_id != hex_digest(student_job_id)
         || definition_sha256 != *student_job_id
         || !valid_lowercase_sha256(&claim.definition.teacher_provider_binding_sha256)
@@ -15298,6 +15319,7 @@ impl<'a> SortedProviderTeardownAuthorization<'a> {
             schema_version: &authorization.schema_version,
             scope: SortedScope {
                 environment_id: &authorization.scope.environment_id,
+                eval_id: &authorization.scope.eval_id,
                 project_id: &authorization.scope.project_id,
                 tenant_id: &authorization.scope.tenant_id,
                 workload_id: &authorization.scope.workload_id,
@@ -17713,10 +17735,7 @@ fn validate_tick_lease(
     if serde_json::to_vec(lease)? != payload
         || lease.schema_version != "dragontales.tick-lease.v1"
         || lease.scope != *scope
-        || scope.tenant_id.is_nil()
-        || scope.project_id.is_nil()
-        || scope.environment_id.is_nil()
-        || scope.workload_id.is_nil()
+        || validate_scope(scope).is_err()
         || lease.owner_id.is_nil()
         || lease.owner_id.get_version_num() != 7
         || lease.owner_id.get_timestamp().is_none()
@@ -18055,6 +18074,7 @@ fn route_scope(scope: &Scope) -> RouteScope {
         project_id: scope.project_id,
         environment_id: scope.environment_id,
         workload_id: scope.workload_id,
+        eval_id: scope.eval_id.clone(),
     }
 }
 
@@ -18334,6 +18354,7 @@ mod tests {
             project_id: Uuid::from_u128(2),
             environment_id: Uuid::from_u128(3),
             workload_id: Uuid::from_u128(4),
+            eval_id: "11".repeat(32),
         }
     }
 
@@ -18377,9 +18398,10 @@ mod tests {
             );
         }
         for invalid in [
-            "dt/v2/_r2_probe/probe",
-            "dt/v2/not-a-uuid/2/3/4/stats/x",
-            "dt/v2/00000000-0000-0000-0000-000000000001/stats/x",
+            "dt/v3/_r2_probe/probe",
+            "dt/v3/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/not-a-uuid/2/3/4/stats/x",
+            "dt/v3/not-a-digest/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003/00000000-0000-0000-0000-000000000004/stats/x",
+            "dt/v3/00000000-0000-0000-0000-000000000001/stats/x",
             "stats/x",
         ] {
             assert!(classify_store_path(&ObjectPath::from(invalid)).is_err());
@@ -23327,6 +23349,45 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn teacher_decision_limit_isolated_by_eval_id() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = gpu_launch_test_store(objects);
+        let first_scope = qualification_scope();
+        let mut second_scope = first_scope.clone();
+        second_scope.eval_id = "22".repeat(32);
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        persist_gpu_test_traces(&store, &first_scope, now, 1).await;
+        persist_gpu_test_traces(&store, &second_scope, now, 1).await;
+        let analyzer = test_gpu_snapshot_analyzer(60, 1, 1);
+
+        for scope in [&first_scope, &second_scope] {
+            let (authorization, authorization_sha256) = test_snapshot_authorization_with_limit(
+                scope,
+                &analyzer,
+                1,
+                now + TimeDelta::days(1),
+            );
+            assert!(matches!(
+                store
+                    .claim_teacher_gpu_run(
+                        scope,
+                        authorization,
+                        authorization_sha256,
+                        analyzer.clone(),
+                        now,
+                    )
+                    .await
+                    .unwrap(),
+                TeacherGpuTickWrite::Launch(_)
+            ));
+            assert_eq!(store.teacher_decision_count(scope).await.unwrap(), 1);
+        }
+
+        assert_ne!(scope_prefix(&first_scope), scope_prefix(&second_scope));
+        assert!(scope_prefix(&first_scope).starts_with(&format!("dt/v3/{}/", first_scope.eval_id)));
+    }
+
+    #[actix_web::test]
     async fn teacher_decision_counter_rejects_malformed_index_keys() {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = gpu_launch_test_store(Arc::clone(&objects));
@@ -23432,7 +23493,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn workload_teacher_decision_limit_survives_terminalization_and_provider_rotation() {
+    async fn eval_teacher_decision_limit_survives_terminalization_and_provider_rotation() {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = gpu_launch_test_store(objects);
         let scope = qualification_scope();
@@ -25073,7 +25134,7 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let first = build_local(&root).unwrap();
         let second = build_local(&root).unwrap();
-        let object = ObjectPath::from("dt/v2/local-cas/lease.json");
+        let object = ObjectPath::from("dt/v3/local-cas/lease.json");
         let initial = first
             .put_opts(
                 &object,
@@ -25146,6 +25207,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             environment_id: Uuid::new_v4(),
             workload_id: Uuid::new_v4(),
+            eval_id: "33".repeat(32),
         };
         let occurred_at = Utc::now().with_nanosecond(0).unwrap();
         let mut trace = test_capture(
@@ -25405,6 +25467,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             environment_id: Uuid::new_v4(),
             workload_id: Uuid::new_v4(),
+            eval_id: "44".repeat(32),
         };
         let records = Records::start(objects, 128 * 1_024, 64 * 1_024, scope.clone(), 10_000)
             .await
@@ -25458,6 +25521,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             environment_id: Uuid::new_v4(),
             workload_id: Uuid::new_v4(),
+            eval_id: "55".repeat(32),
         };
         let now = Utc::now();
         let catalog = test_capture(

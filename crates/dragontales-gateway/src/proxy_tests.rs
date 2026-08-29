@@ -126,6 +126,9 @@ fn traffic_authentication_returns_only_the_configured_cohort() {
 
 #[test]
 fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
+    let mut invalid_eval = config(1_024, 1);
+    invalid_eval.eval_id = "A".repeat(64);
+    assert!(validate_config_identity(&invalid_eval).is_err());
     let mut invalid = config(1_024, 1);
     invalid.workload_id = Uuid::nil();
     assert!(validate_config_identity(&invalid).is_err());
@@ -434,7 +437,7 @@ async fn due_expiry_returns_before_teacher_readiness() {
 }
 
 #[actix_web::test]
-async fn status_contract_exposes_workload_teacher_decision_limit() {
+async fn status_contract_exposes_eval_teacher_decision_limit() {
     #[derive(Deserialize)]
     struct GenerationContract {
         max_decisions: u32,
@@ -618,6 +621,7 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
         project_id: Uuid::new_v4(),
         environment_id: Uuid::new_v4(),
         workload_id: Uuid::new_v4(),
+        eval_id: "11".repeat(32),
         max_request_bytes,
         max_in_flight,
         max_outcomes_in_flight: 2,
@@ -718,6 +722,7 @@ async fn disabled_capture_still_emits_content_free_statistics() {
         project_id: gateway_config.project_id,
         environment_id: gateway_config.environment_id,
         workload_id: gateway_config.workload_id,
+        eval_id: gateway_config.eval_id.clone(),
     };
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let records = Records::start(
@@ -1112,6 +1117,7 @@ fn fragmented_capture_never_retains_capacity_above_record_limit() {
         project_id: Uuid::new_v4(),
         environment_id: Uuid::new_v4(),
         workload_id: Uuid::new_v4(),
+        eval_id: "22".repeat(32),
     };
     let mut recorder = TraceRecorder {
         records: None,
@@ -1378,6 +1384,7 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         project_id: gateway_config.project_id,
         environment_id: gateway_config.environment_id,
         workload_id: gateway_config.workload_id,
+        eval_id: gateway_config.eval_id.clone(),
     };
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let object_probe = Arc::clone(&objects);

@@ -41,7 +41,7 @@ The important settings are:
 - accepted request-key hashes and stable traffic cohorts;
 - `capture_allowed` for each request key;
 - capture, control, and route object stores;
-- one eval scope and its hard decision/call limits;
+- one strict eval identity, its isolated object namespace, and its hard decision/call limits;
 - immutable teacher, student, and image identities.
 
 Secrets stay in environment variables:
@@ -81,7 +81,7 @@ The local path can use three private directories. Production uses three separate
 
 ## Bounded evaluation loop
 
-`tick --once` reads captured traffic and the current eval configuration. It acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached. Existing reconciliation and teardown continue even after the limit.
+`tick --once` reads captured traffic and the current eval configuration. Its required `eval_id` is the 64-character lowercase campaign identity admitted with the canonical eval document. That ID is embedded in every durable scope and object key. It acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached for that eval. Existing reconciliation and teardown continue even after the limit.
 
 The object store is authoritative. A scheduler, Exo, or a local shell may invoke the command, but none of them can manufacture a claim or authorize provider spend.
 

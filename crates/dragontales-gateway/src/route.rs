@@ -191,6 +191,7 @@ pub(crate) struct RouteScope {
     pub(crate) project_id: Uuid,
     pub(crate) environment_id: Uuid,
     pub(crate) workload_id: Uuid,
+    pub(crate) eval_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1121,6 +1122,7 @@ impl RoutePolicy {
                         project_id: Uuid::nil(),
                         environment_id: Uuid::nil(),
                         workload_id: Uuid::nil(),
+                        eval_id: "00".repeat(32),
                     },
                     cohort_sha256: "22".repeat(32),
                     student_job_id: "33".repeat(32),
@@ -1629,6 +1631,7 @@ mod tests {
                 project_id: "22222222-2222-4222-8222-222222222222".parse().unwrap(),
                 environment_id: "33333333-3333-4333-8333-333333333333".parse().unwrap(),
                 workload_id: "44444444-4444-4444-8444-444444444444".parse().unwrap(),
+                eval_id: "55".repeat(32),
             };
             let secret_hex = hex_bytes(&ROUTE_SECRET);
             let route_secret_sha256: [u8; 32] = Sha256::digest(ROUTE_SECRET).into();
@@ -2357,6 +2360,9 @@ mod tests {
         let mut wrong_scope = fixture.scope.clone();
         wrong_scope.workload_id = Uuid::new_v4();
         assert!(load_bytes(&fixture, &fixture.config, &wrong_scope, &fixture.secret_hex).is_err());
+        let mut wrong_eval = fixture.scope.clone();
+        wrong_eval.eval_id = "66".repeat(32);
+        assert!(load_bytes(&fixture, &fixture.config, &wrong_eval, &fixture.secret_hex).is_err());
 
         let mut wrong_terms = fixture.config.clone();
         wrong_terms.authorized_provider_terms_sha256 = repeated_digest(0xaa);
