@@ -35,18 +35,18 @@ def _digest(raw):
 class GitHubRegistryHelperTests(unittest.TestCase):
     def test_visibility_is_fixed_to_the_milk_organization(self):
         with mock.patch.object(GITHUB_REGISTRY, "_get_json", return_value=[{
-            "name": "milk-gateway", "visibility": "private",
+            "name": "milk-carton", "visibility": "private",
         }]) as request:
             self.assertEqual(
                 GITHUB_REGISTRY.package_visibility(
-                    b"bounded-token", "milkinfrastructure", "milk-gateway"
+                    b"bounded-token", "milkinfrastructure", "milk-carton"
                 ),
                 "private",
             )
         self.assertIn("package_type=container", request.call_args.args[0])
         with self.assertRaisesRegex(ValueError, "identity"):
             GITHUB_REGISTRY.package_visibility(
-                b"bounded-token", "another-organization", "milk-gateway"
+                b"bounded-token", "another-organization", "milk-carton"
             )
 
     def test_token_file_must_be_owner_only_and_outside_checkout(self):
@@ -122,7 +122,7 @@ class VerifierFixture:
             "os": "linux",
             "config": {
                 "User": "65532:65532",
-                "Entrypoint": ["/usr/local/bin/dragontales-gateway"],
+                "Entrypoint": ["/usr/local/bin/milk-carton"],
                 "Cmd": ["serve"],
                 "Labels": {
                     "org.opencontainers.image.source": VERIFY.SOURCE_REPOSITORY,
@@ -241,7 +241,7 @@ class VerifierFixture:
                 "packages": [
                     {
                         "SPDXID": "SPDXRef-Package-gateway",
-                        "name": "milk-gateway",
+                        "name": "milk-carton",
                         "checksums": [
                             {
                                 "algorithm": "SHA256",
@@ -574,7 +574,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
                     json.dumps(vars(arguments), sort_keys=True, separators=(",", ":")) + "\n",
                     encoding="utf-8",
                 )
-                image = "ghcr.io/milkinfrastructure/milk-gateway@sha256:" + "a" * 64
+                image = "ghcr.io/milkinfrastructure/milk-carton@sha256:" + "a" * 64
                 print(image + "\t" + hashlib.sha256(raw.encode()).hexdigest())
                 """
             ).lstrip(),
@@ -613,7 +613,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
                     [ "${TEST_GIT_DIRTY:-0}" -eq 0 ] || printf '%s\n' ' M dirty'
                     ;;
                   'remote get-url origin')
-                    printf '%s\n' "${TEST_ORIGIN:-git@github.com:milkinfrastructure/milk-gateway.git}"
+                    printf '%s\n' "${TEST_ORIGIN:-git@github.com:milkinfrastructure/milk-carton.git}"
                     ;;
                   'ls-remote --exit-code origin HEAD')
                     printf '%s\tHEAD\n' "${TEST_REMOTE_HEAD:-$TEST_REVISION}"
@@ -828,7 +828,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
         self.assertFalse(config_path.exists())
         build_line = next(line for line in commands.splitlines() if "|build|" in line)
         self.assertNotIn("|" + str(ROOT), build_line)
-        self.assertIn("/milk-gateway-release.", build_line)
+        self.assertIn("/milk-carton-release.", build_line)
         self.assertEqual(commands.count("|buildx|create|"), 1)
         self.assertEqual(commands.count("|buildx|rm|"), 1)
         version_lines = [line for line in commands.splitlines() if "|buildx|version" in line]
@@ -889,7 +889,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
     def test_rejects_dirty_wrong_origin_unpublished_head_credentials_and_remote_docker(self):
         cases = {
             "dirty": {"TEST_GIT_DIRTY": 1},
-            "origin": {"TEST_ORIGIN": "https://github.com/example/milk-gateway.git"},
+            "origin": {"TEST_ORIGIN": "https://github.com/example/milk-carton.git"},
             "remote-head": {"TEST_REMOTE_HEAD": "5" * 40},
             "ambient-provider": {"AWS_SECRET_ACCESS_KEY": "secret"},
             "remote-docker": {"TEST_ENDPOINT": "tcp://builder.example:2376"},

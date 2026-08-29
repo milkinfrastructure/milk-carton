@@ -15,14 +15,15 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "tools/deploy-private-gateway.sh"
 ACCOUNT = "a" * 32
 APPLICATION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-APPLICATION_NAME = "dragontales-gateway-dragontalesgateway"
+APPLICATION_NAME = "milk-carton-milkcarton"
+API_BASE_URL = "https://carton.example/v1"
 COMMIT = "1" * 40
 PREVIOUS_WORKER = "11111111-1111-1111-1111-111111111111"
 CURRENT_WORKER = "22222222-2222-2222-2222-222222222222"
 PREVIOUS_IMAGE = f"registry.cloudflare.com/{ACCOUNT}/legacy-gateway:previous"
 BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
 DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
-SMOKE_API_KEY = "dt_live_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee_private-test-secret"
+SMOKE_API_KEY = "milk_live_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee_private-test-secret"
 SMOKE_COHORT = "deployment-smoke-v1"
 
 
@@ -35,18 +36,19 @@ def sha256(raw):
 
 
 SMOKE_GATEWAY_CONFIG = json.loads(
-    (ROOT / "deploy/dragontales-config.example.json").read_text()
+    (ROOT / "deploy/milk-carton-config.example.json").read_text()
 )
 SMOKE_GATEWAY_CONFIG["traffic_keys"] = [{
     "api_key_sha256": sha256(SMOKE_API_KEY.encode()),
     "capture_allowed": False,
-    "cohort_id": SMOKE_COHORT,
 }]
 BOOTSTRAP_SECRETS = {
-    "DRAGONTALES_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
-    "DRAGONTALES_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
-    "DRAGONTALES_OPENAI_API_KEY": "bootstrap-openai-private",
-    "DRAGONTALES_ROUTE_SECRET_HEX": "0" * 64,
+    "MILK_CARTON_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
+    "MILK_CARTON_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
+    "MILK_CARTON_OPENAI_API_KEY": "bootstrap-openai-private",
+    "MILK_CARTON_ROUTE_SECRET_HEX": "0" * 64,
+    "MILK_CAPTURE_SAMPLING_KEY_HEX": "1" * 64,
+    "MILK_CAPTURE_SAMPLING_KEY_VERSION": "pilot-v1",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID": "bootstrap-capture-access-private",
     "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY": "bootstrap-capture-secret-private",
     "MILK_ROUTE_STORE_ACCESS_KEY_ID": "bootstrap-route-access-private",
@@ -109,13 +111,13 @@ def make_release(directory):
     }
     index_raw = canonical(index)
     index_sha = sha256(index_raw)
-    image_reference = f"ghcr.io/milkinfrastructure/milk-gateway@sha256:{index_sha}"
+    image_reference = f"ghcr.io/milkinfrastructure/milk-carton@sha256:{index_sha}"
     admission = {
         "schema_version": "milk.private-image-admission.v1",
         "artifact": "gateway",
-        "repository": "ghcr.io/milkinfrastructure/milk-gateway",
+        "repository": "ghcr.io/milkinfrastructure/milk-carton",
         "image_reference": image_reference,
-        "source_repository": "https://github.com/milkinfrastructure/milk-gateway",
+        "source_repository": "https://github.com/milkinfrastructure/milk-carton",
         "source_commit": COMMIT,
         "source_context_method": "git-archive-tar-v1",
         "source_context_sha256": "2" * 64,
@@ -161,7 +163,7 @@ def make_release(directory):
         "schema_version": "milk.private-gateway-release.v1",
         "source_commit": COMMIT,
         "source_date_epoch": 1700000000,
-        "source_repository": "https://github.com/milkinfrastructure/milk-gateway",
+        "source_repository": "https://github.com/milkinfrastructure/milk-carton",
         "buildkit_image_reference": BUILDKIT_IMAGE,
         "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
         "build_authority": "local-socket",
@@ -229,7 +231,7 @@ if name == "git":
         if state["mode"] == "dirty":
             print(" M deploy/cloudflare/wrangler.jsonc")
     elif args[:3] == ["remote", "get-url", "origin"]:
-        print("https://github.com/milkinfrastructure/milk-gateway.git")
+        print("https://github.com/milkinfrastructure/milk-carton.git")
     elif args[:3] == ["ls-remote", "--exit-code", "origin"]:
         print(state["commit"] + "\trefs/heads/main")
     elif args[:4] == ["fetch", "--quiet", "--no-tags", "origin"]:
@@ -252,7 +254,7 @@ if name == "node":
         "generated_mechanics_requests": 320,
         "generated_request_timeout_ms": 30000,
         "max_sdk_requests": 324,
-        "model": "gpt-5.4",
+        "model": "zai-org/GLM-5.3-Flash",
         "saturation_max_completion_tokens": 3840,
         "short_max_completion_tokens": 128,
     }
@@ -266,7 +268,7 @@ if name == "node":
         "finish_reason": "stop",
         "http_status": 200,
         "max_completion_tokens": 128,
-        "model": "gpt-5.4",
+        "model": "zai-org/GLM-5.3-Flash",
         "proof_contract_sha256": hashlib.sha256(json.dumps(
             proof_contract, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest(),
@@ -307,7 +309,7 @@ if name == "docker":
             done(94)
     values = without_global(args)
     expected_child = (
-        "ghcr.io/milkinfrastructure/milk-gateway@sha256:" + state["child_sha"]
+        "ghcr.io/milkinfrastructure/milk-carton@sha256:" + state["child_sha"]
     )
     if values == ["pull", "--platform", "linux/amd64", expected_child]:
         expected_auth = base64.b64encode(b"ShantanuJoshi:github-test-token").decode()
@@ -345,7 +347,7 @@ if name == "wrangler":
             state["deployment"] == "initial" or state.get("worker_deleted", False)
         )
         if worker_missing:
-            print('Worker "dragontales-gateway" not found.', file=sys.stderr)
+            print('Worker "milk-carton" not found.', file=sys.stderr)
             done(1)
         names = state.get("installed_secret_names", [])
         print(json.dumps([{"name": value, "type": "secret_text"} for value in names]))
@@ -355,7 +357,7 @@ if name == "wrangler":
         supplied = json.loads(sys.stdin.read())
         state["installed_secret_names"] = sorted(supplied)
         state["active_config_sha256"] = hashlib.sha256(
-            supplied["DRAGONTALES_CONFIG_JSON"].encode()
+            supplied["MILK_CARTON_CONFIG_JSON"].encode()
         ).hexdigest()
     elif values[:2] == ["deployments", "status"]:
         version = state["previous_worker"] if state["deployment"] in {"initial", "rollback"} else state["current_worker"]
@@ -393,7 +395,7 @@ if name == "wrangler":
             milk_tags.append(intent["target_image"].rsplit(":", 1)[1])
         images = [{"name": "legacy-gateway", "tags": ["previous"]}]
         if milk_tags:
-            images.append({"name": "milk-gateway", "tags": milk_tags})
+            images.append({"name": "milk-carton", "tags": milk_tags})
         print(json.dumps(images))
     elif values[:2] == ["containers", "push"]:
         tag = values[2].rsplit(":", 1)[1]
@@ -415,11 +417,11 @@ if name == "wrangler":
             if secrets_path.stat().st_mode & 0o777 != 0o600:
                 done(2)
             supplied = json.loads(secrets_path.read_text())
-            if set(supplied) != {"DRAGONTALES_CONFIG_JSON"}:
+            if set(supplied) != {"MILK_CARTON_CONFIG_JSON"}:
                 done(2)
             state["deployed_secret_names"] = sorted(supplied)
             state["active_config_sha256"] = hashlib.sha256(
-                supplied["DRAGONTALES_CONFIG_JSON"].encode()
+                supplied["MILK_CARTON_CONFIG_JSON"].encode()
             ).hexdigest()
             if state["mode"] == "config_mismatch":
                 state["active_config_sha256"] = "0" * 64
@@ -500,7 +502,7 @@ class Fixture:
         self.credential.write_bytes(canonical({
             "api_key": SMOKE_API_KEY,
             "cohort_id": SMOKE_COHORT,
-            "model": "gpt-5.4",
+            "model": "zai-org/GLM-5.3-Flash",
         }))
         self.credential.chmod(0o600)
         self.gateway_config = self.root / "gateway-config.json"
@@ -531,13 +533,13 @@ class Fixture:
         arguments = [
             str(script), *registry_arguments,
             str(self.release), APPLICATION, str(self.evidence),
-            str(self.credential), str(self.gateway_config),
+            str(self.credential), str(self.gateway_config), API_BASE_URL,
         ]
         if self.bootstrap:
             arguments = [
                 str(script), *registry_arguments,
                 "--bootstrap", str(self.release), str(self.evidence),
-                str(self.credential), str(self.bootstrap_secrets),
+                str(self.credential), str(self.bootstrap_secrets), API_BASE_URL,
             ]
         return subprocess.run(
             arguments,
@@ -561,6 +563,41 @@ class Fixture:
 
 
 class DeployPrivateGatewayTests(unittest.TestCase):
+    def test_api_base_url_is_explicit_and_strict(self):
+        self.assertEqual(
+            DEPLOY_CONTRACT.validate_api_base_url(API_BASE_URL),
+            (API_BASE_URL, "carton.example", "https://carton.example/healthz"),
+        )
+        for invalid in (
+            "http://carton.example/v1",
+            "https://Carton.example/v1",
+            "https://carton.example:443/v1",
+            "https://carton.example/v1/",
+            "https://carton.example/v1?query=true",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(DEPLOY_CONTRACT.DeployFailure):
+                    DEPLOY_CONTRACT.validate_api_base_url(invalid)
+
+    def test_bootstrap_with_optional_r2_session_tokens_installs_exact_submitted_set(self):
+        fixture = Fixture(bootstrap=True)
+        self.addCleanup(fixture.close)
+        value = json.loads(fixture.bootstrap_secrets.read_text())
+        value["secrets"]["MILK_CAPTURE_STORE_SESSION_TOKEN"] = "capture-session-private"
+        value["secrets"]["MILK_ROUTE_STORE_SESSION_TOKEN"] = "route-session-private"
+        self.assertEqual(
+            set(value["secrets"]),
+            DEPLOY_CONTRACT.BOOTSTRAP_REQUIRED_SECRET_NAMES
+            | DEPLOY_CONTRACT.BOOTSTRAP_OPTIONAL_SECRET_NAMES,
+        )
+        fixture.bootstrap_secrets.write_bytes(canonical(value))
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(
+            fixture.state["installed_secret_names"],
+            sorted(value["secrets"]),
+        )
+
     def test_registry_credential_can_be_streamed_without_evidence(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
@@ -584,15 +621,13 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(fixture.state["commands"], [])
 
     def test_smoke_key_must_be_exactly_non_capturable_in_canonical_gateway_config(self):
-        for defect in ("capture", "cohort", "key"):
+        for defect in ("capture", "key"):
             with self.subTest(defect=defect):
                 fixture = Fixture()
                 self.addCleanup(fixture.close)
                 config = json.loads(fixture.gateway_config.read_text())
                 if defect == "capture":
                     config["traffic_keys"][0]["capture_allowed"] = True
-                elif defect == "cohort":
-                    config["traffic_keys"][0]["cohort_id"] = "different-cohort"
                 else:
                     config["traffic_keys"][0]["api_key_sha256"] = "0" * 64
                 fixture.gateway_config.write_bytes(canonical(config))
@@ -610,7 +645,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         state = fixture.state
         commands = state["commands"]
         child_reference = (
-            "ghcr.io/milkinfrastructure/milk-gateway@sha256:" + state["child_sha"]
+            "ghcr.io/milkinfrastructure/milk-carton@sha256:" + state["child_sha"]
         )
         expected_pull = ["pull", "--platform", "linux/amd64", child_reference]
         pull = next(
@@ -636,7 +671,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertIn("--containers-rollout", deploy["arguments"])
         self.assertIn("immediate", deploy["arguments"])
         self.assertIn("--secrets-file", deploy["arguments"])
-        self.assertEqual(state["deployed_secret_names"], ["DRAGONTALES_CONFIG_JSON"])
+        self.assertEqual(state["deployed_secret_names"], ["MILK_CARTON_CONFIG_JSON"])
         gateway_config_sha256 = sha256(fixture.gateway_config.read_bytes())
         self.assertEqual(state["active_config_sha256"], gateway_config_sha256)
         deployed_config = state["deploy_config"]
@@ -644,9 +679,13 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             deployed_config["main"],
             str(ROOT / "deploy/cloudflare/worker.js"),
         )
+        self.assertEqual(
+            deployed_config["routes"],
+            [{"pattern": "carton.example", "custom_domain": True}],
+        )
         self.assertRegex(
             deployed_config["containers"][0]["image"],
-            rf"^registry\.cloudflare\.com/{ACCOUNT}/milk-gateway:sha256-[0-9a-f]{{64}}-op-[0-9a-f]{{24}}$",
+            rf"^registry\.cloudflare\.com/{ACCOUNT}/milk-carton:sha256-[0-9a-f]{{64}}-op-[0-9a-f]{{24}}$",
         )
         self.assertIn(f":sha256-{state['child_sha']}-op-", deployed_config["containers"][0]["image"])
         self.assertNotIn("Dockerfile", json.dumps(deployed_config))
@@ -688,7 +727,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertIs(sdk_smoke["content_retained"], False)
         self.assertEqual(
             sdk_smoke["proof_contract_sha256"],
-            "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263",
+            "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf",
         )
         current = json.loads((fixture.evidence / "current.json").read_text())
         self.assertEqual(
@@ -848,9 +887,13 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         ))
         self.assertEqual(fixture.terminal()["outcome"], "predeploy_failed")
 
-    def test_empty_account_bootstrap_installs_exact_secrets_before_acceptance(self):
+    def test_required_only_empty_account_bootstrap_installs_exact_submitted_set(self):
         fixture = Fixture(bootstrap=True)
         self.addCleanup(fixture.close)
+        self.assertEqual(
+            set(BOOTSTRAP_SECRETS),
+            DEPLOY_CONTRACT.BOOTSTRAP_REQUIRED_SECRET_NAMES,
+        )
         result = fixture.run()
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         state = fixture.state
@@ -919,7 +962,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         commands = state["commands"]
         self.assertTrue(any(
             item["command"] == "wrangler"
-            and item["arguments"][:2] == ["delete", "dragontales-gateway"]
+            and item["arguments"][:2] == ["delete", "milk-carton"]
             for item in commands
         ))
         self.assertTrue(any(
@@ -1002,7 +1045,11 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         config_raw = (ROOT / "deploy/cloudflare/wrangler.jsonc").read_text()
         config = json.loads(config_raw)
         self.assertEqual(config["main"], ".milk-private-deploy-script-required")
-        self.assertEqual(config["containers"][0]["image"], "MILK_PRIVATE_GATEWAY_ADMITTED_IMAGE_REQUIRED")
+        self.assertEqual(config["containers"][0]["image"], "MILK_CARTON_ADMITTED_IMAGE_REQUIRED")
+        self.assertEqual(
+            config["routes"],
+            [{"pattern": "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED", "custom_domain": True}],
+        )
         self.assertEqual(config["observability"], {"enabled": True})
         self.assertNotIn("Dockerfile", config_raw)
         self.assertNotIn("image_build_context", config_raw)

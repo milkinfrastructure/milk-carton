@@ -13,15 +13,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 
-WORKER = "dragontales-gateway"
-APPLICATION_NAME = "dragontales-gateway-dragontalesgateway"
-SECRET = "DRAGONTALES_CANDIDATE_API_KEY"
-ADMIN_SECRET = "DRAGONTALES_CONTAINER_ADMIN_KEY"
-ADMIN_URL = "https://api.dragontales.milkinfrastructure.com/__milk/candidate-credential"
-SHA256_HEADER = "x-dragontales-candidate-api-key-sha256"
+WORKER = "milk-carton"
+APPLICATION_NAME = "milk-carton-milkcarton"
+SECRET = "MILK_CARTON_CANDIDATE_API_KEY"
+ADMIN_SECRET = "MILK_CARTON_CONTAINER_ADMIN_KEY"
+SHA256_HEADER = "x-milk-candidate-api-key-sha256"
 OPERATION_HEADER = "x-milk-candidate-operation"
 WRANGLER_VERSION = "4.126.0"
 DELIVERY_SCHEMA = "milk.baseten-candidate-key-delivery.v1"
@@ -31,14 +31,18 @@ ACK_SCHEMA = "milk.baseten-candidate-key-delivery-ack.v1"
 RESTART_SCHEMA = "milk.gateway-candidate-container-restart.v1"
 INSPECTION_SCHEMA = "milk.gateway-candidate-container-inspection.v1"
 RELEASE_SCHEMA = "milk.gateway-process-release.v1"
-TEARDOWN_SCHEMA = "dragontales.provider-teardown-authorization.v1"
-ROUTE_RECEIPT_SCHEMA = "dragontales.route-publication-receipt.v2"
+TEARDOWN_SCHEMA = "milk.provider-teardown-authorization.v1"
+ROUTE_RECEIPT_SCHEMA = "milk.route-publication-receipt.v2"
 ACCOUNT_ID = re.compile(r"[0-9a-f]{32}")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 KEY_NAME = re.compile(r"[a-z0-9-]{1,64}")
 IMAGE_TAG = re.compile(r"[a-z0-9_][a-z0-9._-]{0,127}")
+HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
 MAX_JSON = 64 * 1024
 MAX_REQUEST = 32 * 1024
 MAX_DELIVERY = 4096
@@ -469,7 +473,7 @@ def wait_for_worker(runner, previous_worker):
     raise OperationFailure("Worker version did not advance")
 
 
-def call_container_admin(runner, admin_key, operation, candidate_sha256):
+def call_container_admin(runner, admin_key, operation, candidate_sha256, admin_url):
     authorization = bytearray(b"Authorization: Bearer ")
     authorization.extend(admin_key)
     authorization.extend(b"\n")
@@ -479,7 +483,7 @@ def call_container_admin(runner, admin_key, operation, candidate_sha256):
             "--connect-timeout", "10", "--max-time", "50", "--request", "POST",
             "--header", f"{OPERATION_HEADER}: {operation}",
             "--header", f"{SHA256_HEADER}: {candidate_sha256}",
-            "--write-out", "\n%{http_code}", ADMIN_URL,
+            "--write-out", "\n%{http_code}", admin_url,
             input_bytes=bytes(authorization), timeout=55,
         )
     finally:
@@ -543,7 +547,7 @@ def call_container_admin(runner, admin_key, operation, candidate_sha256):
 
 
 def validate_image(image, account_id):
-    prefix = f"registry.cloudflare.com/{account_id}/milk-gateway:"
+    prefix = f"registry.cloudflare.com/{account_id}/milk-carton:"
     if (
         not isinstance(image, str)
         or not image.startswith(prefix)
@@ -611,7 +615,9 @@ def install(metadata, candidate, arguments, runner, account_id, admin_key):
         )
         mutated = True
         worker = wait_for_worker(runner, expected_worker)
-        restart = call_container_admin(runner, admin_key, "install", metadata["candidate_key_sha256"])
+        restart = call_container_admin(
+            runner, admin_key, "install", metadata["candidate_key_sha256"], arguments.admin_url
+        )
         final = assert_admitted_identity(arguments, runner, account_id, worker)
         return acknowledgement(
             metadata, "installed", worker,
@@ -625,7 +631,9 @@ def install(metadata, candidate, arguments, runner, account_id, admin_key):
                 )
                 runner.wrangler("secret", "delete", SECRET, "--name", WORKER)
                 wait_for_worker(runner, before_cleanup)
-                call_container_admin(runner, admin_key, "remove", metadata["candidate_key_sha256"])
+                call_container_admin(
+                    runner, admin_key, "remove", metadata["candidate_key_sha256"], arguments.admin_url
+                )
             except OperationFailure:
                 pass
         raise
@@ -637,7 +645,9 @@ def install(metadata, candidate, arguments, runner, account_id, admin_key):
 def verify(metadata, arguments, runner, account_id, admin_key):
     worker, image, application_version, _instance = assert_admitted_identity(arguments, runner, account_id)
     names = parse_secret_names(runner.wrangler("secret", "list", "--name", WORKER, "--format", "json"))
-    restart = call_container_admin(runner, admin_key, "verify", metadata["candidate_key_sha256"])
+    restart = call_container_admin(
+        runner, admin_key, "verify", metadata["candidate_key_sha256"], arguments.admin_url
+    )
     if (SECRET in names) != (restart["state"] == "loaded"):
         raise OperationFailure("candidate secret state changed during verification")
     assert_admitted_identity(arguments, runner, account_id, worker)
@@ -657,7 +667,9 @@ def remove(metadata, arguments, runner, account_id, admin_key):
     if SECRET in names:
         if worker != metadata["gateway_release_id"]:
             raise OperationFailure("installed gateway release changed")
-        live = call_container_admin(runner, admin_key, "inspect", metadata["candidate_key_sha256"])
+        live = call_container_admin(
+            runner, admin_key, "inspect", metadata["candidate_key_sha256"], arguments.admin_url
+        )
         if (
             live["state"] != "loaded"
             or not hmac.compare_digest(
@@ -679,12 +691,39 @@ def remove(metadata, arguments, runner, account_id, admin_key):
         worker = wait_for_worker(runner, worker)
     elif worker == metadata["gateway_release_id"]:
         raise OperationFailure("candidate deletion did not advance Worker version")
-    call_container_admin(runner, admin_key, "remove", metadata["candidate_key_sha256"])
+    call_container_admin(
+        runner, admin_key, "remove", metadata["candidate_key_sha256"], arguments.admin_url
+    )
     assert_admitted_identity(arguments, runner, account_id, worker)
     final_names = parse_secret_names(runner.wrangler("secret", "list", "--name", WORKER, "--format", "json"))
     if SECRET in final_names:
         raise OperationFailure("candidate credential remains installed")
     return acknowledgement(metadata, "absent")
+
+
+def validate_admin_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("admin URL is invalid") from error
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or HOSTNAME.fullmatch(hostname) is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.netloc != hostname
+        or parsed.path != "/__milk/candidate-credential"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise argparse.ArgumentTypeError(
+            "admin URL must be a lowercase HTTPS domain with the candidate-credential path"
+        )
+    return value
 
 
 def parse_arguments():
@@ -693,6 +732,7 @@ def parse_arguments():
     baseten = modes.add_parser("serve-baseten", allow_abbrev=False)
     baseten.add_argument("--socket-path", type=Path, required=True)
     baseten.add_argument("--admin-key-fd", type=int, required=True)
+    baseten.add_argument("--admin-url", type=validate_admin_url, required=True)
     baseten.add_argument("--application-id", required=True)
     baseten.add_argument("--expected-application-version", type=int, required=True)
     baseten.add_argument("--expected-container-image", required=True)
@@ -712,7 +752,7 @@ def parse_arguments():
 def command_environment(scratch):
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN"}
     forbidden = re.compile(
-        r"^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|TEACHER_|WANDB_|DRAGONTALES_|DOCKER_|BUILDX_|BUILDKIT_).*"
+        r"^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|TEACHER_|WANDB_|MILK_CARTON_|DOCKER_|BUILDX_|BUILDKIT_).*"
         r"|^(GOOGLE_APPLICATION_CREDENTIALS|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|NVIDIA_API_KEY|NGC_API_KEY|CODEX_API_KEY|CODEX_AUTH_TOKEN|CODEX_TOKEN|GH_TOKEN|GITHUB_TOKEN|CR_PAT|CI_JOB_TOKEN|CI_REGISTRY_PASSWORD|NPM_TOKEN|PYPI_TOKEN|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|REGISTRY_AUTH_FILE|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy)$"
         r"|^CARGO_REGISTRIES_.*_TOKEN$|^MILK_.*(AWS|R2|S3|STORE|TEACHER|PROVIDER|CREDENTIAL|SECRET|TOKEN|ACCESS_KEY)"
     )

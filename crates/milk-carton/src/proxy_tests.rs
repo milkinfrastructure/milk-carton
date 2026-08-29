@@ -6,7 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use actix_web::dev::{Server, ServerHandle};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
@@ -32,20 +32,22 @@ use super::{
     TraceRecorder, TrafficKeyConfig, authenticate_traffic_key, build_route_runtime, build_server,
     candidate_health_failure, capture_sample_selected, config_scope, configured_traffic_keys,
     decode_lowercase_sha256, generation_status_once, is_json_content_type,
-    parse_openai_compatible_endpoint, start_records, start_records_with_timeout, status_once,
-    tick_once_with_records, validate_config_identity, validate_teacher_config,
+    parse_openai_compatible_api_base_url, parse_openai_compatible_endpoint,
+    records_sampling_key_version, sampling_identity, start_records, start_records_with_timeout,
+    status_once, tick_once_with_records, validate_config_identity, validate_teacher_config,
 };
 use crate::records::{
-    CAPTURE_SAMPLER_ID, Records, RouteBlockReason, RouteObservation, Scope,
-    SnapshotAnalyzerExecution, SnapshotAnalyzerReasoningEffort, TraceCapture, TraceCatalog,
+    CAPTURE_SAMPLER_ID, Records, RouteBlockReason, RouteObservation, SamplingIndependence,
+    SamplingUnitKind, Scope, SnapshotAnalyzerExecution, SnapshotAnalyzerReasoningEffort,
+    TraceCapture, TraceCatalog,
 };
-use crate::route::{RoutePolicy, RouteStartupConfig};
+use crate::route::{RouteEndpoint, RoutePolicy, RouteStartupConfig};
 
 const OUTCOME_KEY_ID: &str = "018f3f54-7a5b-7cc0-8000-000000000002";
-const KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001";
-const SMOKE_KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000003_test-smoke-secret-0003";
-const COHORT_ID: &str = "production-test-cohort";
-const OUTCOME_KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000002_test-outcome-secret-0002";
+const KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001";
+const SMOKE_KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000003_test-smoke-secret-0003";
+const SESSION_ID: &str = "production-test-session";
+const OUTCOME_KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000002_test-outcome-secret-0002";
 const CANDIDATE_KEY: &str = "candidate-test-secret";
 
 fn local_stores(root: &Path) -> StoresConfig {
@@ -58,6 +60,14 @@ fn local_stores(root: &Path) -> StoresConfig {
         capture: create("capture"),
         control: create("control"),
         routes: create("routes"),
+    }
+}
+
+fn s3_store(bucket: &str) -> ObjectStoreConfig {
+    ObjectStoreConfig::S3 {
+        endpoint: "https://example.r2.cloudflarestorage.com".to_owned(),
+        region: "auto".to_owned(),
+        bucket: bucket.to_owned(),
     }
 }
 
@@ -89,17 +99,15 @@ fn candidate_fuse_status_contract_covers_every_server_error() {
 }
 
 #[test]
-fn traffic_authentication_returns_only_the_configured_cohort() {
+fn traffic_authentication_returns_only_capture_authority() {
     let configured = configured_traffic_keys(&[
         TrafficKeyConfig {
             api_key_sha256: format!("{:x}", Sha256::digest(KEY.as_bytes())),
             capture_allowed: true,
-            cohort_id: COHORT_ID.into(),
         },
         TrafficKeyConfig {
             api_key_sha256: format!("{:x}", Sha256::digest(SMOKE_KEY.as_bytes())),
             capture_allowed: false,
-            cohort_id: COHORT_ID.into(),
         },
     ])
     .unwrap();
@@ -109,40 +117,32 @@ fn traffic_authentication_returns_only_the_configured_cohort() {
         actix_web::http::header::HeaderValue::from_str(&format!("Bearer {KEY}")).unwrap(),
     );
     headers.insert(
-        actix_web::http::header::HeaderName::from_static("x-dragontales-route-unit"),
+        actix_web::http::header::HeaderName::from_static("x-milk-route-unit"),
         actix_web::http::header::HeaderValue::from_static("caller-choice"),
     );
     let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
-    assert_eq!(authenticated.cohort_id, COHORT_ID);
     assert!(authenticated.capture_allowed);
     headers.insert(
         actix_web::http::header::AUTHORIZATION,
         actix_web::http::header::HeaderValue::from_str(&format!("Bearer {SMOKE_KEY}")).unwrap(),
     );
     let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
-    assert_eq!(authenticated.cohort_id, COHORT_ID);
     assert!(!authenticated.capture_allowed);
 }
 
 #[test]
 fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
-    let mut invalid_eval = config(1_024, 1);
-    invalid_eval.eval_id = "A".repeat(64);
-    assert!(validate_config_identity(&invalid_eval).is_err());
     let mut invalid = config(1_024, 1);
-    invalid.workload_id = Uuid::nil();
+    invalid.scope_id = Uuid::nil();
     assert!(validate_config_identity(&invalid).is_err());
     let mut duplicate_scope = config(1_024, 1);
-    duplicate_scope.workload_id = duplicate_scope.tenant_id;
+    duplicate_scope.scope_id = duplicate_scope.outcome_key_id;
     assert!(validate_config_identity(&duplicate_scope).is_err());
     let mut duplicate_key = config(1_024, 1);
     duplicate_key
         .traffic_keys
         .push(duplicate_key.traffic_keys[0].clone());
     assert!(validate_config_identity(&duplicate_key).is_err());
-    let mut invalid_cohort = config(1_024, 1);
-    invalid_cohort.traffic_keys[0].cohort_id = "caller controlled".into();
-    assert!(validate_config_identity(&invalid_cohort).is_err());
     let mut no_traffic_key = config(1_024, 1);
     no_traffic_key.traffic_keys.clear();
     assert!(validate_config_identity(&no_traffic_key).is_err());
@@ -151,20 +151,99 @@ fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
         .map(|index| TrafficKeyConfig {
             api_key_sha256: format!("{index:064x}"),
             capture_allowed: true,
-            cohort_id: format!("cohort-{index}"),
         })
         .collect();
     assert!(validate_config_identity(&too_many_keys).is_err());
-    let mut shared_store = config(1_024, 1);
-    shared_store.stores.control = shared_store.stores.capture.clone();
-    assert!(validate_config_identity(&shared_store).is_err());
-
     let threshold = ((u128::from(u64::MAX) + 1) / 10_000) as u64;
     assert!(capture_sample_selected(0, 1));
     assert!(capture_sample_selected(threshold - 1, 1));
     assert!(!capture_sample_selected(threshold, 1));
     assert!(!capture_sample_selected(u64::MAX, 0));
     assert!(capture_sample_selected(u64::MAX, 10_000));
+}
+
+#[test]
+fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
+    let gateway = Gateway::new(
+        &config(1_024, 1),
+        Url::parse("http://127.0.0.1:1/v1/").unwrap(),
+        None,
+    )
+    .unwrap();
+    let empty = actix_web::http::header::HeaderMap::new();
+    let previous_only = br#"{"model":"test","previous_response_id":"resp_previous"}"#;
+    let previous = sampling_identity(
+        &gateway,
+        RouteEndpoint::Responses,
+        &empty,
+        previous_only,
+        Uuid::now_v7(),
+    );
+    assert_eq!(previous.kind, SamplingUnitKind::Request);
+    assert_eq!(previous.independence, SamplingIndependence::Uncertain);
+    assert!(previous.previous_response_hmac_sha256.is_some());
+    assert!(!previous.content_capture_allowed);
+
+    let mut session_headers = actix_web::http::header::HeaderMap::new();
+    session_headers.insert(
+        actix_web::http::header::HeaderName::from_static("x-milk-session-id"),
+        actix_web::http::header::HeaderValue::from_static("stable-responses-session"),
+    );
+    let header_root_a = sampling_identity(
+        &gateway,
+        RouteEndpoint::Responses,
+        &session_headers,
+        previous_only,
+        Uuid::now_v7(),
+    );
+    let header_root_b = sampling_identity(
+        &gateway,
+        RouteEndpoint::Responses,
+        &session_headers,
+        previous_only,
+        Uuid::now_v7(),
+    );
+    assert_eq!(header_root_a.kind, SamplingUnitKind::ChatSessionHeader);
+    assert_eq!(
+        header_root_a.independence,
+        SamplingIndependence::Independent
+    );
+    assert!(header_root_a.content_capture_allowed);
+    assert_eq!(header_root_a.hmac_sha256, header_root_b.hmac_sha256);
+
+    let conversation = sampling_identity(
+        &gateway,
+        RouteEndpoint::Responses,
+        &empty,
+        br#"{"model":"test","conversation":"conv_root","previous_response_id":"resp_previous"}"#,
+        Uuid::now_v7(),
+    );
+    assert_eq!(conversation.kind, SamplingUnitKind::ResponsesConversation);
+    assert_eq!(conversation.independence, SamplingIndependence::Independent);
+    assert!(conversation.content_capture_allowed);
+
+    let standalone = sampling_identity(
+        &gateway,
+        RouteEndpoint::Responses,
+        &empty,
+        br#"{"model":"test","input":"standalone"}"#,
+        Uuid::now_v7(),
+    );
+    assert_eq!(standalone.kind, SamplingUnitKind::Request);
+    assert_eq!(standalone.independence, SamplingIndependence::Uncertain);
+    assert!(standalone.content_capture_allowed);
+}
+
+#[test]
+fn route_only_records_do_not_load_capture_sampling_secrets() {
+    let route_only = StoreAccessPlan {
+        routes: Some(crate::records::StoreAccess::ReadOnly),
+        ..StoreAccessPlan::default()
+    };
+    assert_eq!(
+        records_sampling_key_version(route_only).unwrap(),
+        "not-applicable"
+    );
 }
 
 #[test]
@@ -203,15 +282,15 @@ fn student_runtime_images_are_immutable_and_branch_matches_route_authority() {
         signing_public_key_hex: "5".repeat(64),
         signing_key_id: "route-test".into(),
         allow_private_candidate_http: false,
-        authorized_provider_terms_sha256: "6".repeat(64),
-        authorized_student_branch_runtime_image_reference: format!(
+        authorized_provider_terms_sha256: Some("6".repeat(64)),
+        authorized_student_branch_runtime_image_reference: Some(format!(
             "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
             "7".repeat(64)
-        ),
-        authorized_admission_program_sha256: "8".repeat(64),
-        winner_authorization_not_after: "2099-01-01T00:00:00Z".parse().unwrap(),
-        winner_max_wall_seconds: crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS,
-        winner_max_cost_microusd: crate::route::MAX_WINNER_DEPLOYMENT_COST_MICROUSD,
+        )),
+        authorized_admission_program_sha256: Some("8".repeat(64)),
+        winner_authorization_not_after: Some("2099-01-01T00:00:00Z".parse().unwrap()),
+        winner_max_wall_seconds: Some(crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS),
+        winner_max_cost_microusd: Some(crate::route::MAX_WINNER_DEPLOYMENT_COST_MICROUSD),
         candidate_max_in_flight: 1,
     });
     assert!(validate_teacher_config(&routed).is_err());
@@ -219,20 +298,22 @@ fn student_runtime_images_are_immutable_and_branch_matches_route_authority() {
         .route
         .as_mut()
         .unwrap()
-        .authorized_student_branch_runtime_image_reference = routed
-        .teacher
-        .as_ref()
-        .unwrap()
-        .student_branch_runtime_image_reference
-        .clone();
+        .authorized_student_branch_runtime_image_reference = Some(
+        routed
+            .teacher
+            .as_ref()
+            .unwrap()
+            .student_branch_runtime_image_reference
+            .clone(),
+    );
     validate_teacher_config(&routed).unwrap();
 }
 
 #[test]
-fn gpu_teacher_file_config_requires_shared_r2_storage() {
+fn gpu_teacher_file_config_requires_shared_s3_storage() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-gpu-local-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-gpu-local-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let mut gpu = config(1_024, 4);
     let teacher = gpu.teacher.as_mut().unwrap();
@@ -249,14 +330,8 @@ fn gpu_teacher_file_config_requires_shared_r2_storage() {
     };
     gpu.stores = local_stores(&root);
     assert!(validate_teacher_config(&gpu).is_err());
-    gpu.stores.capture = ObjectStoreConfig::CloudflareR2 {
-        account_id: "a".repeat(32),
-        bucket: "test-capture".to_owned(),
-    };
-    gpu.stores.control = ObjectStoreConfig::CloudflareR2 {
-        account_id: "a".repeat(32),
-        bucket: "test-control".to_owned(),
-    };
+    gpu.stores.capture = s3_store("test-capture");
+    gpu.stores.control = s3_store("test-control");
     gpu.teacher.as_mut().unwrap().max_decisions = 0;
     assert!(validate_teacher_config(&gpu).is_err());
     gpu.teacher.as_mut().unwrap().max_decisions = 4_097;
@@ -273,8 +348,8 @@ fn provider_endpoints_require_https_or_explicit_literal_loopback() {
             .is_ok()
     );
     assert!(
-        parse_openai_compatible_endpoint(
-            "https://model-x.api.baseten.co/deployment/y/sync/v1/chat/completions",
+        parse_openai_compatible_api_base_url(
+            "https://model-x.api.baseten.co/deployment/y/sync/v1/",
             false
         )
         .is_ok()
@@ -360,7 +435,7 @@ async fn due_expiry_returns_before_teacher_readiness() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!(
-            "dragontales-expiry-before-teacher-{}",
+            "milk-carton-expiry-before-teacher-{}",
             Uuid::now_v7()
         ));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -393,6 +468,8 @@ async fn due_expiry_returns_before_teacher_readiness() {
                 )),
                 occurred_at,
                 endpoint: "chat_completions".into(),
+                request_parse_success: true,
+                streaming: false,
                 route_revision: "baseline-v1".into(),
                 route: RouteObservation::Ineligible {
                     reason: RouteBlockReason::PolicyAbsent,
@@ -404,6 +481,11 @@ async fn due_expiry_returns_before_teacher_readiness() {
                 request_bytes: request.len() as u64,
                 response_bytes: response.len() as u64,
                 sampler_id: CAPTURE_SAMPLER_ID.into(),
+                sampling_unit_kind: SamplingUnitKind::Request,
+                sampling_unit_hmac_sha256: "aa".repeat(32),
+                sampling_independence: SamplingIndependence::Uncertain,
+                sampling_key_version: "test-key-v1".into(),
+                previous_response_hmac_sha256: None,
                 capture_basis_points: 10_000,
                 capture_eligible: true,
                 capture_selected: true,
@@ -431,7 +513,7 @@ async fn due_expiry_returns_before_teacher_readiness() {
     .await
     .unwrap();
     let output = tick_once_with_records(&config, now, records).await.unwrap();
-    assert!(output.starts_with(r#"{"schema_version":"dragontales.expiry-receipt.v1""#));
+    assert!(output.starts_with(r#"{"schema_version":"milk.expiry-receipt.v1""#));
     assert!(!output.contains("teacher-required"));
     fs::remove_dir_all(root).unwrap();
 }
@@ -459,7 +541,7 @@ async fn status_contract_exposes_eval_teacher_decision_limit() {
 
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-status-contract-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-status-contract-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let mut config = config(4_096, 1);
     config.stores = local_stores(&root);
@@ -469,11 +551,8 @@ async fn status_contract_exposes_eval_teacher_decision_limit() {
         .await
         .unwrap();
     let status: StatusContract = serde_json::from_str(&raw).unwrap();
-    assert_eq!(status.schema_version, "dragontales.status.v2");
-    assert_eq!(
-        status.records.schema_version,
-        "dragontales.status-records.v5"
-    );
+    assert_eq!(status.schema_version, "milk.status.v2");
+    assert_eq!(status.records.schema_version, "milk.status-records.v5");
     assert_eq!(status.records.generation.max_decisions, 7);
     assert_eq!(status.records.generation.claimed_decisions, 0);
     assert_eq!(status.records.generation.remaining_decisions, 7);
@@ -481,12 +560,12 @@ async fn status_contract_exposes_eval_teacher_decision_limit() {
 }
 
 #[actix_web::test]
-async fn generation_status_is_content_free_and_eval_bound() {
+async fn generation_status_is_content_free_and_scope_bound() {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct GenerationStatusContract {
         schema_version: String,
-        eval_id: String,
+        scope_id: Uuid,
         max_decisions: u32,
         claimed_decisions: u32,
         remaining_decisions: u32,
@@ -495,7 +574,7 @@ async fn generation_status_is_content_free_and_eval_bound() {
 
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-generation-status-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-generation-status-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let mut config = config(4_096, 1);
     config.stores = local_stores(&root);
@@ -505,8 +584,8 @@ async fn generation_status_is_content_free_and_eval_bound() {
         .await
         .unwrap();
     let status: GenerationStatusContract = serde_json::from_str(&raw).unwrap();
-    assert_eq!(status.schema_version, "dragontales.generation-status.v1");
-    assert_eq!(status.eval_id, config.eval_id);
+    assert_eq!(status.schema_version, "milk.generation-status.v1");
+    assert_eq!(status.scope_id, config.scope_id);
     assert_eq!(status.max_decisions, 7);
     assert_eq!(status.claimed_decisions, 0);
     assert_eq!(status.remaining_decisions, 7);
@@ -518,22 +597,17 @@ async fn generation_status_is_content_free_and_eval_bound() {
 fn serve_example_is_current_and_has_no_teacher_execution_config() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-example-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-example-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let json = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/dragontales-config.example.json"
+        "/../../deploy/milk-carton-config.example.json"
     ))
-    .replace("/var/lib/dragontales/objects", root.to_str().unwrap());
+    .replace("/var/lib/milk-carton/objects", root.to_str().unwrap());
     let config: FileConfig = serde_json::from_str(&json).unwrap();
     assert!(config.teacher.is_none());
     validate_config_identity(&config).unwrap();
-    Gateway::new(
-        &config,
-        Url::parse("http://127.0.0.1:1/v1/chat/completions").unwrap(),
-        None,
-    )
-    .unwrap();
+    Gateway::new(&config, Url::parse("http://127.0.0.1:1/v1/").unwrap(), None).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -648,15 +722,10 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
         traffic_keys: vec![TrafficKeyConfig {
             api_key_sha256: format!("{:x}", Sha256::digest(KEY.as_bytes())),
             capture_allowed: true,
-            cohort_id: COHORT_ID.into(),
         }],
         outcome_key_id: Uuid::parse_str(OUTCOME_KEY_ID).unwrap(),
         outcome_key_sha256: format!("{:x}", Sha256::digest(OUTCOME_KEY.as_bytes())),
-        tenant_id: Uuid::new_v4(),
-        project_id: Uuid::new_v4(),
-        environment_id: Uuid::new_v4(),
-        workload_id: Uuid::new_v4(),
-        eval_id: "11".repeat(32),
+        scope_id: Uuid::new_v4(),
         max_request_bytes,
         max_in_flight,
         max_outcomes_in_flight: 2,
@@ -679,21 +748,12 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
         outcome_rights_state: "authorized".into(),
         outcome_retention_days: 1,
         stores: StoresConfig {
-            capture: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "test-capture".into(),
-            },
-            control: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "test-control".into(),
-            },
-            routes: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "test-routes".into(),
-            },
+            capture: s3_store("test-capture"),
+            control: s3_store("test-control"),
+            routes: s3_store("test-routes"),
         },
         baseline: OpenAiCompatibleEndpoint {
-            chat_completions_url: "https://api.openai.com/v1/chat/completions".into(),
+            api_base_url: "https://api.openai.com/v1/".into(),
             allow_loopback_http: false,
         },
         teacher: Some(TeacherConfig {
@@ -753,11 +813,7 @@ async fn disabled_capture_still_emits_content_free_statistics() {
     let gateway_config = config(4_096, 2);
     assert_eq!(gateway_config.capture_mode, CaptureMode::Disabled);
     let scope = Scope {
-        tenant_id: gateway_config.tenant_id,
-        project_id: gateway_config.project_id,
-        environment_id: gateway_config.environment_id,
-        workload_id: gateway_config.workload_id,
-        eval_id: gateway_config.eval_id.clone(),
+        scope_id: gateway_config.scope_id,
     };
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let records = Records::start(
@@ -784,10 +840,7 @@ async fn disabled_capture_still_emits_content_free_statistics() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["x-dragontales-capture-intent"],
-        "not_selected"
-    );
+    assert_eq!(response.headers()["x-milk-capture-intent"], "not_selected");
     std::mem::drop(response.bytes().await.unwrap());
 
     let stats_bytes = timeout(Duration::from_secs(1), async {
@@ -850,6 +903,14 @@ fn listen() -> (TcpListener, String) {
     (listener, address)
 }
 
+fn test_api_base_url(endpoint: &str) -> Url {
+    let base = endpoint
+        .strip_suffix("chat/completions")
+        .or_else(|| endpoint.strip_suffix("responses"))
+        .unwrap_or(endpoint);
+    Url::parse(base).unwrap()
+}
+
 fn start_gateway(upstream: &str, max_request_bytes: usize, max_in_flight: usize) -> RunningServer {
     start_gateway_with_config(upstream, config(max_request_bytes, max_in_flight))
 }
@@ -864,7 +925,7 @@ fn start_gateway_with_records(
     records: Option<Records>,
 ) -> RunningServer {
     let (listener, address) = listen();
-    let gateway = Gateway::new(&config, Url::parse(upstream).unwrap(), records).unwrap();
+    let gateway = Gateway::new(&config, test_api_base_url(upstream), records).unwrap();
     RunningServer::start(build_server(listener, gateway).unwrap(), address)
 }
 
@@ -874,15 +935,29 @@ fn start_gateway_with_route(
     max_in_flight: usize,
     candidate_max_in_flight: usize,
 ) -> RunningServer {
+    start_gateway_with_route_config(
+        baseline,
+        candidate,
+        config(4_096, max_in_flight),
+        candidate_max_in_flight,
+    )
+}
+
+fn start_gateway_with_route_config(
+    baseline: &str,
+    candidate: &str,
+    config: FileConfig,
+    candidate_max_in_flight: usize,
+) -> RunningServer {
     let (listener, address) = listen();
     let route = RoutePolicy::active_for_test(
-        Url::parse(candidate).unwrap(),
+        test_api_base_url(candidate),
         candidate_max_in_flight,
         CANDIDATE_KEY,
     );
     let gateway = Gateway::with_route(
-        &config(4_096, max_in_flight),
-        Url::parse(baseline).unwrap(),
+        &config,
+        test_api_base_url(baseline),
         None,
         route,
         Some("test-managed-openai-key"),
@@ -896,10 +971,10 @@ fn start_gateway_with_route(
 fn route_runtime_swap_preserves_in_flight_generation() {
     let wrong_key = Gateway::with_route(
         &config(4_096, 2),
-        Url::parse("http://127.0.0.1:8/v1/chat/completions").unwrap(),
+        Url::parse("http://127.0.0.1:8/v1/").unwrap(),
         None,
         RoutePolicy::active_for_test(
-            Url::parse("http://127.0.0.1:9/v1/chat/completions").unwrap(),
+            Url::parse("http://127.0.0.1:9/v1/").unwrap(),
             1,
             CANDIDATE_KEY,
         ),
@@ -911,13 +986,13 @@ fn route_runtime_swap_preserves_in_flight_generation() {
     assert!(wrong_key.to_string().contains("admitted credential"));
 
     let route = RoutePolicy::active_for_test(
-        Url::parse("http://127.0.0.1:9/v1/chat/completions").unwrap(),
+        Url::parse("http://127.0.0.1:9/v1/").unwrap(),
         1,
         CANDIDATE_KEY,
     );
     let gateway = Gateway::with_route(
         &config(4_096, 2),
-        Url::parse("http://127.0.0.1:8/v1/chat/completions").unwrap(),
+        Url::parse("http://127.0.0.1:8/v1/").unwrap(),
         None,
         route,
         Some("test-managed-openai-key"),
@@ -975,10 +1050,7 @@ async fn candidate_credential_check_proves_loaded_absent_and_mismatch_without_ke
             .any(|part| part == CANDIDATE_KEY.as_bytes())
     );
     let probe: CandidateCredentialProbe = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        probe.schema_version,
-        "dragontales.candidate-credential-check.v1"
-    );
+    assert_eq!(probe.schema_version, "milk.candidate-credential-check.v1");
     assert_eq!(
         probe.candidate_api_key_sha256.as_deref(),
         Some(candidate_sha256.as_str())
@@ -1036,7 +1108,7 @@ async fn health_reports_config_identity_without_credential_content() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    let expected_config_sha256 = format!("{:x}", Sha256::digest(b"dragontales-test-config"));
+    let expected_config_sha256 = format!("{:x}", Sha256::digest(b"milk-carton-test-config"));
     assert_eq!(
         response
             .headers()
@@ -1055,8 +1127,8 @@ async fn health_reports_config_identity_without_credential_content() {
     );
     assert!(
         !bytes
-            .windows(COHORT_ID.len())
-            .any(|window| window == COHORT_ID.as_bytes())
+            .windows(SESSION_ID.len())
+            .any(|window| window == SESSION_ID.as_bytes())
     );
     let health: HealthProbe = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(health.status, "degraded");
@@ -1125,6 +1197,67 @@ fn client(follow_redirects: bool) -> reqwest::Client {
 }
 
 #[test]
+fn stream_terminals_survive_every_chunk_width_and_multi_chunk_fragmentation() {
+    fn recorder(endpoint: crate::route::RouteEndpoint) -> TraceRecorder {
+        TraceRecorder {
+            records: None,
+            catalog: None,
+            started: Instant::now(),
+            first_byte: None,
+            request: None,
+            request_content_type: None,
+            request_content_encoding: None,
+            response: Vec::new(),
+            response_content_type: None,
+            response_content_encoding: None,
+            response_limit: 1,
+            record_limit: usize::MAX,
+            selected: false,
+            oversized: false,
+            stream_protocol: Some(endpoint),
+            stream_terminal_seen: false,
+            stream_terminal_tail: Vec::new(),
+        }
+    }
+
+    for (endpoint, marker) in [
+        (
+            crate::route::RouteEndpoint::ChatCompletions,
+            b"data: [DONE]".as_slice(),
+        ),
+        (
+            crate::route::RouteEndpoint::Responses,
+            b"event: response.completed".as_slice(),
+        ),
+        (
+            crate::route::RouteEndpoint::Responses,
+            b"event: response.failed".as_slice(),
+        ),
+        (
+            crate::route::RouteEndpoint::Responses,
+            b"event: response.incomplete".as_slice(),
+        ),
+    ] {
+        for width in 1..=marker.len() {
+            let mut recorder = recorder(endpoint);
+            for chunk in marker.chunks(width) {
+                recorder.observe(&Bytes::copy_from_slice(chunk));
+            }
+            assert!(
+                recorder.stream_terminal_seen,
+                "terminal marker was lost at chunk width {width}"
+            );
+        }
+    }
+
+    let mut recorder = recorder(crate::route::RouteEndpoint::Responses);
+    for chunk in b"event: response.in_progress".chunks(1) {
+        recorder.observe(&Bytes::copy_from_slice(chunk));
+    }
+    assert!(!recorder.stream_terminal_seen);
+}
+
+#[test]
 fn capture_and_memory_admission_are_explicit() {
     assert!(is_json_content_type(Some(
         "Application/JSON; charset=utf-8"
@@ -1160,11 +1293,7 @@ fn capture_and_memory_admission_are_explicit() {
 #[test]
 fn fragmented_capture_never_retains_capacity_above_record_limit() {
     let scope = Scope {
-        tenant_id: Uuid::new_v4(),
-        project_id: Uuid::new_v4(),
-        environment_id: Uuid::new_v4(),
-        workload_id: Uuid::new_v4(),
-        eval_id: "22".repeat(32),
+        scope_id: Uuid::new_v4(),
     };
     let mut recorder = TraceRecorder {
         records: None,
@@ -1173,6 +1302,8 @@ fn fragmented_capture_never_retains_capacity_above_record_limit() {
             trace_id: Uuid::new_v4(),
             occurred_at: Utc::now(),
             endpoint: "chat_completions".to_owned(),
+            request_parse_success: true,
+            streaming: true,
             route_revision: "openai-baseline-v1".to_owned(),
             route: RouteObservation::Ineligible {
                 reason: RouteBlockReason::PolicyAbsent,
@@ -1184,6 +1315,11 @@ fn fragmented_capture_never_retains_capacity_above_record_limit() {
             request_bytes: 2,
             response_bytes: 0,
             sampler_id: crate::records::CAPTURE_SAMPLER_ID.to_owned(),
+            sampling_unit_kind: SamplingUnitKind::Request,
+            sampling_unit_hmac_sha256: "aa".repeat(32),
+            sampling_independence: SamplingIndependence::Uncertain,
+            sampling_key_version: "test-key-v1".to_owned(),
+            previous_response_hmac_sha256: None,
             capture_basis_points: 10_000,
             capture_eligible: true,
             capture_selected: true,
@@ -1203,6 +1339,9 @@ fn fragmented_capture_never_retains_capacity_above_record_limit() {
         record_limit: usize::MAX,
         selected: true,
         oversized: false,
+        stream_protocol: Some(crate::route::RouteEndpoint::ChatCompletions),
+        stream_terminal_seen: false,
+        stream_terminal_tail: Vec::new(),
     };
     recorder.record_limit = recorder.capture_memory_bytes() + 8;
 
@@ -1265,7 +1404,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
                             .insert_header(("x-request-id", "provider-request"))
                             .insert_header(("x-openai-proxy-wasm", "diagnostic"))
                             .insert_header(("set-cookie", "provider-cookie=must-not-stick"))
-                            .insert_header(("x-dragontales-trace-id", "spoofed"))
+                            .insert_header(("x-milk-trace-id", "spoofed"))
                             .body(Bytes::from_static(b"{ \"provider\": \"error\" }\n"))
                     }
                 }),
@@ -1287,7 +1426,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         .post(format!("{}/v1/chat/completions?beta=true", gateway.address))
         .bearer_auth(KEY)
         .header("openai-organization", "org-test")
-        .header("x-dragontales-internal", "remove-me")
+        .header("x-milk-internal", "remove-me")
         .header("cookie", "session=must-not-leak")
         .header("x-forwarded-for", "198.51.100.1")
         .header("connection", "x-remove-me")
@@ -1300,14 +1439,9 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
     assert_eq!(response.headers()["retry-after"], "7");
     assert_eq!(response.headers()["x-request-id"], "provider-request");
     assert_eq!(response.headers()["x-openai-proxy-wasm"], "diagnostic");
-    assert_eq!(
-        response.headers()["x-dragontales-capture-intent"],
-        "unavailable"
-    );
+    assert_eq!(response.headers()["x-milk-capture-intent"], "unavailable");
     assert!(response.headers().get("set-cookie").is_none());
-    let trace_id = response.headers()["x-dragontales-trace-id"]
-        .to_str()
-        .unwrap();
+    let trace_id = response.headers()["x-milk-trace-id"].to_str().unwrap();
     Uuid::parse_str(trace_id).unwrap();
     assert_ne!(trace_id, "spoofed");
     assert_eq!(
@@ -1323,8 +1457,8 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         Some(b"Bearer test-managed-openai-key".as_slice())
     );
     assert!(header(&seen.headers, "openai-organization").is_none());
-    assert!(header(&seen.headers, "x-dragontales-key").is_none());
-    assert!(header(&seen.headers, "x-dragontales-internal").is_none());
+    assert!(header(&seen.headers, "x-milk-key").is_none());
+    assert!(header(&seen.headers, "x-milk-internal").is_none());
     assert!(header(&seen.headers, "x-remove-me").is_none());
     assert!(header(&seen.headers, "cookie").is_none());
     assert!(header(&seen.headers, "x-forwarded-for").is_none());
@@ -1337,7 +1471,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         let response = request.body("{}").send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
         let error: LocalEnvelope = response.json().await.unwrap();
-        assert_eq!(error.error.code, "invalid_dragontales_api_key");
+        assert_eq!(error.error.code, "invalid_milk_api_key");
     }
     let mut duplicate_headers = reqwest::header::HeaderMap::new();
     duplicate_headers.append(
@@ -1359,7 +1493,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
     let traffic_key_on_outcomes = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
         .bearer_auth(KEY)
         .body("{}")
         .send()
@@ -1370,8 +1504,8 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         reqwest::StatusCode::UNAUTHORIZED
     );
     let outcome_key_without_storage = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
-        .header("x-dragontales-key", OUTCOME_KEY)
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
+        .header("x-milk-key", OUTCOME_KEY)
         .body("{}")
         .send()
         .await
@@ -1381,6 +1515,82 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
 
+    gateway.stop().await;
+    upstream.stop().await;
+}
+
+#[actix_web::test]
+async fn responses_is_byte_transparent_and_strips_the_session_header() {
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+    let (upstream_listener, upstream_address) = listen();
+    let upstream = {
+        let seen_tx = Arc::clone(&seen_tx);
+        HttpServer::new(move || {
+            let seen_tx = Arc::clone(&seen_tx);
+            App::new().route(
+                "/v1/responses",
+                web::post().to(move |request: HttpRequest, body: Bytes| {
+                    let seen_tx = Arc::clone(&seen_tx);
+                    async move {
+                        let headers = request
+                            .headers()
+                            .iter()
+                            .map(|(name, value)| {
+                                (name.as_str().to_owned(), value.as_bytes().to_vec())
+                            })
+                            .collect();
+                        seen_tx
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send(SeenRequest {
+                                query: request.query_string().to_owned(),
+                                body,
+                                headers,
+                            })
+                            .unwrap();
+                        HttpResponse::Ok()
+                            .insert_header(("content-type", "application/json"))
+                            .body(Bytes::from_static(
+                                b"{\"id\":\"resp_test\",\"status\":\"completed\"}",
+                            ))
+                    }
+                }),
+            )
+        })
+        .listen(upstream_listener)
+        .unwrap()
+        .run()
+    };
+    let upstream = RunningServer::start(upstream, upstream_address);
+    let gateway = start_gateway(&format!("{}/v1/", upstream.address), 4_096, 2);
+    let body = Bytes::from_static(
+        br#"{"model":"customer-model","input":"hello","conversation":"conv_123","unknown_extension":{"keep":true}}"#,
+    );
+    let response = client(false)
+        .post(format!("{}/v1/responses", gateway.address))
+        .bearer_auth(KEY)
+        .header("content-type", "application/json")
+        .header("x-milk-session-id", SESSION_ID)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from_static(b"{\"id\":\"resp_test\",\"status\":\"completed\"}")
+    );
+    let seen = seen_rx.await.unwrap();
+    assert!(seen.query.is_empty());
+    assert_eq!(seen.body, body);
+    assert!(header(&seen.headers, "x-milk-session-id").is_none());
+    assert_eq!(
+        header(&seen.headers, "authorization"),
+        Some(b"Bearer test-managed-openai-key".as_slice())
+    );
     gateway.stop().await;
     upstream.stop().await;
 }
@@ -1424,14 +1634,9 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
     gateway_config.traffic_keys.push(TrafficKeyConfig {
         api_key_sha256: format!("{:x}", Sha256::digest(SMOKE_KEY.as_bytes())),
         capture_allowed: false,
-        cohort_id: COHORT_ID.into(),
     });
     let scope = Scope {
-        tenant_id: gateway_config.tenant_id,
-        project_id: gateway_config.project_id,
-        environment_id: gateway_config.environment_id,
-        workload_id: gateway_config.workload_id,
-        eval_id: gateway_config.eval_id.clone(),
+        scope_id: gateway_config.scope_id,
     };
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let object_probe = Arc::clone(&objects);
@@ -1459,11 +1664,8 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        response.headers()["x-dragontales-capture-intent"],
-        "selected"
-    );
-    let trace_id = response.headers()["x-dragontales-trace-id"]
+    assert_eq!(response.headers()["x-milk-capture-intent"], "selected");
+    let trace_id = response.headers()["x-milk-trace-id"]
         .to_str()
         .unwrap()
         .to_owned();
@@ -1476,8 +1678,8 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
     );
     assert_eq!(encoding_rx.await.unwrap(), Some(b"identity".to_vec()));
     let outcome = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
-        .header("x-dragontales-key", OUTCOME_KEY)
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
+        .header("x-milk-key", OUTCOME_KEY)
         .header("content-type", "application/json")
         .body(format!(
             r#"{{"trace_id":"{trace_id}","outcome_version":1,"value":{{"kind":"accepted"}}}}"#
@@ -1506,7 +1708,7 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .unwrap();
     let decoded = zstd::decode_all(Cursor::new(payload)).unwrap();
     let stored: StoredTraceProbe = serde_json::from_slice(&decoded).unwrap();
-    assert_eq!(stored.schema_version, "dragontales.trace.v3");
+    assert_eq!(stored.schema_version, "milk.trace.v1");
     assert!(stored.catalog.capture_eligible);
     assert!(stored.catalog.capture_selected);
     assert!(stored.request.content_encoding.is_none());
@@ -1520,10 +1722,7 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        synthetic.headers()["x-dragontales-capture-intent"],
-        "not_selected"
-    );
+    assert_eq!(synthetic.headers()["x-milk-capture-intent"], "not_selected");
     std::mem::drop(synthetic.bytes().await.unwrap());
 
     let not_selected = client(false)
@@ -1535,7 +1734,7 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .await
         .unwrap();
     assert_eq!(
-        not_selected.headers()["x-dragontales-capture-intent"],
+        not_selected.headers()["x-milk-capture-intent"],
         "not_selected"
     );
     std::mem::drop(not_selected.bytes().await.unwrap());
@@ -1550,16 +1749,13 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .await
         .unwrap();
     assert_eq!(encoded.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        encoded.headers()["x-dragontales-capture-intent"],
-        "not_selected"
-    );
+    assert_eq!(encoded.headers()["x-milk-capture-intent"], "not_selected");
     std::mem::drop(encoded.bytes().await.unwrap());
 
     let unavailable_trace = Uuid::now_v7();
     let unavailable = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
-        .header("x-dragontales-key", OUTCOME_KEY)
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
+        .header("x-milk-key", OUTCOME_KEY)
         .header("content-type", "application/json")
         .body(format!(
             r#"{{"trace_id":"{unavailable_trace}","outcome_version":1,"value":{{"kind":"accepted"}}}}"#
@@ -1632,7 +1828,7 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
                             .insert_header(("content-type", "application/json"))
                             .insert_header(("x-request-id", "candidate-request"))
                             .insert_header(("x-openai-internal", "remove-me"))
-                            .insert_header(("x-dragontales-candidate-sha256", "spoofed"))
+                            .insert_header(("x-milk-candidate-sha256", "spoofed"))
                             .body(Bytes::from_static(b"{ \"candidate\": true }\n"))
                     }
                 }),
@@ -1665,24 +1861,18 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(response.headers()["x-milk-route-target"], "candidate");
+    assert_eq!(response.headers()["x-milk-route-revision"], "test-route-v1");
     assert_eq!(
-        response.headers()["x-dragontales-route-target"],
-        "candidate"
-    );
-    assert_eq!(
-        response.headers()["x-dragontales-route-revision"],
-        "test-route-v1"
-    );
-    assert_eq!(
-        response.headers()["x-dragontales-candidate-sha256"],
+        response.headers()["x-milk-candidate-sha256"],
         "33".repeat(32)
     );
     assert_eq!(
-        response.headers()["x-dragontales-artifact-sha256"],
+        response.headers()["x-milk-artifact-sha256"],
         "44".repeat(32)
     );
     assert_eq!(
-        response.headers()["x-dragontales-deployment-sha256"],
+        response.headers()["x-milk-deployment-sha256"],
         "55".repeat(32)
     );
     assert_eq!(response.headers()["x-request-id"], "candidate-request");
@@ -1701,7 +1891,7 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
     );
     assert!(header(&seen.headers, "openai-organization").is_none());
     assert!(header(&seen.headers, "openai-project").is_none());
-    assert!(header(&seen.headers, "x-dragontales-key").is_none());
+    assert!(header(&seen.headers, "x-milk-key").is_none());
     assert_eq!(
         header(&seen.headers, "x-client-request-id"),
         Some(b"logical-call".as_slice())
@@ -1717,7 +1907,7 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
         .send()
         .await
         .unwrap();
-    assert_eq!(beta.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(beta.headers()["x-milk-route-target"], "openai");
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
 
     gateway.stop().await;
@@ -1802,7 +1992,7 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
     };
 
     let first = request().send().await.unwrap();
-    assert_eq!(first.headers()["x-dragontales-route-target"], "candidate");
+    assert_eq!(first.headers()["x-milk-route-target"], "candidate");
     let mut first_body = first.bytes_stream();
     assert_eq!(
         timeout(Duration::from_secs(1), first_body.next())
@@ -1814,10 +2004,7 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
     );
 
     let at_capacity = request().send().await.unwrap();
-    assert_eq!(
-        at_capacity.headers()["x-dragontales-route-target"],
-        "openai"
-    );
+    assert_eq!(at_capacity.headers()["x-milk-route-target"], "openai");
     assert_eq!(at_capacity.text().await.unwrap(), "baseline-capacity");
     assert_eq!(candidate_count.load(Ordering::SeqCst), 1);
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
@@ -1831,10 +2018,7 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
     drop(first_body);
 
     let recovered = request().send().await.unwrap();
-    assert_eq!(
-        recovered.headers()["x-dragontales-route-target"],
-        "candidate"
-    );
+    assert_eq!(recovered.headers()["x-milk-route-target"], "candidate");
     assert_eq!(recovered.text().await.unwrap(), "candidate-recovered");
     assert_eq!(candidate_count.load(Ordering::SeqCst), 2);
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
@@ -1845,17 +2029,22 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
 }
 
 #[actix_web::test]
-async fn candidate_transport_failure_opens_sticky_fuse_without_replay() {
+async fn candidate_transport_failure_falls_back_once_and_opens_sticky_fuse() {
     let baseline_count = Arc::new(AtomicUsize::new(0));
+    let baseline_bodies = Arc::new(Mutex::new(Vec::<Bytes>::new()));
     let (baseline_listener, baseline_address) = listen();
     let baseline = {
         let count = Arc::clone(&baseline_count);
+        let bodies = Arc::clone(&baseline_bodies);
         HttpServer::new(move || {
             let count = Arc::clone(&count);
-            App::new().default_service(web::to(move || {
+            let bodies = Arc::clone(&bodies);
+            App::new().default_service(web::to(move |body: Bytes| {
                 let count = Arc::clone(&count);
+                let bodies = Arc::clone(&bodies);
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body);
                     HttpResponse::Ok().body("baseline-after-fuse")
                 }
             }))
@@ -1894,12 +2083,11 @@ async fn candidate_transport_failure_opens_sticky_fuse_without_replay() {
             .body(r#"{"model":"customer-model","messages":[{"role":"user","content":"hello"}]}"#)
     };
 
-    let failed = request().send().await.unwrap();
-    assert_eq!(failed.status(), reqwest::StatusCode::BAD_GATEWAY);
-    assert_eq!(failed.headers()["x-dragontales-route-target"], "candidate");
-    assert_eq!(baseline_count.load(Ordering::SeqCst), 0);
-    let error: LocalEnvelope = failed.json().await.unwrap();
-    assert_eq!(error.error.code, "candidate_unavailable");
+    let fallback = request().send().await.unwrap();
+    assert_eq!(fallback.status(), reqwest::StatusCode::OK);
+    assert_eq!(fallback.headers()["x-milk-route-target"], "openai");
+    assert_eq!(fallback.text().await.unwrap(), "baseline-after-fuse");
+    assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
     assert_eq!(candidate_attempts.load(Ordering::SeqCst), 1);
 
     timeout(Duration::from_secs(1), raw_task)
@@ -1909,12 +2097,97 @@ async fn candidate_transport_failure_opens_sticky_fuse_without_replay() {
 
     let later_call = request().send().await.unwrap();
     assert_eq!(later_call.status(), reqwest::StatusCode::OK);
-    assert_eq!(later_call.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(later_call.headers()["x-milk-route-target"], "openai");
     assert_eq!(later_call.text().await.unwrap(), "baseline-after-fuse");
-    assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
+    assert_eq!(baseline_count.load(Ordering::SeqCst), 2);
     assert_eq!(candidate_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *baseline_bodies.lock().unwrap(),
+        vec![
+            Bytes::from_static(
+                br#"{"model":"customer-model","messages":[{"role":"user","content":"hello"}]}"#
+            ),
+            Bytes::from_static(
+                br#"{"model":"customer-model","messages":[{"role":"user","content":"hello"}]}"#
+            ),
+        ]
+    );
 
     gateway.stop().await;
+    baseline.stop().await;
+}
+
+#[actix_web::test]
+async fn candidate_fallback_shares_one_total_upstream_deadline() {
+    let baseline_count = Arc::new(AtomicUsize::new(0));
+    let (baseline_listener, baseline_address) = listen();
+    let baseline = {
+        let count = Arc::clone(&baseline_count);
+        HttpServer::new(move || {
+            let count = Arc::clone(&count);
+            App::new().default_service(web::to(move || {
+                let count = Arc::clone(&count);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(180)).await;
+                    HttpResponse::Ok().body("too-late-baseline")
+                }
+            }))
+        })
+        .listen(baseline_listener)
+        .unwrap()
+        .run()
+    };
+    let baseline = RunningServer::start(baseline, baseline_address);
+
+    let candidate_count = Arc::new(AtomicUsize::new(0));
+    let (candidate_listener, candidate_address) = listen();
+    let candidate = {
+        let count = Arc::clone(&candidate_count);
+        HttpServer::new(move || {
+            let count = Arc::clone(&count);
+            App::new().default_service(web::to(move || {
+                let count = Arc::clone(&count);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(180)).await;
+                    HttpResponse::ServiceUnavailable().finish()
+                }
+            }))
+        })
+        .listen(candidate_listener)
+        .unwrap()
+        .run()
+    };
+    let candidate = RunningServer::start(candidate, candidate_address);
+
+    let mut gateway_config = config(4_096, 2);
+    gateway_config.connect_timeout_ms = 100;
+    gateway_config.read_timeout_ms = 250;
+    gateway_config.total_timeout_ms = 300;
+    let gateway = start_gateway_with_route_config(
+        &format!("{}/v1/chat/completions", baseline.address),
+        &format!("{}/v1/chat/completions", candidate.address),
+        gateway_config,
+        1,
+    );
+    let response = client(false)
+        .post(format!("{}/v1/chat/completions", gateway.address))
+        .bearer_auth(KEY)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"customer-model","messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-milk-route-target"], "openai");
+    let error: LocalEnvelope = response.json().await.unwrap();
+    assert_eq!(error.error.code, "upstream_unavailable");
+    assert_eq!(candidate_count.load(Ordering::SeqCst), 1);
+    assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
+
+    gateway.stop().await;
+    candidate.stop().await;
     baseline.stop().await;
 }
 
@@ -1971,7 +2244,7 @@ async fn candidate_stream_transport_failure_opens_sticky_fuse() {
     };
 
     let failed = request().send().await.unwrap();
-    assert_eq!(failed.headers()["x-dragontales-route-target"], "candidate");
+    assert_eq!(failed.headers()["x-milk-route-target"], "candidate");
     assert!(failed.bytes().await.is_err());
     timeout(Duration::from_secs(1), candidate_task)
         .await
@@ -1979,7 +2252,7 @@ async fn candidate_stream_transport_failure_opens_sticky_fuse() {
         .unwrap();
 
     let later = request().send().await.unwrap();
-    assert_eq!(later.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(later.headers()["x-milk-route-target"], "openai");
     assert_eq!(later.text().await.unwrap(), "baseline-after-stream-fuse");
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
 
@@ -2023,7 +2296,7 @@ async fn candidate_408_opens_sticky_fuse() {
         1,
     );
     let http = client(false);
-    let failed = http
+    let fallback = http
         .post(format!("{}/v1/chat/completions", gateway.address))
         .bearer_auth(KEY)
         .header("content-type", "application/json")
@@ -2031,8 +2304,12 @@ async fn candidate_408_opens_sticky_fuse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(failed.status(), reqwest::StatusCode::REQUEST_TIMEOUT);
-    assert_eq!(failed.headers()["x-dragontales-route-target"], "candidate");
+    assert_eq!(fallback.status(), reqwest::StatusCode::OK);
+    assert_eq!(fallback.headers()["x-milk-route-target"], "openai");
+    assert_eq!(
+        fallback.text().await.unwrap(),
+        "baseline-after-auth-failure"
+    );
 
     let later = http
         .post(format!("{}/v1/chat/completions", gateway.address))
@@ -2043,7 +2320,7 @@ async fn candidate_408_opens_sticky_fuse() {
         .await
         .unwrap();
     assert_eq!(later.status(), reqwest::StatusCode::OK);
-    assert_eq!(later.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(later.headers()["x-milk-route-target"], "openai");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     gateway.stop().await;
@@ -2581,7 +2858,7 @@ async fn official_sdk_traces_persist_once_across_restarts() {
 
     let test_directory = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("milk-gateway-capture-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-capture-{}", Uuid::now_v7()));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&test_directory)
@@ -2637,7 +2914,7 @@ async fn official_sdk_traces_persist_once_across_restarts() {
     gateway_config.capture_retention_days = 30;
     gateway_config.stores = local_stores(&object_root);
     gateway_config.baseline = OpenAiCompatibleEndpoint {
-        chat_completions_url: format!("{}/v1/chat/completions", baseline.address),
+        api_base_url: format!("{}/v1/", baseline.address),
         allow_loopback_http: true,
     };
     validate_config_identity(&gateway_config).unwrap();
@@ -2652,8 +2929,8 @@ async fn official_sdk_traces_persist_once_across_restarts() {
     let (gateway_listener, gateway_address) = listen();
     let gateway = Gateway::with_route(
         &gateway_config,
-        parse_openai_compatible_endpoint(
-            &gateway_config.baseline.chat_completions_url,
+        parse_openai_compatible_api_base_url(
+            &gateway_config.baseline.api_base_url,
             gateway_config.baseline.allow_loopback_http,
         )
         .unwrap(),
@@ -2713,7 +2990,7 @@ async fn official_sdk_traces_persist_once_across_restarts() {
 }
 
 #[actix_web::test]
-async fn official_node_sdk_is_chat_completions_compatible() {
+async fn official_node_sdk_is_chat_and_responses_compatible() {
     #[derive(Deserialize)]
     struct SmokeRequest {
         model: String,
@@ -2726,6 +3003,11 @@ async fn official_node_sdk_is_chat_completions_compatible() {
         multimodal_request: String,
         multimodal_content: String,
         nonstream_content: String,
+        responses_nonstream_text: String,
+        responses_request: String,
+        responses_stream_request: String,
+        responses_stream_terminal: String,
+        responses_stream_text: String,
         stream_text: String,
         missing_key_status: u16,
         rate_limit_status: u16,
@@ -2752,7 +3034,8 @@ async fn official_node_sdk_is_chat_completions_compatible() {
         let stream_gate = Arc::clone(&stream_gate);
         let dropped_tx = Arc::clone(&dropped_tx);
         HttpServer::new(move || {
-            let seen = Arc::clone(&seen);
+            let chat_seen = Arc::clone(&seen);
+            let responses_seen = Arc::clone(&seen);
             let request_gate = Arc::clone(&stream_gate);
             let release_gate = Arc::clone(&stream_gate);
             let dropped_tx = Arc::clone(&dropped_tx);
@@ -2760,7 +3043,7 @@ async fn official_node_sdk_is_chat_completions_compatible() {
                 .route(
                     "/v1/chat/completions",
                     web::post().to(move |request: HttpRequest, body: Bytes| {
-                        let seen = Arc::clone(&seen);
+                        let seen = Arc::clone(&chat_seen);
                         let request_gate = Arc::clone(&request_gate);
                         let dropped_tx = Arc::clone(&dropped_tx);
                         async move {
@@ -2864,6 +3147,47 @@ data: [DONE]
                     }),
                 )
                 .route(
+                    "/v1/responses",
+                    web::post().to(move |request: HttpRequest, body: Bytes| {
+                        let seen = Arc::clone(&responses_seen);
+                        async move {
+                            let parsed: SmokeRequest = serde_json::from_slice(&body).unwrap();
+                            let headers = request
+                                .headers()
+                                .iter()
+                                .map(|(name, value)| {
+                                    (name.as_str().to_owned(), value.as_bytes().to_vec())
+                                })
+                                .collect();
+                            seen.lock().unwrap().push(SeenRequest {
+                                query: request.query_string().to_owned(),
+                                body,
+                                headers,
+                            });
+
+                            match parsed.model.as_str() {
+                                "sdk-responses-nonstream" => HttpResponse::Ok()
+                                    .insert_header(("content-type", "application/json"))
+                                    .body(Bytes::from_static(
+                                        br#"{"id":"resp-sdk-nonstream","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"metadata":{},"model":"sdk-responses-nonstream","output":[{"id":"msg-sdk-nonstream","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"responses-ok"}]}],"parallel_tool_calls":true,"temperature":1.0,"tool_choice":"auto","tools":[],"top_p":1.0}"#,
+                                    )),
+                                "sdk-responses-stream" => HttpResponse::Ok()
+                                    .insert_header(("content-type", "text/event-stream"))
+                                    .body(Bytes::from_static(
+                                        concat!(
+                                            "event: response.output_text.delta\n",
+                                            "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"delta\":\"responses-stream-ok\",\"item_id\":\"msg-sdk-stream\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":1}\n\n",
+                                            "event: response.completed\n",
+                                            "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp-sdk-stream\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":{},\"model\":\"sdk-responses-stream\",\"output\":[{\"id\":\"msg-sdk-stream\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"responses-stream-ok\"}]}],\"parallel_tool_calls\":true,\"temperature\":1.0,\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0}}\n\n",
+                                        )
+                                        .as_bytes(),
+                                    )),
+                                model => HttpResponse::BadRequest().body(model.to_owned()),
+                            }
+                        }
+                    }),
+                )
+                .route(
                     "/release-stream",
                     web::post().to(move || {
                         let release_gate = Arc::clone(&release_gate);
@@ -2910,6 +3234,9 @@ data: [DONE]
     assert_eq!(receipt.nonstream_content, r#"{"ok":true}"#);
     assert_eq!(receipt.multimodal_content, "hello");
     assert_eq!(receipt.stream_text, "hello");
+    assert_eq!(receipt.responses_nonstream_text, "responses-ok");
+    assert_eq!(receipt.responses_stream_text, "responses-stream-ok");
+    assert_eq!(receipt.responses_stream_terminal, "response.completed");
     assert_eq!(receipt.missing_key_status, 401);
     assert_eq!(receipt.rate_limit_status, 429);
     assert!(receipt.cancelled);
@@ -2920,10 +3247,12 @@ data: [DONE]
 
     {
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 5);
+        assert_eq!(seen.len(), 7);
         let mut nonstream = 0;
         let mut multimodal = 0;
         let mut streamed = 0;
+        let mut responses_nonstream = 0;
+        let mut responses_stream = 0;
         let mut rate_limited = 0;
         let mut cancelled = 0;
         let mut missing_key = 0;
@@ -2933,23 +3262,27 @@ data: [DONE]
                 "sdk-nonstream" => nonstream += 1,
                 "sdk-multimodal" => multimodal += 1,
                 "sdk-stream" => streamed += 1,
+                "sdk-responses-nonstream" => responses_nonstream += 1,
+                "sdk-responses-stream" => responses_stream += 1,
                 "sdk-rate-limit" => rate_limited += 1,
                 "sdk-cancel" => cancelled += 1,
                 "sdk-missing-key" => missing_key += 1,
                 model => panic!("unexpected SDK smoke request model {model}"),
             }
-            assert!(header(&request.headers, "x-dragontales-key").is_none());
+            assert!(header(&request.headers, "x-milk-key").is_none());
         }
         assert_eq!(
             (
                 nonstream,
                 multimodal,
                 streamed,
+                responses_nonstream,
+                responses_stream,
                 rate_limited,
                 cancelled,
                 missing_key,
             ),
-            (1, 1, 1, 1, 1, 0)
+            (1, 1, 1, 1, 1, 1, 1, 0)
         );
 
         let advanced = seen
@@ -2965,6 +3298,18 @@ data: [DONE]
         seen.iter()
             .find(|request| request.body.as_ref() == receipt.multimodal_request.as_bytes())
             .expect("multimodal SDK request should reach upstream byte-for-byte");
+
+        for expected in [
+            receipt.responses_request.as_bytes(),
+            receipt.responses_stream_request.as_bytes(),
+        ] {
+            let request = seen
+                .iter()
+                .find(|request| request.body.as_ref() == expected)
+                .expect("Responses SDK request should reach upstream byte-for-byte");
+            let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(value["unknown_extension"]["keep"], true);
+        }
     }
 
     gateway.stop().await;

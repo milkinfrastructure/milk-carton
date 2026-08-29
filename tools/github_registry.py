@@ -103,7 +103,7 @@ def _get_json(path, token):
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": "Bearer " + token.decode("ascii"),
-            "User-Agent": "milk-gateway-release/1",
+            "User-Agent": "milk-carton-release/1",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )

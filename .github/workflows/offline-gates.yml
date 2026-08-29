@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: milk-gateway-offline-${{ github.ref }}
+  group: milk-carton-offline-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,8 +49,8 @@ jobs:
           python3 tools/test_manage_candidate_credential.py
           python3 tools/test_private_build.py
           python3 tools/test_deploy_private_gateway.py
-          bash deploy/dragontales-key.test.sh
-          bash deploy/dragontales-publish-route.test.sh
+          bash deploy/milk-carton-key.test.sh
+          bash deploy/milk-carton-publish-route.test.sh
           sh -n tools/build-private-gateway.sh tools/deploy-private-gateway.sh
 
       - name: Write content-free CI receipt
@@ -87,7 +87,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: milk-gateway-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          name: milk-carton-ci-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-evidence/receipt.json
           if-no-files-found: error
           retention-days: 30

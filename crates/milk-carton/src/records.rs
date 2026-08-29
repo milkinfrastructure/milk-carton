@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,8 +97,8 @@ const STUDENT_COMPRESSED_TENSORS_WHEEL_SHA256: &str =
 const SNAPSHOT_ANALYZER_MIN_OUTPUT_TOKENS: u16 = 4_096;
 const SNAPSHOT_ANALYZER_MAX_OUTPUT_TOKENS: u16 = 32_768;
 const SNAPSHOT_ANALYSIS_PROJECTION_ID: &str = "chat_completions_teacher_v1";
-const TEACHER_PARTITION_DOMAIN: &[u8] = b"dragontales.teacher-partition.v1\0";
-const STUDENT_DEV_SET_DOMAIN: &[u8] = b"dragontales.student-dev-set.v1\0";
+const TEACHER_PARTITION_DOMAIN: &[u8] = b"milk.teacher-partition.v1\0";
+const STUDENT_DEV_SET_DOMAIN: &[u8] = b"milk.student-dev-set.v1\0";
 const MAX_ANALYZER_TOKEN_COUNT: u64 = 1_000_000_000;
 const MAX_ROUTE_COMMIT_BYTES: usize = 8 * 1_024;
 const MAX_ROUTE_COHORT_BINDING_BYTES: usize = 1_024;
@@ -131,7 +132,9 @@ const OBJECT_WRITE_CONCURRENCY: usize = 16;
 const LATENCY_BUCKET_UPPER_MS: [u64; 7] = [10, 50, 100, 250, 500, 1_000, 5_000];
 const REQUEST_SIZE_BUCKET_UPPER_BYTES: [u64; 7] =
     [1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304];
-pub(crate) const CAPTURE_SAMPLER_ID: &str = "sha256_uuidv7_u64_v1";
+pub(crate) const CAPTURE_SAMPLER_ID: &str = "hmac_sha256_session_root_v1";
+const TRACE_SCHEMA_VERSION: &str = "milk.trace.v1";
+const STATS_SHARD_SCHEMA_VERSION: &str = "milk.stats-shard.v1";
 pub(crate) const ANALYZER_OPERATION_TIMEOUT: Duration = Duration::from_secs(210);
 const STUDENT_MAX_MESSAGES: usize = 256;
 const STUDENT_CALIBRATION_ROWS: usize = 128;
@@ -143,11 +146,7 @@ static TRACE_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Scope {
-    pub(crate) tenant_id: Uuid,
-    pub(crate) project_id: Uuid,
-    pub(crate) environment_id: Uuid,
-    pub(crate) workload_id: Uuid,
-    pub(crate) eval_id: String,
+    pub(crate) scope_id: Uuid,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -170,8 +169,10 @@ pub(crate) enum RouteBlockReason {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum RouteFallbackReason {
     CandidateCapacity,
+    CandidateFailure,
     CandidateUnhealthy,
 }
 
@@ -222,11 +223,16 @@ impl TryFrom<BaselineReason> for RouteBlockReason {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TraceCatalog {
+    #[serde(flatten)]
     pub(crate) scope: Scope,
+    #[serde(rename = "request_id")]
     pub(crate) trace_id: Uuid,
     pub(crate) occurred_at: DateTime<Utc>,
     pub(crate) endpoint: String,
+    pub(crate) request_parse_success: bool,
+    pub(crate) streaming: bool,
     pub(crate) route_revision: String,
+    #[serde(rename = "route_observation")]
     pub(crate) route: RouteObservation,
     pub(crate) provider_status: Option<u16>,
     pub(crate) error_class: Option<String>,
@@ -234,13 +240,36 @@ pub(crate) struct TraceCatalog {
     pub(crate) completion_ms: Option<u64>,
     pub(crate) request_bytes: u64,
     pub(crate) response_bytes: u64,
+    #[serde(rename = "sampling_algorithm")]
     pub(crate) sampler_id: String,
+    pub(crate) sampling_unit_kind: SamplingUnitKind,
+    pub(crate) sampling_unit_hmac_sha256: String,
+    pub(crate) sampling_independence: SamplingIndependence,
+    pub(crate) sampling_key_version: String,
+    pub(crate) previous_response_hmac_sha256: Option<String>,
+    #[serde(rename = "inclusion_probability_basis_points")]
     pub(crate) capture_basis_points: u16,
     pub(crate) capture_eligible: bool,
     pub(crate) capture_selected: bool,
+    #[serde(rename = "sampling_policy_version")]
     pub(crate) capture_policy_version: Option<String>,
     pub(crate) rights_state: String,
     pub(crate) retention_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SamplingUnitKind {
+    ChatSessionHeader,
+    ResponsesConversation,
+    Request,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SamplingIndependence {
+    Independent,
+    Uncertain,
 }
 
 impl TraceCatalog {
@@ -249,6 +278,13 @@ impl TraceCatalog {
             .chain(std::iter::once(self.route_revision.capacity()))
             .chain(self.error_class.iter().map(String::capacity))
             .chain(std::iter::once(self.sampler_id.capacity()))
+            .chain(std::iter::once(self.sampling_unit_hmac_sha256.capacity()))
+            .chain(std::iter::once(self.sampling_key_version.capacity()))
+            .chain(
+                self.previous_response_hmac_sha256
+                    .iter()
+                    .map(String::capacity),
+            )
             .chain(self.capture_policy_version.iter().map(String::capacity))
             .chain(std::iter::once(self.rights_state.capacity()))
             .fold(0_usize, usize::saturating_add);
@@ -385,6 +421,8 @@ impl Default for StatsCounters {
 struct StatsRuntime {
     scope: Scope,
     capture_basis_points: u16,
+    capture_policy_version: Option<String>,
+    sampling_key_version: String,
     counters: StatsCounters,
 }
 
@@ -702,22 +740,22 @@ fn conditional_update_version(meta: &ObjectMeta, object: &str) -> Result<UpdateV
 
 fn classify_store_path(location: &ObjectPath) -> object_store::Result<StorePartition> {
     let parts = location.as_ref().split('/').collect::<Vec<_>>();
-    if parts.len() < 8
-        || parts[0] != "dt"
-        || parts[1] != "v3"
-        || !valid_lowercase_hex(parts[2], 64)
-        || parts[3..7].iter().any(|part| {
-            Uuid::parse_str(part).map_or(true, |value| value.is_nil() || value.to_string() != *part)
+    if parts.len() < 5
+        || parts[0] != "milk"
+        || parts[1] != "v1"
+        || parts[2] != "scopes"
+        || Uuid::parse_str(parts[3]).map_or(true, |value| {
+            value.is_nil() || value.to_string() != parts[3]
         })
     {
         return Err(store_permission_error(
             location,
-            "object key is outside a scoped dt/v3 eval authority",
+            "object key is outside a milk/v1 scope authority",
         ));
     }
-    Ok(match parts[7] {
-        "stats" | "traces" | "outcomes" | "tombstones" | "expiry-index" => StorePartition::Capture,
-        "frontier" if parts.get(8) == Some(&"snapshots") => StorePartition::Capture,
+    Ok(match parts[4] {
+        "stats" | "traffic" | "outcomes" | "tombstones" | "expiry-index" => StorePartition::Capture,
+        "frontier" if parts.get(5) == Some(&"snapshots") => StorePartition::Capture,
         "routes" => StorePartition::Routes,
         _ => StorePartition::Control,
     })
@@ -961,7 +999,7 @@ impl SnapshotAnalysisAuthorization {
         not_after: DateTime<Utc>,
     ) -> Result<(Self, [u8; 32])> {
         let policy = Self {
-            schema_version: "dragontales.teacher-policy.v2".to_owned(),
+            schema_version: "milk.teacher-policy.v2".to_owned(),
             policy_id,
             scope: scope.clone(),
             capture_policy_version,
@@ -1371,7 +1409,7 @@ fn snapshot_analyzer_provider_binding(
     budget: &SnapshotAnalysisBudget,
 ) -> Result<[u8; 32]> {
     let binding = ProviderBinding {
-        schema_version: "dragontales.teacher-provider-binding.v3",
+        schema_version: "milk.teacher-provider-binding.v3",
         chat_completions_url: chat_url.as_str(),
         model,
         deployment_sha256: hex_digest(deployment_sha256),
@@ -2935,7 +2973,7 @@ const SNAPSHOT_ANALYZER_JSON_SCHEMA: &str = r##"{
   "type":"object","additionalProperties":false,
   "required":["schema_version","tags","output"],
   "properties":{
-    "schema_version":{"const":"dragontales.teacher-decision.v1"},
+    "schema_version":{"const":"milk.teacher-decision.v1"},
     "tags":{"type":"array","minItems":0,"maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64,"pattern":"^(workload|domain|capability|quality|risk)\\.[a-z0-9][a-z0-9._-]*$"}},
     "output":{"oneOf":[
       {"type":"object","additionalProperties":false,"required":["kind","target"],"properties":{"kind":{"const":"train"},"target":{"type":"string","minLength":1,"maxLength":65536}}},
@@ -3018,7 +3056,7 @@ fn snapshot_analyzer_controls(
         response_format: AnalyzerResponseFormat {
             r#type: "json_schema".to_owned(),
             json_schema: AnalyzerJsonSchema {
-                name: "dragontales_single_snapshot_decision".to_owned(),
+                name: "milk_single_snapshot_decision".to_owned(),
                 strict: true,
                 schema: RawValue::from_string(SNAPSHOT_ANALYZER_JSON_SCHEMA.to_owned())?,
             },
@@ -3113,7 +3151,7 @@ pub(crate) fn successful_snapshot_analyzer_response_for_test(
         TeacherPartition::Calibration => TeacherDecisionOutput::Calibration,
     };
     let decision = TeacherDecision {
-        schema_version: "dragontales.teacher-decision.v1".to_owned(),
+        schema_version: "milk.teacher-decision.v1".to_owned(),
         tags: vec!["workload.capture_smoke".to_owned()],
         output,
     };
@@ -3399,6 +3437,11 @@ impl LatencyStats {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatsValues {
     observed: u64,
+    chat_completions: u64,
+    responses: u64,
+    streaming: u64,
+    request_parse_success: u64,
+    request_parse_failure: u64,
     eligible: u64,
     selected: u64,
     captured: u64,
@@ -3435,6 +3478,17 @@ pub(crate) struct StatsValues {
 impl StatsValues {
     fn observe(&mut self, catalog: &TraceCatalog, state: CaptureState, captured: bool) {
         self.observed = self.observed.saturating_add(1);
+        match catalog.endpoint.as_str() {
+            "chat_completions" => self.chat_completions = self.chat_completions.saturating_add(1),
+            "responses" => self.responses = self.responses.saturating_add(1),
+            _ => {}
+        }
+        self.streaming = self.streaming.saturating_add(u64::from(catalog.streaming));
+        if catalog.request_parse_success {
+            self.request_parse_success = self.request_parse_success.saturating_add(1);
+        } else {
+            self.request_parse_failure = self.request_parse_failure.saturating_add(1);
+        }
         self.queued = self.queued.saturating_add(1);
         self.eligible = self
             .eligible
@@ -3525,6 +3579,11 @@ impl StatsValues {
         }
         add!(
             observed,
+            chat_completions,
+            responses,
+            streaming,
+            request_parse_success,
+            request_parse_failure,
             eligible,
             selected,
             captured,
@@ -3579,12 +3638,18 @@ impl StatsValues {
 #[serde(deny_unknown_fields)]
 struct StatsShard {
     schema_version: String,
+    #[serde(flatten)]
     scope: Scope,
     writer_id: Uuid,
     flush_id: Uuid,
     hour: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
+    #[serde(rename = "sampling_algorithm")]
     sampler_id: String,
+    #[serde(rename = "sampling_policy_version")]
+    capture_policy_version: Option<String>,
+    sampling_key_version: String,
+    #[serde(rename = "inclusion_probability_basis_points")]
     capture_basis_points: u16,
     values: StatsValues,
 }
@@ -3647,12 +3712,14 @@ enum PutDisposition {
 }
 
 impl Records {
-    pub(crate) async fn start(
+    pub(crate) async fn start_with_sampling(
         objects: Arc<dyn ObjectStore>,
         queue_max_bytes: usize,
         max_trace_bytes: usize,
         scope: Scope,
         capture_basis_points: u16,
+        capture_policy_version: Option<String>,
+        sampling_key_version: String,
     ) -> Result<Self> {
         validate_scope(&scope)?;
         if queue_max_bytes == 0 || queue_max_bytes > u32::MAX as usize {
@@ -3663,6 +3730,14 @@ impl Records {
         }
         if capture_basis_points > 10_000 {
             bail!("capture_basis_points cannot exceed 10000");
+        }
+        if capture_policy_version
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256)
+            || sampling_key_version.is_empty()
+            || sampling_key_version.len() > 128
+        {
+            bail!("capture sampling identity is invalid");
         }
         let max_artifact_bytes = max_trace_bytes
             .checked_mul(MAX_STUDENT_TRAIN_ROWS)
@@ -3678,6 +3753,8 @@ impl Records {
         let stats = Arc::new(StatsRuntime {
             scope,
             capture_basis_points,
+            capture_policy_version,
+            sampling_key_version,
             counters: StatsCounters::default(),
         });
         let worker_store = Arc::clone(&store);
@@ -3696,6 +3773,26 @@ impl Records {
     }
 
     #[cfg(test)]
+    pub(crate) async fn start(
+        objects: Arc<dyn ObjectStore>,
+        queue_max_bytes: usize,
+        max_trace_bytes: usize,
+        scope: Scope,
+        capture_basis_points: u16,
+    ) -> Result<Self> {
+        Self::start_with_sampling(
+            objects,
+            queue_max_bytes,
+            max_trace_bytes,
+            scope,
+            capture_basis_points,
+            (capture_basis_points > 0).then(|| "test-policy-v1".to_owned()),
+            "test-key-v1".to_owned(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) fn stalled_for_test(queue_max_bytes: usize, max_trace_bytes: usize) -> Result<Self> {
         if queue_max_bytes == 0 || max_trace_bytes == 0 || max_trace_bytes > queue_max_bytes {
             bail!("invalid test capture queue limits");
@@ -3709,13 +3806,11 @@ impl Records {
         let (sender, receiver) = mpsc::channel(TRACE_QUEUE_RECORDS);
         let stats = Arc::new(StatsRuntime {
             scope: Scope {
-                tenant_id: Uuid::new_v4(),
-                project_id: Uuid::new_v4(),
-                environment_id: Uuid::new_v4(),
-                workload_id: Uuid::new_v4(),
-                eval_id: "11".repeat(32),
+                scope_id: Uuid::new_v4(),
             },
             capture_basis_points: 0,
+            capture_policy_version: None,
+            sampling_key_version: "test-v1".to_owned(),
             counters: StatsCounters::default(),
         });
         std::mem::drop(tokio::spawn(async move {
@@ -4341,7 +4436,7 @@ impl RecordStore {
             .retention_until
             .context("captured trace is missing retention")?;
         let frontier = SnapshotTraceFrontier {
-            schema_version: "dragontales.snapshot-trace-frontier.v1".to_owned(),
+            schema_version: "milk.snapshot-trace-frontier.v1".to_owned(),
             scope: capture.catalog.scope.clone(),
             trace_id: capture.catalog.trace_id,
             occurred_at: capture.catalog.occurred_at,
@@ -4406,13 +4501,15 @@ impl RecordStore {
             }
             let flush_id = Uuid::now_v7();
             let shard = StatsShard {
-                schema_version: "dragontales.stats-shard.v5".to_owned(),
+                schema_version: STATS_SHARD_SCHEMA_VERSION.to_owned(),
                 scope: runtime.scope.clone(),
                 writer_id: self.writer_id,
                 flush_id,
                 hour,
                 recorded_at,
                 sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+                capture_policy_version: runtime.capture_policy_version.clone(),
+                sampling_key_version: runtime.sampling_key_version.clone(),
                 capture_basis_points: runtime.capture_basis_points,
                 values,
             };
@@ -4482,7 +4579,7 @@ impl RecordStore {
         let object = encode_compressed(
             key.clone(),
             &OutcomeObject {
-                schema_version: "dragontales.outcome.v1",
+                schema_version: "milk.outcome.v1",
                 scope,
                 submission_sha256: hex_digest(&digest),
                 retention_until,
@@ -4628,7 +4725,7 @@ impl RecordStore {
         }
 
         let mut report = ExpiryWrite {
-            schema_version: "dragontales.expiry-receipt.v1",
+            schema_version: "milk.expiry-receipt.v1",
             scanned: candidates.len() as u64,
             tombstoned: 0,
             deferred: 0,
@@ -4824,7 +4921,7 @@ impl RecordStore {
             .await?;
         let key = trace_key(scope, trace_id)?;
         let trace: StoredTraceObject = self.load_compressed(&key, self.max_trace_bytes).await?;
-        if trace.schema_version != "dragontales.trace.v3"
+        if trace.schema_version != TRACE_SCHEMA_VERSION
             || trace.catalog.scope != *scope
             || trace.catalog.trace_id != trace_id
         {
@@ -5619,7 +5716,7 @@ impl RecordStore {
             return Ok(());
         }
         let frontier = GpuLaunchFrontier {
-            schema_version: "dragontales.gpu-launch-frontier.v1".to_owned(),
+            schema_version: "milk.gpu-launch-frontier.v1".to_owned(),
             scope: scope.clone(),
             dispatch_id: outbox.dispatch_id.clone(),
             outbox_object_key: outbox_key,
@@ -5713,7 +5810,7 @@ impl RecordStore {
             object_sha256,
         );
         let marker = ExpiryMarker {
-            schema_version: "dragontales.expiry-marker.v1".to_owned(),
+            schema_version: "milk.expiry-marker.v1".to_owned(),
             scope: scope.clone(),
             kind,
             trace_id,
@@ -5807,7 +5904,7 @@ impl RecordStore {
                 bail!("snapshot frontier trace digest differs from its marker");
             }
             let trace: StoredTraceObject = decode_compressed(&trace_payload, self.max_trace_bytes)?;
-            if trace.schema_version != "dragontales.trace.v3"
+            if trace.schema_version != TRACE_SCHEMA_VERSION
                 || trace.catalog.scope != *scope
                 || trace.catalog.trace_id != marker.trace_id
                 || trace.catalog.occurred_at != marker.occurred_at
@@ -6065,7 +6162,7 @@ impl RecordStore {
             TeacherGpuRunCompletion::Terminalized => teacher_gpu_terminalization_deadline(&start)?,
         };
         if serde_json::to_vec(&result)? != payload
-            || result.schema_version != "dragontales.teacher-gpu-run-result.v2"
+            || result.schema_version != "milk.teacher-gpu-run-result.v2"
             || result.scope != *scope
             || result.teacher_run_id != hex_digest(teacher_run_id)
             || result.definition != claim.definition
@@ -6349,7 +6446,7 @@ impl RecordStore {
                 }
                 self.put_create_same(&manifest_object).await?;
                 return Ok(Some(SnapshotBatchWrite {
-                    schema_version: "dragontales.snapshot-batch-receipt.v2",
+                    schema_version: "milk.snapshot-batch-receipt.v2",
                     snapshot_batch_id: index.snapshot_batch_id.clone(),
                     object_key: manifest_object.key,
                     manifest_sha256: index.snapshot_batch_id,
@@ -6397,7 +6494,7 @@ impl RecordStore {
             )
             .await?;
         let manifest = SnapshotBatchManifest {
-            schema_version: "dragontales.snapshot-batch.v2".to_owned(),
+            schema_version: "milk.snapshot-batch.v2".to_owned(),
             scope: scope.clone(),
             from_hour,
             through_hour,
@@ -6424,7 +6521,7 @@ impl RecordStore {
             .max()
             .context("snapshot batch has no retention deadline")?;
         let frontier = SnapshotBatchIndex {
-            schema_version: "dragontales.snapshot-batch-frontier.v1".to_owned(),
+            schema_version: "milk.snapshot-batch-frontier.v1".to_owned(),
             scope: scope.clone(),
             snapshot_batch_id: hex_digest(&snapshot_batch_id),
             retained_until,
@@ -6467,7 +6564,7 @@ impl RecordStore {
                     encode_json(snapshot_batch_key(scope, &winner_id), &winner.manifest)?;
                 self.put_create_same(&winner_object).await?;
                 return Ok(Some(SnapshotBatchWrite {
-                    schema_version: "dragontales.snapshot-batch-receipt.v2",
+                    schema_version: "milk.snapshot-batch-receipt.v2",
                     snapshot_batch_id: winner.snapshot_batch_id.clone(),
                     object_key: winner_object.key,
                     manifest_sha256: winner.snapshot_batch_id,
@@ -6483,7 +6580,7 @@ impl RecordStore {
         self.ensure_snapshot_entries_live(scope, &manifest.entries, now)
             .await?;
         Ok(Some(SnapshotBatchWrite {
-            schema_version: "dragontales.snapshot-batch-receipt.v2",
+            schema_version: "milk.snapshot-batch-receipt.v2",
             snapshot_batch_id: hex_digest(&snapshot_batch_id),
             object_key: object.key,
             manifest_sha256: hex_digest(&snapshot_batch_id),
@@ -6512,7 +6609,7 @@ impl RecordStore {
             .retention_until
             .context("sampled snapshot has no retention deadline")?;
         let occurred_at = trace.catalog.occurred_at;
-        if trace.schema_version != "dragontales.trace.v3"
+        if trace.schema_version != TRACE_SCHEMA_VERSION
             || trace.catalog.scope != *scope
             || trace_key(scope, trace.catalog.trace_id)? != key
             || occurred_at < from_hour
@@ -7097,7 +7194,7 @@ impl RecordStore {
         }
         ensure_teacher_runway(now, max_gpu_seconds, expires_at, "teacher GPU run claim")?;
         let definition = TeacherGpuRunDefinition {
-            schema_version: "dragontales.teacher-gpu-run-definition.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-definition.v1".to_owned(),
             provider_binding_sha256: hex_digest(&provider_binding_sha256),
             slot: acquired.slot.slot,
             run_nonce: acquired.slot.run_nonce,
@@ -7109,14 +7206,14 @@ impl RecordStore {
         };
         let teacher_run_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
         let claim = TeacherGpuRunClaim {
-            schema_version: "dragontales.teacher-gpu-run-claim.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-claim.v1".to_owned(),
             scope: scope.clone(),
             teacher_run_id: hex_digest(&teacher_run_id),
             definition,
             claimed_at: acquired.slot.acquired_at,
         };
         let index = TeacherGpuRunIndex {
-            schema_version: "dragontales.teacher-gpu-run-index.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-index.v1".to_owned(),
             scope: scope.clone(),
             provider_binding_sha256: hex_digest(&provider_binding_sha256),
             teacher_run_id: hex_digest(&teacher_run_id),
@@ -7165,7 +7262,7 @@ impl RecordStore {
             return Ok(None);
         }
         let dispatch = TeacherGpuDispatch {
-            schema_version: "dragontales.teacher-gpu-dispatch.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-dispatch.v1".to_owned(),
             scope: scope.clone(),
             provider_binding_sha256: slot.provider_binding_sha256.clone(),
             slot: slot.slot,
@@ -7278,7 +7375,7 @@ impl RecordStore {
             return Ok(TeacherGpuTickWrite::Hold);
         }
         Ok(TeacherGpuTickWrite::Launch(TeacherGpuRunLaunchWrite {
-            schema_version: "dragontales.teacher-gpu-run-launch.v1",
+            schema_version: "milk.teacher-gpu-run-launch.v1",
             teacher_run_id: index.teacher_run_id,
             claim_object_key: claim_object.key,
             claim_sha256: hex_digest(&claim_object.sha256),
@@ -7456,7 +7553,7 @@ impl RecordStore {
             "teacher GPU run start",
         )?;
         let start = TeacherGpuRunStart {
-            schema_version: "dragontales.teacher-gpu-run-start.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-start.v1".to_owned(),
             scope: scope.clone(),
             teacher_run_id: claim.teacher_run_id.clone(),
             claim_sha256: hex_digest(&Sha256::digest(&claim_payload).into()),
@@ -7495,7 +7592,7 @@ impl RecordStore {
             Err(error) => return Err(error.into()),
         }
         Ok(TeacherGpuRunStartWrite {
-            schema_version: "dragontales.teacher-gpu-run-start-receipt.v1",
+            schema_version: "milk.teacher-gpu-run-start-receipt.v1",
             teacher_run_id: claim.teacher_run_id,
             execution_start_object_key: object.key,
             execution_start_sha256: hex_digest(&object.sha256),
@@ -7522,7 +7619,7 @@ impl RecordStore {
             .await?;
         let start: TeacherGpuRunStart = serde_json::from_slice(&payload)?;
         if serde_json::to_vec(&start)? != payload
-            || start.schema_version != "dragontales.teacher-gpu-run-start.v1"
+            || start.schema_version != "milk.teacher-gpu-run-start.v1"
             || start.scope != *scope
             || start.teacher_run_id != claim.teacher_run_id
             || start.claim_sha256 != hex_digest(&Sha256::digest(claim_payload).into())
@@ -7643,7 +7740,7 @@ impl RecordStore {
             }
         }
         let result = TeacherGpuRunResult {
-            schema_version: "dragontales.teacher-gpu-run-result.v2".to_owned(),
+            schema_version: "milk.teacher-gpu-run-result.v2".to_owned(),
             scope: scope.clone(),
             teacher_run_id: claim.teacher_run_id,
             definition: claim.definition.clone(),
@@ -7889,7 +7986,7 @@ impl RecordStore {
         }
         let observed_gpu_seconds = elapsed_seconds_ceil(start.started_at, completed_at)?;
         let result = TeacherGpuRunResult {
-            schema_version: "dragontales.teacher-gpu-run-result.v2".to_owned(),
+            schema_version: "milk.teacher-gpu-run-result.v2".to_owned(),
             scope: scope.clone(),
             teacher_run_id: claim.teacher_run_id,
             definition: claim.definition,
@@ -8039,7 +8136,7 @@ impl RecordStore {
         self.ensure_snapshot_entries_live(scope, &manifest.entries, now)
             .await?;
         let definition = TeacherJobDefinition {
-            schema_version: "dragontales.teacher-job-definition.v2".to_owned(),
+            schema_version: "milk.teacher-job-definition.v2".to_owned(),
             snapshot_batch_id: hex_digest(snapshot_batch_id),
             provider_binding_sha256: hex_digest(&provider_binding_sha256),
             execution: config.execution.identity(),
@@ -8085,13 +8182,13 @@ impl RecordStore {
             }
             Some(_) => bail!("snapshot batch is already reserved by another teacher job"),
             None => TeacherJobIndex {
-                schema_version: "dragontales.teacher-job-index.v2".to_owned(),
+                schema_version: "milk.teacher-job-index.v2".to_owned(),
                 scope: scope.clone(),
                 snapshot_batch_id: hex_digest(&snapshot_batch_id),
                 teacher_job_id: hex_digest(&teacher_job_id),
                 expires_at,
                 claim: TeacherJobClaim {
-                    schema_version: "dragontales.teacher-job-claim.v2".to_owned(),
+                    schema_version: "milk.teacher-job-claim.v2".to_owned(),
                     scope: scope.clone(),
                     teacher_job_id: hex_digest(&teacher_job_id),
                     definition: prepared.definition.clone(),
@@ -8157,7 +8254,7 @@ impl RecordStore {
             };
             let result_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(&result)?).into();
             let artifact = StoredTeacherResult {
-                schema_version: "dragontales.teacher-result-artifact.v1".to_owned(),
+                schema_version: "milk.teacher-result-artifact.v1".to_owned(),
                 scope: scope.clone(),
                 teacher_job_id: hex_digest(&prepared.teacher_job_id),
                 definition: prepared.definition,
@@ -8224,7 +8321,7 @@ impl RecordStore {
         }
         let trace_frontier_sha256: [u8; 32] = Sha256::digest(&trace_frontier_payload).into();
         let rejection = SnapshotLocalRejection {
-            schema_version: "dragontales.snapshot-analysis-local-rejection.v1".to_owned(),
+            schema_version: "milk.snapshot-analysis-local-rejection.v1".to_owned(),
             scope: scope.clone(),
             provider_binding_sha256: hex_digest(provider_binding_sha256),
             trace_id: entry.trace_id,
@@ -8258,7 +8355,7 @@ impl RecordStore {
         ))
         .await?;
         Ok(SnapshotLocalRejectionWrite {
-            schema_version: "dragontales.snapshot-analysis-local-rejection-receipt.v1",
+            schema_version: "milk.snapshot-analysis-local-rejection-receipt.v1",
             provider_binding_sha256: rejection.provider_binding_sha256,
             trace_id: rejection.trace_id,
             trace_payload_sha256: rejection.trace_payload_sha256,
@@ -8310,7 +8407,7 @@ impl RecordStore {
         let claim_key = teacher_job_claim_key(scope, teacher_job_id);
         let claim_payload = self.load_bytes(&claim_key, self.max_trace_bytes).await?;
         let claim: TeacherJobClaim = serde_json::from_slice(&claim_payload)?;
-        if claim.schema_version != "dragontales.teacher-job-claim.v2"
+        if claim.schema_version != "milk.teacher-job-claim.v2"
             || claim.scope != *scope
             || claim.teacher_job_id != hex_digest(teacher_job_id)
             || claim.definition != artifact.definition
@@ -8446,7 +8543,7 @@ impl RecordStore {
         } else {
             Ok(SnapshotAnalysisInputLoad::Complete {
                 input: CompleteSnapshotAnalysisInput {
-                    schema_version: "dragontales.teacher-input.v1".to_owned(),
+                    schema_version: "milk.teacher-input.v1".to_owned(),
                     projection_id: SNAPSHOT_ANALYSIS_PROJECTION_ID.to_owned(),
                     snapshot_batch_id: hex_digest(snapshot_batch_id),
                     snapshots,
@@ -8888,7 +8985,7 @@ impl RecordStore {
             .verified_student_source_expires_at(scope, &claim)
             .await?;
         let index = StudentJobIndex {
-            schema_version: "dragontales.student-job-index.v1".to_owned(),
+            schema_version: "milk.student-job-index.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: claim.student_job_id.clone(),
             source_expires_at,
@@ -9086,7 +9183,7 @@ impl RecordStore {
             }
         });
         Ok(RecordsStatusWrite {
-            schema_version: "dragontales.status-records.v5",
+            schema_version: "milk.status-records.v5",
             scope: scope.clone(),
             capture,
             expiry,
@@ -9611,7 +9708,7 @@ impl RecordStore {
                 MAX_STUDENT_RESULT_BYTES,
             )
             .await?;
-        if result.schema_version != "dragontales.student-result.v2" {
+        if result.schema_version != "milk.student-result.v2" {
             bail!("student result has an unsupported schema");
         }
         let expected = self
@@ -9935,6 +10032,16 @@ impl RecordStore {
             self.load_verified_route_commit(scope, &previous.revision)
                 .await?;
         }
+        if publication.is_operator_proposal() {
+            if publication.has_candidate != (publication.candidate_basis_points > 0) {
+                bail!("operator route candidate differs from its basis points");
+            }
+            return if publication.has_candidate {
+                self.verify_route_cohort_binding(scope, publication).await
+            } else {
+                Ok(())
+            };
+        }
         if publication.candidate_basis_points == 0 {
             let previous = previous
                 .context("zero-basis-point rollback requires a prior committed route revision")?;
@@ -9951,7 +10058,7 @@ impl RecordStore {
                 || publication.student_branch_runtime_image_reference
                     != previous.student_branch_runtime_image_reference
                 || publication.provider_terms_sha256 != previous.provider_terms_sha256
-                || publication.candidate_endpoint != previous.candidate_endpoint
+                || publication.candidate_api_base_url != previous.candidate_api_base_url
                 || publication.logical_model_alias != previous.logical_model_alias
                 || publication.reasoning_effort != previous.reasoning_effort
                 || publication.route_secret_sha256 != previous.route_secret_sha256
@@ -10075,7 +10182,7 @@ impl RecordStore {
             MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
             "student model manifest",
         )?;
-        if model_manifest.schema_version != "dragontales.student-model-manifest.v1"
+        if model_manifest.schema_version != "milk.student-model-manifest.v1"
             || model_manifest.student_job_id != result.student_job_id
             || model_manifest.variant != winner
             || !model_manifest.retained
@@ -10284,7 +10391,7 @@ impl RecordStore {
             .load_verified_provider_teardown_authorization(scope, student_job_id)
             .await?;
         if serde_json::to_vec(&frontier)? != payload
-            || frontier.schema_version != "dragontales.provider-teardown-frontier.v1"
+            || frontier.schema_version != "milk.provider-teardown-frontier.v1"
             || frontier.scope != *scope
             || frontier.student_job_id != hex_digest(student_job_id)
             || frontier.authorization_object_key
@@ -10313,7 +10420,7 @@ impl RecordStore {
             .load_verified_provider_teardown_authorization_control(scope, student_job_id)
             .await?;
         if serde_json::to_vec(&frontier)? != payload
-            || frontier.schema_version != "dragontales.provider-teardown-frontier.v1"
+            || frontier.schema_version != "milk.provider-teardown-frontier.v1"
             || frontier.scope != *scope
             || frontier.student_job_id != hex_digest(student_job_id)
             || frontier.authorization_object_key
@@ -10355,7 +10462,7 @@ impl RecordStore {
             .load_verified_student_winner_deployment_claim(scope, student_job_id)
             .await?;
         let authorization = ProviderTeardownAuthorization {
-            schema_version: "dragontales.provider-teardown-authorization.v1".to_owned(),
+            schema_version: "milk.provider-teardown-authorization.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: result.student_job_id.clone(),
             claim_sha256: result.claim_sha256.clone(),
@@ -10401,7 +10508,7 @@ impl RecordStore {
             .load_verified_provider_teardown_authorization_control(scope, student_job_id)
             .await?;
         let frontier = ProviderTeardownFrontier {
-            schema_version: "dragontales.provider-teardown-frontier.v1".to_owned(),
+            schema_version: "milk.provider-teardown-frontier.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: hex_digest(student_job_id),
             authorization_object_key: authorization_key,
@@ -10675,7 +10782,7 @@ impl RecordStore {
                     .await?;
             }
             let receipt = StudentWinnerMaterializationReceipt {
-                schema_version: "dragontales.student-winner-materialization-receipt.v1",
+                schema_version: "milk.student-winner-materialization-receipt.v1",
                 student_job_id: hex_digest(student_job_id),
                 variant: student_variant_name(variant).to_owned(),
                 model_manifest_sha256: hex_digest(model_manifest_sha256),
@@ -10712,7 +10819,7 @@ impl RecordStore {
             .await?;
         let binding: RouteCohortBinding = serde_json::from_slice(&bytes)?;
         if serde_json::to_vec(&binding)? != bytes
-            || binding.schema_version != "dragontales.route-cohort-binding.v2"
+            || binding.schema_version != "milk.route-cohort-binding.v2"
             || binding.scope != *scope
             || binding.cohort_sha256 != hex_digest(&publication.cohort_sha256)
             || binding.route_secret_sha256 != hex_digest(&publication.route_secret_sha256)
@@ -10734,7 +10841,7 @@ impl RecordStore {
         let bytes = self.load_bytes(&key, MAX_ROUTE_RETIREMENT_BYTES).await?;
         let retirement: RouteStudentRetirement = serde_json::from_slice(&bytes)?;
         if serde_json::to_vec(&retirement)? != bytes
-            || retirement.schema_version != "dragontales.route-student-retirement.v1"
+            || retirement.schema_version != "milk.route-student-retirement.v1"
             || retirement.scope != *scope
             || retirement.student_job_id != hex_digest(student_job_id)
             || !valid_lowercase_sha256(&retirement.zero_route_revision)
@@ -10768,7 +10875,7 @@ impl RecordStore {
             bail!("route student retirement requires a zero-basis-point publication");
         }
         let retirement = RouteStudentRetirement {
-            schema_version: "dragontales.route-student-retirement.v1".to_owned(),
+            schema_version: "milk.route-student-retirement.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: hex_digest(&publication.student_job_id),
             zero_route_revision: publication.revision_hex(),
@@ -10845,7 +10952,7 @@ impl RecordStore {
             encode_json(
                 route_cohort_binding_key(scope, &publication.cohort_sha256),
                 &RouteCohortBinding {
-                    schema_version: "dragontales.route-cohort-binding.v2".to_owned(),
+                    schema_version: "milk.route-cohort-binding.v2".to_owned(),
                     scope: scope.clone(),
                     cohort_sha256: hex_digest(&publication.cohort_sha256),
                     route_secret_sha256: hex_digest(&publication.route_secret_sha256),
@@ -10862,7 +10969,7 @@ impl RecordStore {
         self.verify_route_cohort_binding(scope, publication).await?;
         let commit_key = route_commit_key(scope, &publication.revision);
         let commit = RoutePublicationCommit {
-            schema_version: "dragontales.route-publication-commit.v2".to_owned(),
+            schema_version: "milk.route-publication-commit.v2".to_owned(),
             scope: scope.clone(),
             route_revision: revision,
             previous_route_revision: publication
@@ -10888,7 +10995,9 @@ impl RecordStore {
         {
             bail!("stored route publication differs from the signed input");
         }
-        if let Some(previous) = previous.filter(|route| route.candidate_basis_points == 0) {
+        if !publication.is_operator_proposal()
+            && let Some(previous) = previous.filter(|route| route.candidate_basis_points == 0)
+        {
             let (current, _) = self
                 .load_live_pointer(scope)
                 .await?
@@ -10903,7 +11012,7 @@ impl RecordStore {
                 .await?;
         }
         self.activate_route(scope, publication).await?;
-        if publication.candidate_basis_points == 0 {
+        if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
             self.store_route_student_retirement(scope, publication)
                 .await?;
         }
@@ -10917,7 +11026,7 @@ impl RecordStore {
         {
             bail!("live route differs from the activated publication");
         }
-        if publication.candidate_basis_points == 0 {
+        if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
             self.verify_zero_route_retirement(scope, publication)
                 .await?;
             let canary = previous.context(
@@ -11068,7 +11177,7 @@ impl RecordStore {
         let commit: RoutePublicationCommit = serde_json::from_slice(&commit_bytes)?;
         let signature_sha256 = decode_hex_digest(&commit.signature_sha256)?;
         if serde_json::to_vec(&commit)? != commit_bytes
-            || commit.schema_version != "dragontales.route-publication-commit.v2"
+            || commit.schema_version != "milk.route-publication-commit.v2"
             || commit.scope != *scope
             || commit.route_revision != hex_digest(revision)
             || commit
@@ -11650,24 +11759,25 @@ pub(crate) fn validate_local_store_identity(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_cloudflare_r2(
-    account_id: &str,
+pub(crate) fn build_s3(
+    endpoint: &str,
+    region: &str,
     bucket: &str,
     partition: StorePartition,
 ) -> Result<Arc<dyn ObjectStore>> {
-    validate_cloudflare_r2_identity(account_id, bucket)?;
+    validate_s3_identity(endpoint, region, bucket)?;
     let prefix = partition.credential_prefix();
     let access_key = required_utf8_environment(&format!("{prefix}_ACCESS_KEY_ID"))?;
     let secret_key = required_utf8_environment(&format!("{prefix}_SECRET_ACCESS_KEY"))?;
     let session_token = optional_utf8_environment(&format!("{prefix}_SESSION_TOKEN"))?;
-    let endpoint = format!("https://{account_id}.r2.cloudflarestorage.com");
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_region("auto")
+        .with_region(region)
         .with_endpoint(endpoint)
         .with_access_key_id(access_key)
         .with_secret_access_key(secret_key)
         .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_virtual_hosted_style_request(false)
         .with_allow_http(false);
     if let Some(session_token) = session_token {
         builder = builder.with_token(session_token);
@@ -11676,31 +11786,59 @@ pub(crate) fn build_cloudflare_r2(
     Ok(Arc::new(store))
 }
 
-pub(crate) fn validate_cloudflare_r2_identity(account_id: &str, bucket: &str) -> Result<()> {
-    if account_id.len() != 32
-        || !account_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("Cloudflare account_id must be exactly 32 lowercase hexadecimal characters");
+pub(crate) fn validate_s3_identity(endpoint: &str, region: &str, bucket: &str) -> Result<()> {
+    if endpoint.is_empty() || endpoint.len() > 2_048 {
+        bail!("S3 endpoint must contain 1..=2048 bytes");
     }
-    if !(3..=63).contains(&bucket.len())
-        || bucket.starts_with('-')
-        || bucket.ends_with('-')
-        || !bucket
+    let endpoint = Url::parse(endpoint).context("S3 endpoint is not a valid URL")?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.path() != "/"
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        bail!("S3 endpoint must be an HTTPS origin without credentials, path, query, or fragment");
+    }
+    if region.is_empty()
+        || region.len() > 64
+        || region.starts_with('-')
+        || region.ends_with('-')
+        || !region
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        bail!("Cloudflare R2 bucket must be a valid 3..=63 byte bucket name");
+        bail!("S3 region must contain 1..=64 lowercase letters, digits, or interior hyphens");
+    }
+    if !(3..=63).contains(&bucket.len())
+        || !bucket
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !bucket
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+        || bucket.contains("..")
+        || bucket.contains(".-")
+        || bucket.contains("-.")
+        || bucket.parse::<Ipv4Addr>().is_ok()
+    {
+        bail!("S3 bucket must be a valid 3..=63 byte DNS-compatible bucket name");
     }
     Ok(())
 }
 
-pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Result<()> {
-    let prefix = ObjectPath::from(format!("dt/v3/_r2_probe/{}", Uuid::new_v4()));
-    let object = prefix.child("semantics");
-    let first_payload = PutPayload::from_static(b"dragontales-r2-probe-v1");
-    let second_payload = PutPayload::from_static(b"dragontales-r2-probe-v2");
+pub(crate) async fn probe_s3(objects: &Arc<dyn ObjectStore>) -> Result<()> {
+    let prefix = ObjectPath::from(format!("milk/v1/_s3_probe/{}", Uuid::new_v4()));
+    let object = prefix.child("a-semantics");
+    let ordered_object = prefix.child("z-order");
+    let first_payload = PutPayload::from_static(b"milk-carton-s3-probe-v1");
+    let second_payload = PutPayload::from_static(b"milk-carton-s3-probe-v2");
     let result = async {
         let first = objects
             .put_opts(
@@ -11724,7 +11862,7 @@ pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Resul
             .await
         {
             Err(object_store::Error::AlreadyExists { .. }) => {}
-            Ok(_) => bail!("R2 conditional create overwrote the probe object"),
+            Ok(_) => bail!("S3 conditional create overwrote the probe object"),
             Err(error) => return Err(error.into()),
         }
         let second = objects
@@ -11749,44 +11887,68 @@ pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Resul
             .await
         {
             Err(object_store::Error::Precondition { .. }) => {}
-            Ok(_) => bail!("R2 stale ETag update overwrote the probe object"),
+            Ok(_) => bail!("S3 stale ETag update overwrote the probe object"),
             Err(error) => return Err(error.into()),
         }
         if second.e_tag.is_none() {
-            bail!("R2 conditional update did not return an ETag");
+            bail!("S3 conditional update did not return an ETag");
         }
         let bytes = objects.get(&object).await?.bytes().await?;
-        if bytes.as_ref() != b"dragontales-r2-probe-v2" {
-            bail!("R2 read did not return the conditionally updated probe object");
+        if bytes.as_ref() != b"milk-carton-s3-probe-v2" {
+            bail!("S3 read did not return the conditionally updated probe object");
         }
+        objects
+            .put_opts(
+                &ordered_object,
+                PutPayload::from_static(b"milk-carton-s3-probe-order"),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await?;
         let listed = objects
             .list(Some(&prefix))
             .map(|entry| entry.map(|entry| entry.location))
             .try_collect::<Vec<_>>()
             .await?;
-        if listed != [object.clone()] {
-            bail!("R2 list did not return exactly the probe object");
+        if listed != [object.clone(), ordered_object.clone()] {
+            bail!("S3 list did not return the probe objects in key order");
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    let deleted = objects.delete(&object).await;
-    match (result, deleted) {
-        (Ok(()), Ok(())) => match objects.get(&object).await {
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Ok(_) => bail!("R2 delete left the probe object readable"),
-            Err(error) => Err(error.into()),
-        },
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(error), Err(delete_error)) => Err(error.context(format!(
-            "R2 semantics probe cleanup also failed: {delete_error}"
+    let cleanup_failure = match (
+        objects.delete(&object).await,
+        objects.delete(&ordered_object).await,
+    ) {
+        (Ok(()), Ok(())) => None,
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Some(error.to_string()),
+        (Err(first), Err(second)) => Some(format!("{first}; {second}")),
+    };
+    match (result, cleanup_failure) {
+        (Err(error), Some(cleanup_failure)) => Err(error.context(format!(
+            "S3 semantics probe cleanup also failed: {cleanup_failure}"
         ))),
+        (Err(error), None) => Err(error),
+        (Ok(()), Some(cleanup_failure)) => {
+            bail!("S3 semantics probe cleanup failed: {cleanup_failure}")
+        }
+        (Ok(()), None) => {
+            for deleted in [&object, &ordered_object] {
+                match objects.get(deleted).await {
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Ok(_) => bail!("S3 delete left a probe object readable"),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        }
     }
 }
 
-pub(crate) async fn probe_cloudflare_r2_read(objects: &Arc<dyn ObjectStore>) -> Result<()> {
-    let prefix = ObjectPath::from("dt/v3");
+pub(crate) async fn probe_s3_read(objects: &Arc<dyn ObjectStore>) -> Result<()> {
+    let prefix = ObjectPath::from("milk/v1");
     let mut listed = objects.list(Some(&prefix));
     if let Some(result) = listed.next().await {
         result?;
@@ -11827,6 +11989,10 @@ fn validate_stats_shard(
         .and_then(|value| value.checked_add(values.interrupted))
         .and_then(|value| value.checked_add(values.capture_failed));
     let route_total = values.route_eligible.checked_add(values.route_ineligible);
+    let endpoint_total = values.chat_completions.checked_add(values.responses);
+    let parse_total = values
+        .request_parse_success
+        .checked_add(values.request_parse_failure);
     let route_eligible_total = values.route_selected.checked_add(values.route_not_selected);
     let blocked_total = values
         .route_blocked_reason_counts
@@ -11866,7 +12032,7 @@ fn validate_stats_shard(
             && (latency.count > 0 || (latency.sum_ms == 0 && latency.max_ms == 0))
             && latency.sum_ms >= latency.max_ms
     };
-    if shard.schema_version != "dragontales.stats-shard.v5"
+    if shard.schema_version != STATS_SHARD_SCHEMA_VERSION
         || shard.scope != *scope
         || shard.hour != hour_start(shard.hour)
         || shard.hour < from_hour
@@ -11875,6 +12041,12 @@ fn validate_stats_shard(
         || shard.flush_id.get_timestamp().is_none()
         || shard.recorded_at < shard.hour
         || shard.sampler_id != CAPTURE_SAMPLER_ID
+        || shard.sampling_key_version.is_empty()
+        || shard.sampling_key_version.len() > 128
+        || shard
+            .capture_policy_version
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256)
         || shard.capture_basis_points > 10_000
         || key != stats_key(scope, shard.hour, shard.writer_id, shard.flush_id)
         || values.eligible > values.observed
@@ -11886,6 +12058,9 @@ fn validate_stats_shard(
         || values.traces_persisted != values.captured
         || values.trace_persist_failures != values.capture_failed
         || capture_total != Some(values.observed)
+        || endpoint_total != Some(values.observed)
+        || parse_total != Some(values.observed)
+        || values.streaming > values.observed
         || route_total != Some(values.observed)
         || route_eligible_total != Some(values.route_eligible)
         || blocked_total != Some(values.route_ineligible)
@@ -11927,7 +12102,7 @@ fn decode_expiry_marker(scope: &Scope, key: &str, payload: &[u8]) -> Result<Expi
         }),
     };
     if serde_json::to_vec(&marker)? != payload
-        || marker.schema_version != "dragontales.expiry-marker.v1"
+        || marker.schema_version != "milk.expiry-marker.v1"
         || marker.scope != *scope
         || marker.created_at != trace_time(marker.trace_id)?
         || marker.retention_until <= marker.created_at
@@ -11961,7 +12136,7 @@ fn expiry_tombstone(scope: &Scope, marker: &ExpiryMarker) -> Result<EncodedObjec
     encode_json(
         key,
         &Tombstone {
-            schema_version: "dragontales.tombstone.v1".to_owned(),
+            schema_version: "milk.tombstone.v1".to_owned(),
             scope: scope.clone(),
             kind: marker.kind,
             trace_id: marker.trace_id,
@@ -11981,7 +12156,7 @@ fn validate_expiry_source(
     match marker.kind {
         ExpiryKind::Trace => {
             let trace: StoredTraceObject = decode_compressed(payload, max_bytes)?;
-            if trace.schema_version != "dragontales.trace.v3"
+            if trace.schema_version != TRACE_SCHEMA_VERSION
                 || trace.catalog.scope != *scope
                 || trace.catalog.trace_id != marker.trace_id
                 || trace.catalog.retention_until != Some(marker.retention_until)
@@ -12012,7 +12187,7 @@ fn validate_stored_outcome(
     outcome.submission.validate(max_bytes)?;
     let submission_sha256: [u8; 32] =
         Sha256::digest(serde_json::to_vec(&outcome.submission)?).into();
-    if outcome.schema_version != "dragontales.outcome.v1"
+    if outcome.schema_version != "milk.outcome.v1"
         || outcome.scope != *scope
         || key
             != outcome_key(
@@ -12035,7 +12210,7 @@ fn validate_snapshot_trace_frontier(
     payload: &[u8],
 ) -> Result<()> {
     if serde_json::to_vec(marker)? != payload
-        || marker.schema_version != "dragontales.snapshot-trace-frontier.v1"
+        || marker.schema_version != "milk.snapshot-trace-frontier.v1"
         || marker.scope != *scope
         || hour_start(marker.occurred_at) != hour_start(trace_time(marker.trace_id)?)
         || marker.retention_until <= marker.occurred_at
@@ -12075,7 +12250,7 @@ fn validate_snapshot_local_rejection(
         SnapshotLocalRejectionReason::UnsupportedEncoding => rejection.provider_request_bytes == 0,
         SnapshotLocalRejectionReason::UnsupportedUtf8 => rejection.provider_request_bytes == 0,
     };
-    if rejection.schema_version != "dragontales.snapshot-analysis-local-rejection.v1"
+    if rejection.schema_version != "milk.snapshot-analysis-local-rejection.v1"
         || rejection.scope != *scope
         || rejection.provider_binding_sha256 != hex_digest(provider_binding_sha256)
         || hour_start(rejection.occurred_at) != hour_start(trace_time(rejection.trace_id)?)
@@ -12103,7 +12278,7 @@ fn validate_snapshot_batch_manifest(
     authorization_bytes.push(b'\n');
     if serde_json::to_vec(manifest)? != payload
         || Sha256::digest(payload).as_slice() != snapshot_batch_id
-        || manifest.schema_version != "dragontales.snapshot-batch.v2"
+        || manifest.schema_version != "milk.snapshot-batch.v2"
         || manifest.scope != *scope
         || manifest.entries.is_empty()
         || manifest.entries.len() > MAX_SNAPSHOT_BATCH_ENTRIES
@@ -12151,7 +12326,7 @@ fn validate_snapshot_batch_index(
         .max()
         .context("snapshot batch frontier has no retention deadline")?;
     if serde_json::to_vec(index)? != payload
-        || index.schema_version != "dragontales.snapshot-batch-frontier.v1"
+        || index.schema_version != "milk.snapshot-batch-frontier.v1"
         || index.scope != *scope
         || index.manifest.source_authorization_sha256 != hex_digest(source_authorization_sha256)
         || index.manifest.from_hour != from_hour
@@ -12180,11 +12355,11 @@ fn validate_teacher_job_claim(
     validate_snapshot_analysis_budget(&claim.definition.budget)?;
     claim.definition.execution.validate()?;
     if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "dragontales.teacher-job-claim.v2"
+        || claim.schema_version != "milk.teacher-job-claim.v2"
         || claim.scope != *scope
         || claim.teacher_job_id != hex_digest(teacher_job_id)
         || definition_sha256 != *teacher_job_id
-        || claim.definition.schema_version != "dragontales.teacher-job-definition.v2"
+        || claim.definition.schema_version != "milk.teacher-job-definition.v2"
         || !valid_lowercase_sha256(&claim.definition.snapshot_batch_id)
         || !valid_lowercase_sha256(&claim.definition.provider_binding_sha256)
         || !valid_lowercase_sha256(&claim.definition.input_sha256)
@@ -12215,7 +12390,7 @@ fn validate_teacher_job_index(
     let expected_frontier_key =
         teacher_job_frontier_key(scope, &provider_binding, index.expires_at, &teacher_job_id);
     if serde_json::to_vec(index)? != payload
-        || index.schema_version != "dragontales.teacher-job-index.v2"
+        || index.schema_version != "milk.teacher-job-index.v2"
         || index.scope != *scope
         || index.snapshot_batch_id != index.claim.definition.snapshot_batch_id
         || index.teacher_job_id != index.claim.teacher_job_id
@@ -12236,7 +12411,7 @@ fn validate_teacher_gpu_slot(
 ) -> Result<()> {
     validate_runtime_image_reference(&slot.runtime_image_reference)?;
     if serde_json::to_vec(slot)? != payload
-        || slot.schema_version != "dragontales.teacher-gpu-slot.v1"
+        || slot.schema_version != "milk.teacher-gpu-slot.v1"
         || slot.scope != *scope
         || slot.provider_binding_sha256 != hex_digest(provider_binding_sha256)
         || slot.slot >= TEACHER_MAX_PARALLEL_RUNS
@@ -12261,7 +12436,7 @@ fn validate_teacher_gpu_dispatch(
     payload: &[u8],
 ) -> Result<()> {
     if serde_json::to_vec(dispatch)? != payload
-        || dispatch.schema_version != "dragontales.teacher-gpu-dispatch.v1"
+        || dispatch.schema_version != "milk.teacher-gpu-dispatch.v1"
         || dispatch.scope != *scope
         || !valid_lowercase_sha256(&dispatch.provider_binding_sha256)
         || dispatch.slot >= TEACHER_MAX_PARALLEL_RUNS
@@ -12291,11 +12466,11 @@ fn validate_teacher_gpu_run_claim(
         .windows(2)
         .all(|pair| pair[0].teacher_job_id < pair[1].teacher_job_id);
     if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "dragontales.teacher-gpu-run-claim.v1"
+        || claim.schema_version != "milk.teacher-gpu-run-claim.v1"
         || claim.scope != *scope
         || claim.teacher_run_id != hex_digest(teacher_run_id)
         || definition_sha256 != *teacher_run_id
-        || claim.definition.schema_version != "dragontales.teacher-gpu-run-definition.v1"
+        || claim.definition.schema_version != "milk.teacher-gpu-run-definition.v1"
         || !valid_lowercase_sha256(&claim.definition.provider_binding_sha256)
         || claim.definition.slot >= TEACHER_MAX_PARALLEL_RUNS
         || claim.definition.run_nonce.is_nil()
@@ -12327,7 +12502,7 @@ fn validate_teacher_gpu_run_index(
     validate_teacher_gpu_run_claim(scope, &teacher_run_id, &index.claim, &claim_payload)?;
     let provider_binding_sha256 = decode_hex_digest(&index.provider_binding_sha256)?;
     if serde_json::to_vec(index)? != payload
-        || index.schema_version != "dragontales.teacher-gpu-run-index.v1"
+        || index.schema_version != "milk.teacher-gpu-run-index.v1"
         || index.scope != *scope
         || index.provider_binding_sha256 != index.claim.definition.provider_binding_sha256
         || index.teacher_run_id != index.claim.teacher_run_id
@@ -12366,7 +12541,7 @@ fn validate_teacher_gpu_call_execution(
                         run_claim_sha256: &str,
                         dispatch_sha256: &str,
                         provider_request_sha256: &str| {
-        schema_version == "dragontales.teacher-gpu-call-execution.v1"
+        schema_version == "milk.teacher-gpu-call-execution.v1"
             && execution_scope == scope
             && execution_teacher_job_id == hex_digest(teacher_job_id)
             && claim_sha256 == reference.claim_sha256
@@ -12450,7 +12625,7 @@ fn teacher_gpu_call_started(
     started_at: DateTime<Utc>,
 ) -> Result<TeacherGpuCallExecution> {
     Ok(TeacherGpuCallExecution::Started {
-        schema_version: "dragontales.teacher-gpu-call-execution.v1".to_owned(),
+        schema_version: "milk.teacher-gpu-call-execution.v1".to_owned(),
         scope: scope.clone(),
         teacher_job_id: hex_digest(teacher_job_id),
         claim_sha256: reference.claim_sha256.clone(),
@@ -12478,7 +12653,7 @@ fn teacher_gpu_call_not_started(
     recorded_at: DateTime<Utc>,
 ) -> Result<TeacherGpuCallExecution> {
     Ok(TeacherGpuCallExecution::NotStarted {
-        schema_version: "dragontales.teacher-gpu-call-execution.v1".to_owned(),
+        schema_version: "milk.teacher-gpu-call-execution.v1".to_owned(),
         scope: scope.clone(),
         teacher_job_id: hex_digest(teacher_job_id),
         claim_sha256: reference.claim_sha256.clone(),
@@ -12770,27 +12945,12 @@ fn valid_lowercase_hex(value: &str, length: usize) -> bool {
 }
 
 fn scope_prefix(scope: &Scope) -> String {
-    format!(
-        "dt/v3/{}/{}/{}/{}/{}",
-        scope.eval_id, scope.tenant_id, scope.project_id, scope.environment_id, scope.workload_id
-    )
+    format!("milk/v1/scopes/{}", scope.scope_id)
 }
 
 fn validate_scope(scope: &Scope) -> Result<()> {
-    if scope.tenant_id.is_nil()
-        || scope.project_id.is_nil()
-        || scope.environment_id.is_nil()
-        || scope.workload_id.is_nil()
-        || validate_eval_id(&scope.eval_id).is_err()
-    {
-        bail!("scope UUIDs and eval ID are invalid");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_eval_id(eval_id: &str) -> Result<()> {
-    if !valid_lowercase_hex(eval_id, 64) {
-        bail!("eval_id must be exactly 64 lowercase hexadecimal characters");
+    if scope.scope_id.is_nil() {
+        bail!("scope_id must be a non-nil UUID");
     }
     Ok(())
 }
@@ -12822,7 +12982,7 @@ fn trace_time(trace_id: Uuid) -> Result<DateTime<Utc>> {
 
 fn trace_key(scope: &Scope, trace_id: Uuid) -> Result<String> {
     Ok(format!(
-        "{}/traces/{}/{}.json.zst",
+        "{}/traffic/{}/{}.json.zst",
         scope_prefix(scope),
         trace_time(trace_id)?.format("%Y/%m/%d/%H"),
         trace_id,
@@ -12940,7 +13100,7 @@ fn encode_trace(capture: &TraceCapture, max_record_bytes: usize) -> Result<Encod
         &capture.response,
     )?;
     let value = TraceObject {
-        schema_version: "dragontales.trace.v3",
+        schema_version: TRACE_SCHEMA_VERSION,
         catalog: &capture.catalog,
         request: &request,
         response: &response,
@@ -12972,7 +13132,7 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 #[cfg(test)]
 fn snapshot_trace_rank(authorization_sha256: &[u8; 32], trace_id: Uuid) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"dragontales.snapshot-batch-sample.v1\0");
+    digest.update(b"milk.snapshot-batch-sample.v1\0");
     digest.update(authorization_sha256);
     digest.update(trace_id.as_bytes());
     digest.finalize().into()
@@ -12997,7 +13157,7 @@ fn validate_snapshot_analysis_authorization(
     scope: &Scope,
     authorization: &SnapshotAnalysisAuthorization,
 ) -> Result<()> {
-    if authorization.schema_version != "dragontales.teacher-policy.v2"
+    if authorization.schema_version != "milk.teacher-policy.v2"
         || !valid_analysis_identifier(&authorization.policy_id, 128)
         || authorization.scope != *scope
         || !bounded_nonempty(&authorization.capture_policy_version, 256)
@@ -13099,7 +13259,7 @@ fn new_teacher_gpu_slot(
     let expires_at = authorization_deadline.min(lease_deadline);
     ensure_teacher_runway(now, max_gpu_seconds, expires_at, "teacher GPU slot")?;
     Ok(TeacherGpuSlot {
-        schema_version: "dragontales.teacher-gpu-slot.v1".to_owned(),
+        schema_version: "milk.teacher-gpu-slot.v1".to_owned(),
         scope: scope.clone(),
         provider_binding_sha256: hex_digest(provider_binding_sha256),
         slot,
@@ -13170,7 +13330,7 @@ fn validate_snapshot_entry_trace(
     now: DateTime<Utc>,
 ) -> Result<()> {
     let expected_key = trace_key(scope, entry.trace_id)?;
-    if trace.schema_version != "dragontales.trace.v3"
+    if trace.schema_version != TRACE_SCHEMA_VERSION
         || trace.catalog.scope != *scope
         || trace.catalog.trace_id != entry.trace_id
         || trace.catalog.occurred_at != entry.occurred_at
@@ -13266,7 +13426,7 @@ fn hydrate_teacher_result(
     let [source] = sources else {
         bail!("teacher decision requires exactly one source trace");
     };
-    if decision.schema_version != "dragontales.teacher-decision.v1" {
+    if decision.schema_version != "milk.teacher-decision.v1" {
         bail!("teacher decision schema is invalid");
     }
     let output = match decision.output {
@@ -13287,7 +13447,7 @@ fn hydrate_teacher_result(
         TeacherDecisionOutput::Skip { reason } => TeacherOutput::Skip { reason },
     };
     let result = TeacherResult {
-        schema_version: "dragontales.teacher-result.v1".to_owned(),
+        schema_version: "milk.teacher-result.v1".to_owned(),
         entries: vec![TeacherResultEntry {
             trace_id: source.trace_id,
             trace_payload_sha256: source.trace_payload_sha256.clone(),
@@ -13302,7 +13462,7 @@ fn hydrate_teacher_result(
 }
 
 fn validate_teacher_result(result: &TeacherResult, sources: &[CompleteSnapshot]) -> Result<()> {
-    if result.schema_version != "dragontales.teacher-result.v1"
+    if result.schema_version != "milk.teacher-result.v1"
         || result.entries.len() != sources.len()
         || result.entries.is_empty()
         || result.entries.len() > MAX_SNAPSHOT_BATCH_ENTRIES
@@ -13488,7 +13648,7 @@ fn prepare_student_job_claim(
         .min()
         .context("student job has no teacher expiry")?;
     let definition = StudentJobDefinition {
-        schema_version: "dragontales.student-job-definition.v4".to_owned(),
+        schema_version: "milk.student-job-definition.v4".to_owned(),
         teacher_provider_binding_sha256: provider_binding,
         teacher_results: current.into_iter().map(|source| source.reference).collect(),
         input_sha256: hex_digest(&Sha256::digest(&input).into()),
@@ -13509,7 +13669,7 @@ fn prepare_student_job_claim(
     };
     let student_job_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
     let claim = StudentJobClaim {
-        schema_version: "dragontales.student-job-claim.v4".to_owned(),
+        schema_version: "milk.student-job-claim.v4".to_owned(),
         scope: scope.clone(),
         student_job_id: hex_digest(&student_job_id),
         definition,
@@ -13531,7 +13691,7 @@ fn student_input_bundle(
             || !valid_lowercase_sha256(&source.reference.teacher_job_id)
             || !valid_lowercase_sha256(&source.reference.object_sha256)
             || source.reference.bytes == 0
-            || source.result.schema_version != "dragontales.teacher-result.v1"
+            || source.result.schema_version != "milk.teacher-result.v1"
             || source.result.entries.is_empty()
             || source.result.entries.len() > MAX_SNAPSHOT_BATCH_ENTRIES
         {
@@ -13595,7 +13755,7 @@ fn student_input_bundle(
         bail!("student deterministic selection exceeds a fixed adapter input limit");
     }
     Ok(StudentInputBundle {
-        schema_version: "dragontales.student-input.v1".to_owned(),
+        schema_version: "milk.student-input.v1".to_owned(),
         scope: scope.clone(),
         teacher_provider_binding_sha256: provider_binding_sha256.to_owned(),
         train,
@@ -13709,8 +13869,8 @@ fn validate_student_job_claim(
         .teacher_results
         .windows(2)
         .all(|pair| pair[0].teacher_job_id < pair[1].teacher_job_id);
-    let valid_version = claim.schema_version == "dragontales.student-job-claim.v4"
-        && claim.definition.schema_version == "dragontales.student-job-definition.v4"
+    let valid_version = claim.schema_version == "milk.student-job-claim.v4"
+        && claim.definition.schema_version == "milk.student-job-definition.v4"
         && claim.definition.max_train_gpu_seconds == STUDENT_MAX_TRAIN_GPU_SECONDS
         && claim.definition.max_branch_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
         && claim.definition.max_total_gpu_seconds == STUDENT_MAX_TOTAL_GPU_SECONDS;
@@ -13781,7 +13941,7 @@ fn validate_student_job_index(
     let claim_payload = serde_json::to_vec(&index.claim)?;
     validate_student_job_claim(scope, &student_job_id, &index.claim, &claim_payload)?;
     if serde_json::to_vec(index)? != payload
-        || index.schema_version != "dragontales.student-job-index.v1"
+        || index.schema_version != "milk.student-job-index.v1"
         || index.scope != *scope
         || index.student_job_id != index.claim.student_job_id
         || index.source_expires_at < index.claim.definition.expires_at
@@ -13816,7 +13976,7 @@ fn student_branch_definition(
     train_result_sha256: String,
 ) -> Result<StudentBranchDefinition> {
     Ok(StudentBranchDefinition {
-        schema_version: "dragontales.student-branch-definition.v2".to_owned(),
+        schema_version: "milk.student-branch-definition.v2".to_owned(),
         student_job_id: claim.student_job_id.clone(),
         variant,
         train_result_sha256,
@@ -13860,7 +14020,7 @@ fn prepare_student_fanout_claim(
             let definition =
                 student_branch_definition(parent, variant, train_result_sha256.clone())?;
             Ok(StudentBranchClaim {
-                schema_version: "dragontales.student-branch-claim.v2".to_owned(),
+                schema_version: "milk.student-branch-claim.v2".to_owned(),
                 branch_id: hex_digest(&Sha256::digest(serde_json::to_vec(&definition)?).into()),
                 variant,
                 max_gpu_seconds: definition.max_gpu_seconds,
@@ -13868,7 +14028,7 @@ fn prepare_student_fanout_claim(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(StudentFanoutClaim {
-        schema_version: "dragontales.student-fanout-claim.v4".to_owned(),
+        schema_version: "milk.student-fanout-claim.v4".to_owned(),
         scope: parent.scope.clone(),
         student_job_id: parent.student_job_id.clone(),
         train_result_sha256,
@@ -13922,7 +14082,7 @@ fn student_fanout_launch_write(
     key: String,
 ) -> StudentFanoutLaunchWrite {
     StudentFanoutLaunchWrite {
-        schema_version: "dragontales.student-fanout-launch.v3",
+        schema_version: "milk.student-fanout-launch.v3",
         student_job_id: claim.student_job_id.clone(),
         fanout_claim_object_key: key,
         fanout_claim_sha256: hex_digest(&Sha256::digest(payload).into()),
@@ -13963,7 +14123,7 @@ fn prepare_student_winner_deployment_claim(
     let student_result_sha256 =
         hex_digest(&Sha256::digest(canonical_json_line(&winner.result)?).into());
     Ok(StudentWinnerDeploymentClaim {
-        schema_version: "dragontales.student-winner-deployment-claim.v2".to_owned(),
+        schema_version: "milk.student-winner-deployment-claim.v2".to_owned(),
         scope: scope.clone(),
         student_job_id: winner.claim.student_job_id.clone(),
         student_claim_sha256,
@@ -14013,7 +14173,7 @@ fn validate_student_winner_deployment_claim_record(
     validate_student_artifact_ref(scope, student_job_id, &claim.model_manifest)?;
     validate_student_artifact_ref(scope, student_job_id, &claim.dev_receipt)?;
     if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "dragontales.student-winner-deployment-claim.v2"
+        || claim.schema_version != "milk.student-winner-deployment-claim.v2"
         || claim.scope != *scope
         || claim.student_job_id != hex_digest(student_job_id)
         || !valid_lowercase_sha256(&claim.student_claim_sha256)
@@ -14199,7 +14359,7 @@ fn validate_student_winner_deployment_result(
         StudentVariant::DynamicFp8 => WinnerVariant::DynamicFp8,
         StudentVariant::StaticFp8 => WinnerVariant::StaticFp8,
     };
-    if result.schema_version != "dragontales.student-winner-deployment-result.v1"
+    if result.schema_version != "milk.student-winner-deployment-result.v1"
         || result.scope != *scope
         || result.student_job_id != hex_digest(student_job_id)
         || result.student_job_id != claim.student_job_id
@@ -14253,7 +14413,7 @@ fn validate_provider_teardown_authorization(
     authorization: &ProviderTeardownAuthorization,
 ) -> Result<()> {
     let selected_provider = result.provider_acceptance.selection.selected_provider();
-    if authorization.schema_version != "dragontales.provider-teardown-authorization.v1"
+    if authorization.schema_version != "milk.provider-teardown-authorization.v1"
         || authorization.scope != *scope
         || authorization.student_job_id != hex_digest(student_job_id)
         || authorization.student_job_id != result.student_job_id
@@ -14332,7 +14492,7 @@ fn validate_provider_route_receipt(
         .strip_prefix(&signature_prefix)
         .and_then(|value| value.strip_suffix(".ed25519"))
         .context("provider teardown route signature key is invalid")?;
-    if receipt.schema_version != "dragontales.route-publication-receipt.v2"
+    if receipt.schema_version != "milk.route-publication-receipt.v2"
         || receipt.state != "active"
         || receipt.student_job_id != claim.student_job_id
         || receipt.student_result_sha256 != claim.student_result_sha256
@@ -14403,7 +14563,7 @@ fn validate_provider_teardown_result(
     ]
     .into_iter()
     .collect::<HashSet<_>>();
-    if result.schema_version != "dragontales.provider-teardown-result.v1"
+    if result.schema_version != "milk.provider-teardown-result.v1"
         || result.scope != *scope
         || result.student_job_id != hex_digest(student_job_id)
         || result.student_job_id != authorization.student_job_id
@@ -14431,7 +14591,7 @@ fn student_winner_deployment_launch_write(
     key: String,
 ) -> StudentWinnerDeploymentLaunchWrite {
     StudentWinnerDeploymentLaunchWrite {
-        schema_version: "dragontales.student-winner-deployment-launch.v2",
+        schema_version: "milk.student-winner-deployment-launch.v2",
         student_job_id: claim.student_job_id.clone(),
         student_result_sha256: claim.student_result_sha256.clone(),
         winner: claim.winner,
@@ -14453,7 +14613,7 @@ fn student_winner_deployment_result_write(
     result_object_key: String,
 ) -> StudentWinnerDeploymentResultWrite {
     StudentWinnerDeploymentResultWrite {
-        schema_version: "dragontales.student-winner-deployment-result-receipt.v1",
+        schema_version: "milk.student-winner-deployment-result-receipt.v1",
         student_job_id,
         result_object_key,
         state: "admitted",
@@ -14465,7 +14625,7 @@ fn provider_teardown_result_write(
     result_object_key: String,
 ) -> ProviderTeardownResultWrite {
     ProviderTeardownResultWrite {
-        schema_version: "dragontales.provider-teardown-result-receipt.v1",
+        schema_version: "milk.provider-teardown-result-receipt.v1",
         student_job_id,
         result_object_key,
         state: "zero",
@@ -14477,7 +14637,7 @@ fn student_stage_result_write(
     result_object_key: String,
 ) -> StudentStageResultWrite {
     StudentStageResultWrite {
-        schema_version: "dragontales.student-stage-result-receipt.v1",
+        schema_version: "milk.student-stage-result-receipt.v1",
         student_job_id,
         result_object_key,
         state: "ready",
@@ -14497,7 +14657,7 @@ fn validate_student_train_result(
 ) -> Result<()> {
     let max_train_gpu_seconds = claim.definition.max_train_gpu_seconds;
     let wall_seconds = student_stage_wall_seconds(result.started_at, result.finished_at);
-    if result.schema_version != "dragontales.student-train-result.v1"
+    if result.schema_version != "milk.student-train-result.v1"
         || result.scope != *scope
         || result.student_job_id != hex_digest(student_job_id)
         || result.claim_sha256 != hex_digest(&Sha256::digest(claim_payload).into())
@@ -14557,7 +14717,7 @@ fn validate_student_branch_result(
 ) -> Result<()> {
     let branch = fanout_branch(fanout, result.variant)?;
     let wall_seconds = student_stage_wall_seconds(result.started_at, result.finished_at);
-    if result.schema_version != "dragontales.student-branch-result.v1"
+    if result.schema_version != "milk.student-branch-result.v1"
         || result.scope != *scope
         || result.student_job_id != hex_digest(student_job_id)
         || result.branch_id != branch.branch_id
@@ -14636,7 +14796,7 @@ fn validate_student_upload_inventory(
     upload: &StudentUpload,
     inputs: &mut [StudentArtifactInput],
 ) -> Result<()> {
-    if upload.schema_version != "dragontales.student-upload.v1"
+    if upload.schema_version != "milk.student-upload.v1"
         || upload.student_job_id != hex_digest(student_job_id)
         || upload.files.len() > MAX_STUDENT_ARTIFACT_FILES
         || upload.files.len() != inputs.len()
@@ -14840,7 +15000,7 @@ fn validate_student_adapter_manifest(
     adapter: &StudentAdapterManifest,
     closure: &mut HashSet<String>,
 ) -> Result<()> {
-    if adapter.schema_version != "dragontales.student-adapter-manifest.v1"
+    if adapter.schema_version != "milk.student-adapter-manifest.v1"
         || adapter.student_job_id != hex_digest(student_job_id)
         || adapter.files.len() != 2
         || adapter.files[0].relative_path != "adapter_config.json"
@@ -14859,7 +15019,7 @@ fn validate_complete_student_model_manifest(
     manifest: &StudentModelManifest,
     closure: &mut HashSet<String>,
 ) -> Result<()> {
-    if manifest.schema_version != "dragontales.student-model-manifest.v1"
+    if manifest.schema_version != "milk.student-model-manifest.v1"
         || manifest.student_job_id != hex_digest(student_job_id)
         || manifest.variant != variant
         || !manifest.retained
@@ -14952,7 +15112,7 @@ fn student_inventory_sha256(files: &[StudentManifestFile]) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let mut digest = Sha256::new();
-    digest.update(b"dragontales.student-model-inventory.v1\0");
+    digest.update(b"milk.student-model-inventory.v1\0");
     digest.update(serde_json::to_vec(&inventory)?);
     Ok(hex_digest(&digest.finalize().into()))
 }
@@ -14964,7 +15124,7 @@ fn validate_student_stage_gpu_evidence(
     expected_variant: Option<StudentVariant>,
     require_candidate_kernel: bool,
 ) -> Result<()> {
-    if evidence.schema_version != "dragontales.student-gpu-evidence.v2"
+    if evidence.schema_version != "milk.student-gpu-evidence.v2"
         || evidence.student_job_id != student_job_id
         || evidence.recipe_sha256 != recipe_sha256
         || evidence.device.compute_capability != [9, 0]
@@ -14993,7 +15153,7 @@ fn validate_student_stage_gpu_evidence(
             },
             None,
         ) => {
-            schema_version == "dragontales.student-train-image-probe.v1"
+            schema_version == "milk.student-train-image-probe.v1"
                 && platform == "linux/amd64"
                 && prime_rl_version == STUDENT_PRIME_RL_VERSION
                 && accelerate_version == STUDENT_ACCELERATE_VERSION
@@ -15014,7 +15174,7 @@ fn validate_student_stage_gpu_evidence(
             },
             Some(_),
         ) => {
-            schema_version == "dragontales.h100-fp8-image-probe.v2"
+            schema_version == "milk.h100-fp8-image-probe.v2"
                 && platform == "linux/amd64"
                 && vllm_version == STUDENT_VLLM_VERSION
                 && vllm_metadata_sha256 == STUDENT_VLLM_METADATA_SHA256
@@ -15048,7 +15208,7 @@ fn validate_student_stage_gpu_evidence(
         };
         if expected_variant.is_some_and(|variant| kernel.variant != variant)
             || !seen.insert(kernel.variant)
-            || kernel.model_verification.schema_version != "dragontales.h100-model-verification.v2"
+            || kernel.model_verification.schema_version != "milk.h100-model-verification.v2"
             || kernel.model_verification.model_type != "qwen3"
             || kernel.model_verification.variant != expected_model_variant
             || kernel.model_verification.shards == 0
@@ -15109,7 +15269,7 @@ fn validate_student_dev_receipt_fields(
     summary: &StudentDevSummary,
     receipt: &StudentDevReceipt,
 ) -> Result<()> {
-    if receipt.schema_version != "dragontales.student-dev-receipt.v1"
+    if receipt.schema_version != "milk.student-dev-receipt.v1"
         || receipt.student_job_id != student_job_id
         || receipt.variant != variant
         || receipt.dev_set_sha256 != dev_set_sha256
@@ -15294,7 +15454,7 @@ fn join_student_results(
     } = &train.outcome
     else {
         return Ok(StoredStudentResult {
-            schema_version: "dragontales.student-result.v2".to_owned(),
+            schema_version: "milk.student-result.v2".to_owned(),
             scope: parent.scope.clone(),
             student_job_id: parent.student_job_id.clone(),
             claim_sha256,
@@ -15350,7 +15510,7 @@ fn join_student_results(
         .any(|branch| matches!(branch.outcome, StudentBranchOutcome::Failed { .. }))
     {
         return Ok(StoredStudentResult {
-            schema_version: "dragontales.student-result.v2".to_owned(),
+            schema_version: "milk.student-result.v2".to_owned(),
             scope: parent.scope.clone(),
             student_job_id: parent.student_job_id.clone(),
             claim_sha256,
@@ -15432,7 +15592,7 @@ fn join_student_results(
             )
             .collect();
         return Ok(StoredStudentResult {
-            schema_version: "dragontales.student-result.v2".to_owned(),
+            schema_version: "milk.student-result.v2".to_owned(),
             scope: parent.scope.clone(),
             student_job_id: parent.student_job_id.clone(),
             claim_sha256,
@@ -15454,7 +15614,7 @@ fn join_student_results(
         .map(|(_, evidence, ..)| (*evidence).clone())
         .context("student winner branch has no GPU evidence")?;
     Ok(StoredStudentResult {
-        schema_version: "dragontales.student-result.v2".to_owned(),
+        schema_version: "milk.student-result.v2".to_owned(),
         scope: parent.scope.clone(),
         student_job_id: parent.student_job_id.clone(),
         claim_sha256,
@@ -15494,7 +15654,7 @@ fn student_claim_write(
     let student_job_id = decode_hex_digest(&claim.student_job_id)
         .expect("validated student claim contains a SHA-256 job ID");
     StudentJobClaimWrite {
-        schema_version: "dragontales.student-job-claim-receipt.v3",
+        schema_version: "milk.student-job-claim-receipt.v3",
         student_job_id: claim.student_job_id.clone(),
         claim_object_key: student_job_claim_key(&claim.scope, &student_job_id),
         claim_sha256: hex_digest(&Sha256::digest(payload).into()),
@@ -15530,10 +15690,10 @@ fn validate_stored_teacher_result_metadata(
     teacher_job_id: &[u8; 32],
     artifact: &StoredTeacherResult,
 ) -> Result<()> {
-    if artifact.schema_version != "dragontales.teacher-result-artifact.v1"
+    if artifact.schema_version != "milk.teacher-result-artifact.v1"
         || artifact.scope != *scope
         || artifact.teacher_job_id != hex_digest(teacher_job_id)
-        || artifact.definition.schema_version != "dragontales.teacher-job-definition.v2"
+        || artifact.definition.schema_version != "milk.teacher-job-definition.v2"
         || Sha256::digest(serde_json::to_vec(&artifact.definition)?).as_slice() != teacher_job_id
         || !valid_lowercase_sha256(&artifact.definition.snapshot_batch_id)
         || !valid_lowercase_sha256(&artifact.definition.provider_binding_sha256)
@@ -15686,7 +15846,7 @@ fn route_publication_write(
     publication: &RoutePublication,
 ) -> RoutePublicationWrite {
     RoutePublicationWrite {
-        schema_version: "dragontales.route-publication-receipt.v2".to_owned(),
+        schema_version: "milk.route-publication-receipt.v2".to_owned(),
         route_revision: commit.route_revision.clone(),
         student_job_id: hex_digest(&publication.student_job_id),
         student_result_sha256: hex_digest(&publication.student_result_sha256),
@@ -15696,7 +15856,7 @@ fn route_publication_write(
         candidate_basis_points: publication.candidate_basis_points,
         manifest_object_key: commit.manifest_object_key.clone(),
         signature_object_key: commit.signature_object_key.clone(),
-        live_pointer_object_key: format!("{}/routes/live.json", scope_prefix(&commit.scope)),
+        live_pointer_object_key: route_live_key(&commit.scope),
         state: "active".to_owned(),
     }
 }
@@ -16293,7 +16453,7 @@ fn new_gpu_launch_intent(
 ) -> Result<GpuLaunchIntentRecord> {
     let (_, outbox_object, outbox) = canonical_gpu_launch_intent_parts(scope, &claim)?;
     let record = GpuLaunchIntentRecord {
-        schema_version: "dragontales.gpu-launch-intent.v1".to_owned(),
+        schema_version: "milk.gpu-launch-intent.v1".to_owned(),
         scope: scope.clone(),
         dispatch_id: outbox.dispatch_id.clone(),
         claim,
@@ -16330,7 +16490,7 @@ fn validate_gpu_launch_intent(
             .is_some_and(|terminalized_at| terminalized_at >= record.created_at),
     };
     if serde_json::to_vec(record)? != payload
-        || record.schema_version != "dragontales.gpu-launch-intent.v1"
+        || record.schema_version != "milk.gpu-launch-intent.v1"
         || record.scope != *scope
         || record.dispatch_id != expected_outbox.dispatch_id
         || record.outbox != expected_outbox
@@ -16357,7 +16517,7 @@ fn new_tick_lease(scope: &Scope, owner_id: Uuid, now: DateTime<Utc>) -> Result<T
         ))
         .context("tick lease expiry is out of range")?;
     let lease = TickLeaseRecord {
-        schema_version: "dragontales.tick-lease.v1".to_owned(),
+        schema_version: "milk.tick-lease.v1".to_owned(),
         scope: scope.clone(),
         owner_id,
         acquired_at: now,
@@ -16389,7 +16549,7 @@ fn validate_tick_lease(
         }),
     };
     if serde_json::to_vec(lease)? != payload
-        || lease.schema_version != "dragontales.tick-lease.v1"
+        || lease.schema_version != "milk.tick-lease.v1"
         || lease.scope != *scope
         || validate_scope(scope).is_err()
         || lease.owner_id.is_nil()
@@ -16433,7 +16593,7 @@ fn teacher_gpu_launch_outbox(
     Ok((
         teacher_gpu_run_launch_outbox_key(scope, &teacher_run_id),
         GpuLaunchOutbox {
-            schema_version: "dragontales.gpu-launch-outbox.v1".to_owned(),
+            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
             scope: scope.clone(),
             dispatch_id: claim_sha256.clone(),
             claim_object_key: teacher_gpu_run_claim_key(scope, &teacher_run_id),
@@ -16463,7 +16623,7 @@ fn student_train_gpu_launch_outbox(
     Ok((
         student_job_launch_outbox_key(scope, &student_job_id),
         GpuLaunchOutbox {
-            schema_version: "dragontales.gpu-launch-outbox.v1".to_owned(),
+            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
             scope: scope.clone(),
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_job_claim_key(scope, &student_job_id),
@@ -16496,7 +16656,7 @@ fn student_fanout_gpu_launch_outbox(
     Ok((
         student_fanout_launch_outbox_key(scope, student_job_id),
         GpuLaunchOutbox {
-            schema_version: "dragontales.gpu-launch-outbox.v1".to_owned(),
+            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
             scope: scope.clone(),
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_fanout_claim_key(scope, student_job_id),
@@ -16524,7 +16684,7 @@ fn student_winner_deployment_gpu_launch_outbox(
     Ok((
         student_winner_deployment_launch_outbox_key(scope, &student_job_id),
         GpuLaunchOutbox {
-            schema_version: "dragontales.gpu-launch-outbox.v1".to_owned(),
+            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
             scope: scope.clone(),
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_winner_deployment_claim_key(scope, &student_job_id),
@@ -16586,7 +16746,7 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
                     .iter()
                     .zip(student_variants())
                     .all(|(branch, variant)| {
-                        branch.schema_version == "dragontales.student-branch-claim.v2"
+                        branch.schema_version == "milk.student-branch-claim.v2"
                             && branch.variant == variant
                             && branch.max_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
                             && valid_lowercase_sha256(&branch.branch_id)
@@ -16618,7 +16778,7 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
                 && key == student_winner_deployment_launch_outbox_key(scope, &student_job_id)
         }
     };
-    if outbox.schema_version != "dragontales.gpu-launch-outbox.v1"
+    if outbox.schema_version != "milk.gpu-launch-outbox.v1"
         || outbox.scope != *scope
         || dispatch_id != claim_sha256
         || validate_runtime_image_reference(&outbox.runtime_image_reference).is_err()
@@ -16639,7 +16799,7 @@ fn validate_gpu_launch_frontier(
     outbox: &GpuLaunchOutbox,
 ) -> Result<()> {
     let dispatch_id = decode_hex_digest(&frontier.dispatch_id)?;
-    if frontier.schema_version != "dragontales.gpu-launch-frontier.v1"
+    if frontier.schema_version != "milk.gpu-launch-frontier.v1"
         || frontier.scope != *scope
         || frontier.dispatch_id != outbox.dispatch_id
         || frontier.outbox_object_key != outbox_key
@@ -16680,7 +16840,7 @@ fn student_artifact_key(
 
 fn route_manifest_key(scope: &Scope, revision: &[u8; 32]) -> String {
     format!(
-        "{}/routes/manifests/{}.json",
+        "{}/routes/versions/{}.json",
         scope_prefix(scope),
         hex_digest(revision)
     )
@@ -16720,22 +16880,18 @@ fn route_student_retirement_key(scope: &Scope, student_job_id: &[u8; 32]) -> Str
 }
 
 fn route_live_key(scope: &Scope) -> String {
-    format!("{}/routes/live.json", scope_prefix(scope))
+    format!("{}/routes/current.json", scope_prefix(scope))
 }
 
 fn route_scope(scope: &Scope) -> RouteScope {
     RouteScope {
-        tenant_id: scope.tenant_id,
-        project_id: scope.project_id,
-        environment_id: scope.environment_id,
-        workload_id: scope.workload_id,
-        eval_id: scope.eval_id.clone(),
+        scope_id: scope.scope_id,
     }
 }
 
 fn teacher_result_write(artifact: &StoredTeacherResult) -> TeacherResultWrite {
     TeacherResultWrite {
-        schema_version: "dragontales.teacher-result-receipt.v1",
+        schema_version: "milk.teacher-result-receipt.v1",
         teacher_job_id: artifact.teacher_job_id.clone(),
         snapshot_batch_id: artifact.definition.snapshot_batch_id.clone(),
         provider_binding_sha256: artifact.definition.provider_binding_sha256.clone(),
@@ -16771,7 +16927,7 @@ fn teacher_gpu_run_result_write(result: &TeacherGpuRunResult) -> Result<TeacherG
         bail!("teacher GPU run terminal counts are inconsistent");
     }
     Ok(TeacherGpuRunResultWrite {
-        schema_version: "dragontales.teacher-gpu-run-result-receipt.v1",
+        schema_version: "milk.teacher-gpu-run-result-receipt.v1",
         teacher_run_id: result.teacher_run_id.clone(),
         claim_sha256: result.claim_sha256.clone(),
         execution_start_sha256: result.execution_start_sha256.clone(),
@@ -17005,11 +17161,7 @@ mod tests {
 
     fn qualification_scope() -> Scope {
         Scope {
-            tenant_id: Uuid::from_u128(1),
-            project_id: Uuid::from_u128(2),
-            environment_id: Uuid::from_u128(3),
-            workload_id: Uuid::from_u128(4),
-            eval_id: "11".repeat(32),
+            scope_id: Uuid::from_u128(1),
         }
     }
 
@@ -17018,10 +17170,28 @@ mod tests {
     }
 
     #[test]
+    fn route_keys_match_the_scope_first_version_contract() {
+        let scope = qualification_scope();
+        let revision = [0xab; 32];
+        assert_eq!(
+            route_manifest_key(&scope, &revision),
+            format!(
+                "{}/routes/versions/{}.json",
+                scope_prefix(&scope),
+                "ab".repeat(32)
+            )
+        );
+        assert_eq!(
+            route_live_key(&scope),
+            format!("{}/routes/current.json", scope_prefix(&scope))
+        );
+    }
+
+    #[test]
     fn store_partition_classification_is_exact_and_scoped() {
         for suffix in [
             "stats/2026/08/27/x.json",
-            "traces/2026/08/27/x.json.zst",
+            "traffic/2026/08/27/x.json.zst",
             "outcomes/x/1/claim.json.zst",
             "tombstones/traces/x.json",
             "expiry-index/x.json",
@@ -17033,7 +17203,7 @@ mod tests {
             );
         }
         assert_eq!(
-            classify_store_path(&partition_test_key("routes/live.json")).unwrap(),
+            classify_store_path(&partition_test_key("routes/current.json")).unwrap(),
             StorePartition::Routes
         );
         for suffix in [
@@ -17053,10 +17223,10 @@ mod tests {
             );
         }
         for invalid in [
-            "dt/v3/_r2_probe/probe",
-            "dt/v3/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/not-a-uuid/2/3/4/stats/x",
-            "dt/v3/not-a-digest/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003/00000000-0000-0000-0000-000000000004/stats/x",
-            "dt/v3/00000000-0000-0000-0000-000000000001/stats/x",
+            "milk/v1/_s3_probe/probe",
+            "milk/v1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/not-a-uuid/2/3/4/stats/x",
+            "milk/v1/not-a-digest/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003/00000000-0000-0000-0000-000000000004/stats/x",
+            "milk/v1/00000000-0000-0000-0000-000000000001/stats/x",
             "stats/x",
         ] {
             assert!(classify_store_path(&ObjectPath::from(invalid)).is_err());
@@ -17068,9 +17238,9 @@ mod tests {
         let capture = Arc::new(InMemory::new());
         let control = Arc::new(InMemory::new());
         let routes = Arc::new(InMemory::new());
-        let capture_key = partition_test_key("traces/2026/08/27/capture.json");
+        let capture_key = partition_test_key("traffic/2026/08/27/capture.json");
         let control_key = partition_test_key("students/private.json");
-        let route_key = partition_test_key("routes/live.json");
+        let route_key = partition_test_key("routes/current.json");
         control
             .put(&control_key, PutPayload::from_static(b"control"))
             .await
@@ -17194,7 +17364,7 @@ mod tests {
     ) -> (TeacherGpuRunClaim, Vec<u8>) {
         let digest = |label: u8| hex_digest(&Sha256::digest([nonce, label]).into());
         let definition = TeacherGpuRunDefinition {
-            schema_version: "dragontales.teacher-gpu-run-definition.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-definition.v1".to_owned(),
             provider_binding_sha256: digest(1),
             slot: nonce % TEACHER_MAX_PARALLEL_RUNS,
             run_nonce: Uuid::from_u128(u128::from(nonce) + 1),
@@ -17211,7 +17381,7 @@ mod tests {
         let teacher_run_id: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&definition).unwrap()).into();
         let claim = TeacherGpuRunClaim {
-            schema_version: "dragontales.teacher-gpu-run-claim.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-claim.v1".to_owned(),
             scope: scope.clone(),
             teacher_run_id: hex_digest(&teacher_run_id),
             definition,
@@ -17228,7 +17398,7 @@ mod tests {
         expires_at: DateTime<Utc>,
     ) -> (StudentJobClaim, Vec<u8>) {
         let definition = StudentJobDefinition {
-            schema_version: "dragontales.student-job-definition.v4".to_owned(),
+            schema_version: "milk.student-job-definition.v4".to_owned(),
             teacher_provider_binding_sha256: hex_digest(&[1; 32]),
             teacher_results: vec![StudentTeacherResultRef {
                 teacher_job_id: hex_digest(&[2; 32]),
@@ -17260,7 +17430,7 @@ mod tests {
         let student_job_id: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&definition).unwrap()).into();
         let claim = StudentJobClaim {
-            schema_version: "dragontales.student-job-claim.v4".to_owned(),
+            schema_version: "milk.student-job-claim.v4".to_owned(),
             scope: scope.clone(),
             student_job_id: hex_digest(&student_job_id),
             definition,
@@ -17297,7 +17467,7 @@ mod tests {
                 .unwrap();
         }
         let train = StudentTrainResult {
-            schema_version: "dragontales.student-train-result.v1".to_owned(),
+            schema_version: "milk.student-train-result.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: parent.student_job_id.clone(),
             claim_sha256: hex_digest(&Sha256::digest(&parent_payload).into()),
@@ -17432,7 +17602,7 @@ mod tests {
             })
             .collect();
         let result = TeacherResult {
-            schema_version: "dragontales.teacher-result.v1".to_owned(),
+            schema_version: "milk.teacher-result.v1".to_owned(),
             entries,
         };
         let result_bytes = serde_json::to_vec(&result).unwrap();
@@ -17508,7 +17678,7 @@ mod tests {
             max_cost_microusd: 2,
         };
         let definition = TeacherJobDefinition {
-            schema_version: "dragontales.teacher-job-definition.v2".to_owned(),
+            schema_version: "milk.teacher-job-definition.v2".to_owned(),
             snapshot_batch_id: hex_digest(&Sha256::digest(format!("batch-{label}")).into()),
             provider_binding_sha256: provider_binding.clone(),
             execution: SnapshotAnalyzerExecutionIdentity::GpuJob {
@@ -17527,7 +17697,7 @@ mod tests {
         let result_sha256 =
             hex_digest(&Sha256::digest(serde_json::to_vec(&result).unwrap()).into());
         let artifact = StoredTeacherResult {
-            schema_version: "dragontales.teacher-result-artifact.v1".to_owned(),
+            schema_version: "milk.teacher-result-artifact.v1".to_owned(),
             scope: scope.clone(),
             teacher_job_id: hex_digest(&teacher_job_id),
             definition,
@@ -17579,7 +17749,7 @@ mod tests {
             StudentVariant::StaticFp8 => StudentModelVerificationVariant::Static,
         };
         StudentGpuEvidence {
-            schema_version: "dragontales.student-gpu-evidence.v2".to_owned(),
+            schema_version: "milk.student-gpu-evidence.v2".to_owned(),
             student_job_id: student_job_id.to_owned(),
             mode: StudentGpuMode::H100,
             recipe_sha256: recipe_sha256.to_owned(),
@@ -17591,7 +17761,7 @@ mod tests {
                 total_memory_bytes: 80 * 1_024 * 1_024 * 1_024,
             },
             runtime: StudentRuntimeProbe::Branch {
-                schema_version: "dragontales.h100-fp8-image-probe.v2".to_owned(),
+                schema_version: "milk.h100-fp8-image-probe.v2".to_owned(),
                 platform: "linux/amd64".to_owned(),
                 vllm_version: STUDENT_VLLM_VERSION.to_owned(),
                 vllm_metadata_sha256: STUDENT_VLLM_METADATA_SHA256.to_owned(),
@@ -17603,7 +17773,7 @@ mod tests {
             kernels: vec![StudentKernelEvidence {
                 variant,
                 model_verification: StudentModelVerification {
-                    schema_version: "dragontales.h100-model-verification.v2".to_owned(),
+                    schema_version: "milk.h100-model-verification.v2".to_owned(),
                     model_type: "qwen3".to_owned(),
                     variant: model_variant,
                     shards: 1,
@@ -17621,7 +17791,7 @@ mod tests {
         let student_job_id = hex_digest(&[0x31; 32]);
         let recipe_sha256 = hex_digest(&[0x32; 32]);
         let train = StudentGpuEvidence {
-            schema_version: "dragontales.student-gpu-evidence.v2".to_owned(),
+            schema_version: "milk.student-gpu-evidence.v2".to_owned(),
             student_job_id: student_job_id.clone(),
             mode: StudentGpuMode::H100,
             recipe_sha256: recipe_sha256.clone(),
@@ -17633,7 +17803,7 @@ mod tests {
                 total_memory_bytes: 80 * 1_024 * 1_024 * 1_024,
             },
             runtime: StudentRuntimeProbe::Train {
-                schema_version: "dragontales.student-train-image-probe.v1".to_owned(),
+                schema_version: "milk.student-train-image-probe.v1".to_owned(),
                 platform: "linux/amd64".to_owned(),
                 prime_rl_version: STUDENT_PRIME_RL_VERSION.to_owned(),
                 accelerate_version: STUDENT_ACCELERATE_VERSION.to_owned(),
@@ -17768,7 +17938,7 @@ mod tests {
             .await
             .unwrap();
         let index = StudentJobIndex {
-            schema_version: "dragontales.student-job-index.v1".to_owned(),
+            schema_version: "milk.student-job-index.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: claim.student_job_id.clone(),
             source_expires_at: expires_at,
@@ -17803,7 +17973,7 @@ mod tests {
         )
         .await;
         let train = StudentTrainResult {
-            schema_version: "dragontales.student-train-result.v1".to_owned(),
+            schema_version: "milk.student-train-result.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: claim.student_job_id.clone(),
             claim_sha256: hex_digest(&Sha256::digest(&claim_payload).into()),
@@ -17867,7 +18037,7 @@ mod tests {
                     .await
                     .unwrap();
                 let manifest = StudentModelManifest {
-                    schema_version: "dragontales.student-model-manifest.v1".to_owned(),
+                    schema_version: "milk.student-model-manifest.v1".to_owned(),
                     student_job_id: claim.student_job_id.clone(),
                     variant,
                     retained: true,
@@ -17894,7 +18064,7 @@ mod tests {
                 .await
             };
             let receipt = StudentDevReceipt {
-                schema_version: "dragontales.student-dev-receipt.v1".to_owned(),
+                schema_version: "milk.student-dev-receipt.v1".to_owned(),
                 student_job_id: claim.student_job_id.clone(),
                 variant,
                 dev_set_sha256: dev_set_sha256.clone(),
@@ -17940,7 +18110,7 @@ mod tests {
             .await;
             let branch = fanout_branch(&fanout, variant).unwrap();
             let result = StudentBranchResult {
-                schema_version: "dragontales.student-branch-result.v1".to_owned(),
+                schema_version: "milk.student-branch-result.v1".to_owned(),
                 scope: scope.clone(),
                 student_job_id: claim.student_job_id.clone(),
                 branch_id: branch.branch_id.clone(),
@@ -17981,7 +18151,7 @@ mod tests {
 
     fn winner_test_authority(now: DateTime<Utc>) -> WinnerDeploymentAuthority {
         WinnerDeploymentAuthority {
-            schema_version: "dragontales.winner-deployment-authority.v3".to_owned(),
+            schema_version: "milk.winner-deployment-authority.v3".to_owned(),
             provider_policy: WinnerProviderPolicy {
                 only: crate::route::WINNER_PROVIDER.to_owned(),
             },
@@ -18062,7 +18232,7 @@ mod tests {
         .unwrap();
         let launch_started_at = claim.claimed_at + TimeDelta::seconds(1);
         StudentWinnerDeploymentResult {
-            schema_version: "dragontales.student-winner-deployment-result.v1".to_owned(),
+            schema_version: "milk.student-winner-deployment-result.v1".to_owned(),
             scope: claim.scope.clone(),
             student_job_id: claim.student_job_id.clone(),
             claim_sha256: hex_digest(&Sha256::digest(claim_payload).into()),
@@ -18088,8 +18258,8 @@ mod tests {
                 admission_program_sha256: claim.authority.admission_program_sha256.clone(),
                 execution_id: "winner-execution-1".to_owned(),
                 execution_name: "winner-deployment".to_owned(),
-                chat_completions_url:
-                    "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/chat/completions"
+                api_base_url:
+                    "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/"
                         .to_owned(),
                 models_response_sha256: hex_digest(&Sha256::digest(b"models").into()),
                 chat_request_sha256: hex_digest(&Sha256::digest(b"chat-request").into()),
@@ -18129,7 +18299,7 @@ mod tests {
         store.put_create_same(&manifest_object).await.unwrap();
         store.put_create_same(&signature_object).await.unwrap();
         let commit = RoutePublicationCommit {
-            schema_version: "dragontales.route-publication-commit.v2".to_owned(),
+            schema_version: "milk.route-publication-commit.v2".to_owned(),
             scope: scope.clone(),
             route_revision: hex_digest(&revision),
             previous_route_revision: previous.map(|receipt| receipt.route_revision.clone()),
@@ -18146,7 +18316,7 @@ mod tests {
             .await
             .unwrap();
         RoutePublicationWrite {
-            schema_version: "dragontales.route-publication-receipt.v2".to_owned(),
+            schema_version: "milk.route-publication-receipt.v2".to_owned(),
             route_revision: commit.route_revision,
             student_job_id: claim.student_job_id.clone(),
             student_result_sha256: claim.student_result_sha256.clone(),
@@ -18259,8 +18429,7 @@ mod tests {
         let claim_receipt = student_claim_write(&parent, &parent_payload, "claimed");
         let claim_receipt_json = serde_json::to_string(&claim_receipt).unwrap();
         assert!(
-            claim_receipt_json
-                .contains("\"schema_version\":\"dragontales.student-job-claim-receipt.v3\"")
+            claim_receipt_json.contains("\"schema_version\":\"milk.student-job-claim-receipt.v3\"")
         );
         assert!(claim_receipt_json.contains(
             "\"counts\":{\"train\":50,\"dev\":73,\"calibration\":128},\"student_train_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-train@sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"state\":\"claimed\""
@@ -18271,7 +18440,7 @@ mod tests {
         ));
         assert!(!definition_json.contains("\"max_gpu_seconds\":"));
         let train = StudentTrainResult {
-            schema_version: "dragontales.student-train-result.v1".to_owned(),
+            schema_version: "milk.student-train-result.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: job_hex.clone(),
             claim_sha256: hex_digest(&Sha256::digest(&parent_payload).into()),
@@ -18287,21 +18456,19 @@ mod tests {
         };
         let fanout = prepare_student_fanout_claim(&parent, &train, train.finished_at).unwrap();
         let fanout_json = serde_json::to_string(&fanout).unwrap();
-        assert!(fanout_json.contains("\"schema_version\":\"dragontales.student-fanout-claim.v4\""));
+        assert!(fanout_json.contains("\"schema_version\":\"milk.student-fanout-claim.v4\""));
         assert!(fanout_json.contains(
             "\"recipe_sha256\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"max_total_gpu_seconds\":7200,\"created_at\""
         ));
         let launch =
             student_fanout_launch_write(&fanout, fanout_json.as_bytes(), "fanout.json".to_owned());
         let launch_json = serde_json::to_string(&launch).unwrap();
-        assert!(
-            launch_json.contains("\"schema_version\":\"dragontales.student-fanout-launch.v3\"")
-        );
+        assert!(launch_json.contains("\"schema_version\":\"milk.student-fanout-launch.v3\""));
         assert!(launch_json.contains(
             "\"student_branch_runtime_image_reference\":\"ghcr.io/milkinfrastructure/milk-student-branch@sha256:6666666666666666666666666666666666666666666666666666666666666666\",\"branches\""
         ));
         let mut obsolete_fanout = fanout.clone();
-        obsolete_fanout.schema_version = "dragontales.student-fanout-claim.v3".to_owned();
+        obsolete_fanout.schema_version = "milk.student-fanout-claim.v3".to_owned();
         let obsolete_fanout_payload = serde_json::to_vec(&obsolete_fanout).unwrap();
         assert!(
             validate_student_fanout_claim(
@@ -18317,7 +18484,7 @@ mod tests {
         let branch = |variant: StudentVariant, score: u16, latency: u64| {
             let claim = fanout_branch(&fanout, variant).unwrap();
             StudentBranchResult {
-                schema_version: "dragontales.student-branch-result.v1".to_owned(),
+                schema_version: "milk.student-branch-result.v1".to_owned(),
                 scope: scope.clone(),
                 student_job_id: job_hex.clone(),
                 branch_id: claim.branch_id.clone(),
@@ -18502,8 +18669,8 @@ mod tests {
         );
 
         let mut obsolete = parent;
-        obsolete.schema_version = "dragontales.student-job-claim.v2".to_owned();
-        obsolete.definition.schema_version = "dragontales.student-job-definition.v2".to_owned();
+        obsolete.schema_version = "milk.student-job-claim.v2".to_owned();
+        obsolete.definition.schema_version = "milk.student-job-definition.v2".to_owned();
         let obsolete_job_id: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&obsolete.definition).unwrap()).into();
         obsolete.student_job_id = hex_digest(&obsolete_job_id);
@@ -18735,7 +18902,7 @@ mod tests {
         .unwrap()
         .0;
         let index = StudentJobIndex {
-            schema_version: "dragontales.student-job-index.v1".to_owned(),
+            schema_version: "milk.student-job-index.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: claim.student_job_id.clone(),
             source_expires_at: expires_at,
@@ -19075,7 +19242,7 @@ mod tests {
             .await
             .unwrap();
         let mut model_manifest = StudentModelManifest {
-            schema_version: "dragontales.student-model-manifest.v1".to_owned(),
+            schema_version: "milk.student-model-manifest.v1".to_owned(),
             student_job_id: hex_digest(&student_job_id),
             variant: StudentVariant::StaticFp8,
             retained: true,
@@ -19089,7 +19256,7 @@ mod tests {
         model_manifest_bytes.push(b'\n');
         let model_manifest_sha256: [u8; 32] = Sha256::digest(&model_manifest_bytes).into();
         let parent = std::env::temp_dir().join(format!(
-            "dragontales-student-winner-materialization-{}",
+            "milk-carton-student-winner-materialization-{}",
             Uuid::now_v7()
         ));
         fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
@@ -19201,7 +19368,7 @@ mod tests {
         );
         let object = encode_trace(&capture, store.max_trace_bytes).unwrap();
         let frontier = SnapshotTraceFrontier {
-            schema_version: "dragontales.snapshot-trace-frontier.v1".to_owned(),
+            schema_version: "milk.snapshot-trace-frontier.v1".to_owned(),
             scope: scope.clone(),
             trace_id,
             occurred_at,
@@ -19356,6 +19523,8 @@ mod tests {
                 trace_id,
                 occurred_at,
                 endpoint: "chat_completions".to_owned(),
+                request_parse_success: true,
+                streaming: false,
                 route_revision: "baseline-v1".to_owned(),
                 route: RouteObservation::Ineligible {
                     reason: RouteBlockReason::PolicyAbsent,
@@ -19367,6 +19536,11 @@ mod tests {
                 request_bytes: request.len() as u64,
                 response_bytes: response.len() as u64,
                 sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+                sampling_unit_kind: SamplingUnitKind::Request,
+                sampling_unit_hmac_sha256: "aa".repeat(32),
+                sampling_independence: SamplingIndependence::Uncertain,
+                sampling_key_version: "test-key-v1".to_owned(),
+                previous_response_hmac_sha256: None,
                 capture_basis_points: 10_000,
                 capture_eligible: true,
                 capture_selected: true,
@@ -19556,7 +19730,7 @@ mod tests {
         let second = gpu_launch_test_store(objects);
         let first_scope = qualification_scope();
         let mut second_scope = qualification_scope();
-        second_scope.workload_id = Uuid::from_u128(5);
+        second_scope.scope_id = Uuid::from_u128(5);
         let now = Utc::now().with_nanosecond(0).unwrap();
         let (first_lease, second_lease) = tokio::join!(
             first.acquire_tick_lease(&first_scope, now),
@@ -19599,7 +19773,7 @@ mod tests {
 
         let foreign_objects = Arc::new(InMemory::new());
         let mut foreign_scope = qualification_scope();
-        foreign_scope.workload_id = Uuid::from_u128(5);
+        foreign_scope.scope_id = Uuid::from_u128(5);
         let foreign = new_tick_lease(&foreign_scope, Uuid::now_v7(), now).unwrap();
         foreign_objects
             .put(
@@ -20047,7 +20221,7 @@ mod tests {
         .await;
         let zero_route_revision = zero_route_receipt.route_revision.clone();
         let retirement = RouteStudentRetirement {
-            schema_version: "dragontales.route-student-retirement.v1".to_owned(),
+            schema_version: "milk.route-student-retirement.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: hex_digest(&student_job_id),
             zero_route_revision: zero_route_revision.clone(),
@@ -20103,7 +20277,7 @@ mod tests {
             bytes: 128,
         };
         let teardown = ProviderTeardownResult {
-            schema_version: "dragontales.provider-teardown-result.v1".to_owned(),
+            schema_version: "milk.provider-teardown-result.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: hex_digest(&student_job_id),
             claim_sha256: result.claim_sha256.clone(),
@@ -20827,7 +21001,7 @@ mod tests {
 
         let student_job_id = decode_hex_digest(&student.student_job_id).unwrap();
         let train = StudentTrainResult {
-            schema_version: "dragontales.student-train-result.v1".to_owned(),
+            schema_version: "milk.student-train-result.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: student.student_job_id.clone(),
             claim_sha256: student_claim_sha256,
@@ -21076,7 +21250,7 @@ mod tests {
             .await
             .unwrap();
         let result = StudentTrainResult {
-            schema_version: "dragontales.student-train-result.v1".to_owned(),
+            schema_version: "milk.student-train-result.v1".to_owned(),
             scope: scope.clone(),
             student_job_id: claim.student_job_id.clone(),
             claim_sha256: hex_digest(&Sha256::digest(&claim_payload).into()),
@@ -21133,7 +21307,7 @@ mod tests {
         for variant in student_variants() {
             let branch = fanout_branch(&fanout, variant).unwrap();
             let result = StudentBranchResult {
-                schema_version: "dragontales.student-branch-result.v1".to_owned(),
+                schema_version: "milk.student-branch-result.v1".to_owned(),
                 scope: scope.clone(),
                 student_job_id: parent.student_job_id.clone(),
                 branch_id: branch.branch_id.clone(),
@@ -21479,7 +21653,7 @@ mod tests {
         let (two, two_sha256) =
             test_snapshot_authorization_with_limit(&scope, &analyzer, 2, not_after);
 
-        assert_eq!(one.schema_version, "dragontales.teacher-policy.v2");
+        assert_eq!(one.schema_version, "milk.teacher-policy.v2");
         assert_eq!(
             one.analyzer_provider_binding_sha256,
             two.analyzer_provider_binding_sha256
@@ -21508,7 +21682,7 @@ mod tests {
         let store = gpu_launch_test_store(objects);
         let first_scope = qualification_scope();
         let mut second_scope = first_scope.clone();
-        second_scope.eval_id = "22".repeat(32);
+        second_scope.scope_id = Uuid::from_u128(22);
         let now = Utc::now().with_nanosecond(0).unwrap();
         persist_gpu_test_traces(&store, &first_scope, now, 1).await;
         persist_gpu_test_traces(&store, &second_scope, now, 1).await;
@@ -21538,7 +21712,10 @@ mod tests {
         }
 
         assert_ne!(scope_prefix(&first_scope), scope_prefix(&second_scope));
-        assert!(scope_prefix(&first_scope).starts_with(&format!("dt/v3/{}/", first_scope.eval_id)));
+        assert_eq!(
+            scope_prefix(&first_scope),
+            format!("milk/v1/scopes/{}", first_scope.scope_id)
+        );
     }
 
     #[actix_web::test]
@@ -21604,13 +21781,13 @@ mod tests {
             PreparedTeacherAnalysisLoad::Advanced(_) => panic!("test trace must be analyzable"),
         };
         let index = TeacherJobIndex {
-            schema_version: "dragontales.teacher-job-index.v2".to_owned(),
+            schema_version: "milk.teacher-job-index.v2".to_owned(),
             scope: scope.clone(),
             snapshot_batch_id: batch.snapshot_batch_id,
             teacher_job_id: hex_digest(&prepared.teacher_job_id),
             expires_at: prepared.definition.expires_at,
             claim: TeacherJobClaim {
-                schema_version: "dragontales.teacher-job-claim.v2".to_owned(),
+                schema_version: "milk.teacher-job-claim.v2".to_owned(),
                 scope: scope.clone(),
                 teacher_job_id: hex_digest(&prepared.teacher_job_id),
                 definition: prepared.definition,
@@ -22757,7 +22934,7 @@ mod tests {
             max_cost_microusd: 2,
         };
         let definition = TeacherJobDefinition {
-            schema_version: "dragontales.teacher-job-definition.v2".to_owned(),
+            schema_version: "milk.teacher-job-definition.v2".to_owned(),
             snapshot_batch_id: batch.snapshot_batch_id.clone(),
             provider_binding_sha256: hex_digest(&provider_binding),
             execution: SnapshotAnalyzerExecutionIdentity::GpuJob {
@@ -22774,7 +22951,7 @@ mod tests {
         let teacher_job_id: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&definition).unwrap()).into();
         let claim = TeacherJobClaim {
-            schema_version: "dragontales.teacher-job-claim.v2".to_owned(),
+            schema_version: "milk.teacher-job-claim.v2".to_owned(),
             scope: scope.clone(),
             teacher_job_id: hex_digest(&teacher_job_id),
             definition,
@@ -22782,7 +22959,7 @@ mod tests {
         };
         let batch_id = decode_hex_digest(&batch.snapshot_batch_id).unwrap();
         let index = TeacherJobIndex {
-            schema_version: "dragontales.teacher-job-index.v2".to_owned(),
+            schema_version: "milk.teacher-job-index.v2".to_owned(),
             scope: scope.clone(),
             snapshot_batch_id: batch.snapshot_batch_id,
             teacher_job_id: hex_digest(&teacher_job_id),
@@ -22892,7 +23069,7 @@ mod tests {
         for index in 0..=MAX_ITERATION_SNAPSHOT_ARTIFACTS {
             let identity = Sha256::digest(index.to_be_bytes());
             let definition = TeacherJobDefinition {
-                schema_version: "dragontales.teacher-job-definition.v2".to_owned(),
+                schema_version: "milk.teacher-job-definition.v2".to_owned(),
                 snapshot_batch_id: hex_digest(&identity.into()),
                 provider_binding_sha256: hex_digest(&archived_provider),
                 execution: SnapshotAnalyzerExecutionIdentity::GpuJob {
@@ -22909,7 +23086,7 @@ mod tests {
             let teacher_job_id: [u8; 32] =
                 Sha256::digest(serde_json::to_vec(&definition).unwrap()).into();
             let claim = TeacherJobClaim {
-                schema_version: "dragontales.teacher-job-claim.v2".to_owned(),
+                schema_version: "milk.teacher-job-claim.v2".to_owned(),
                 scope: scope.clone(),
                 teacher_job_id: hex_digest(&teacher_job_id),
                 definition,
@@ -23222,7 +23399,7 @@ mod tests {
         for (partition, output) in decisions {
             let source = source(partition);
             let decision = TeacherDecision {
-                schema_version: "dragontales.teacher-decision.v1".to_owned(),
+                schema_version: "milk.teacher-decision.v1".to_owned(),
                 tags: vec!["workload.chat".to_owned()],
                 output,
             };
@@ -23253,27 +23430,56 @@ mod tests {
 
         let train_source = source(TeacherPartition::Train);
         let wrong_partition = TeacherDecision {
-            schema_version: "dragontales.teacher-decision.v1".to_owned(),
+            schema_version: "milk.teacher-decision.v1".to_owned(),
             tags: vec!["workload.chat".to_owned()],
             output: TeacherDecisionOutput::Calibration,
         };
         assert!(hydrate_teacher_result(wrong_partition, &[train_source]).is_err());
 
-        let echoed_projection = r#"{"schema_version":"dragontales.teacher-decision.v1","tags":["workload.chat"],"output":{"kind":"train","target":"ideal","projection":{}}}"#;
+        let echoed_projection = r#"{"schema_version":"milk.teacher-decision.v1","tags":["workload.chat"],"output":{"kind":"train","target":"ideal","projection":{}}}"#;
         assert!(serde_json::from_str::<TeacherDecision>(echoed_projection).is_err());
     }
 
     #[actix_web::test]
-    async fn cloudflare_r2_identity_and_required_semantics_are_exact() {
-        assert!(validate_cloudflare_r2_identity(&"a".repeat(32), "valid-bucket").is_ok());
-        for account_id in ["a".repeat(31), "A".repeat(32), "g".repeat(32)] {
-            assert!(validate_cloudflare_r2_identity(&account_id, "valid-bucket").is_err());
+    async fn s3_identity_and_required_semantics_are_exact() {
+        assert!(
+            validate_s3_identity(
+                "https://example.r2.cloudflarestorage.com",
+                "auto",
+                "valid.bucket"
+            )
+            .is_ok()
+        );
+        for endpoint in [
+            "http://object-store.example.com",
+            "https://user@example.com",
+            "https://object-store.example.com/path",
+            "https://object-store.example.com?query=true",
+        ] {
+            assert!(validate_s3_identity(endpoint, "auto", "valid-bucket").is_err());
         }
-        for bucket in ["ab", "-bucket", "bucket-", "UPPER", "has_underscore"] {
-            assert!(validate_cloudflare_r2_identity(&"a".repeat(32), bucket).is_err());
+        for region in ["", "US-EAST-1", "-auto", "auto-"] {
+            assert!(
+                validate_s3_identity("https://object-store.example.com", region, "valid-bucket")
+                    .is_err()
+            );
+        }
+        for bucket in [
+            "ab",
+            "-bucket",
+            "bucket-",
+            "UPPER",
+            "has_underscore",
+            "bucket..name",
+            "127.0.0.1",
+        ] {
+            assert!(
+                validate_s3_identity("https://object-store.example.com", "us-east-1", bucket)
+                    .is_err()
+            );
         }
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        probe_cloudflare_r2(&objects).await.unwrap();
+        probe_s3(&objects).await.unwrap();
         assert_eq!(
             objects.list(None).try_collect::<Vec<_>>().await.unwrap(),
             []
@@ -23284,11 +23490,11 @@ mod tests {
     async fn local_store_conditional_update_is_cross_instance_atomic() {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("dragontales-local-cas-{}", Uuid::now_v7()));
+            .join(format!("milk-carton-local-cas-{}", Uuid::now_v7()));
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let first = build_local(&root).unwrap();
         let second = build_local(&root).unwrap();
-        let object = ObjectPath::from("dt/v3/local-cas/lease.json");
+        let object = ObjectPath::from("milk/v1/local-cas/lease.json");
         let initial = first
             .put_opts(
                 &object,
@@ -23357,11 +23563,7 @@ mod tests {
         );
 
         let scope = Scope {
-            tenant_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment_id: Uuid::new_v4(),
-            workload_id: Uuid::new_v4(),
-            eval_id: "33".repeat(32),
+            scope_id: Uuid::new_v4(),
         };
         let occurred_at = Utc::now().with_nanosecond(0).unwrap();
         let mut trace = test_capture(
@@ -23376,9 +23578,9 @@ mod tests {
         let trace_object = encode_trace(&trace, 64 * 1_024).unwrap();
         let trace_fixture: serde_json::Value =
             decode_compressed(&trace_object.payload, 64 * 1_024).unwrap();
-        assert_eq!(trace_fixture["schema_version"], "dragontales.trace.v3");
+        assert_eq!(trace_fixture["schema_version"], TRACE_SCHEMA_VERSION);
         assert_eq!(
-            trace_fixture["catalog"]["route"],
+            trace_fixture["catalog"]["route_observation"],
             serde_json::json!({"state": "ineligible", "reason": "unsupported_request"})
         );
         assert!(trace_fixture["catalog"].get("eligibility").is_none());
@@ -23427,13 +23629,15 @@ mod tests {
         let writer_id = Uuid::now_v7();
         let flush_id = Uuid::now_v7();
         let shard = StatsShard {
-            schema_version: "dragontales.stats-shard.v5".to_owned(),
+            schema_version: STATS_SHARD_SCHEMA_VERSION.to_owned(),
             scope: scope.clone(),
             writer_id,
             flush_id,
             hour,
             recorded_at: occurred_at,
             sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+            capture_policy_version: Some("test-v1".to_owned()),
+            sampling_key_version: "test-key-v1".to_owned(),
             capture_basis_points: 0,
             values,
         };
@@ -23444,7 +23648,7 @@ mod tests {
         let decoded: StatsShard = serde_json::from_slice(&canonical).unwrap();
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), canonical);
         let fixture: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
-        assert_eq!(fixture["schema_version"], "dragontales.stats-shard.v5");
+        assert_eq!(fixture["schema_version"], STATS_SHARD_SCHEMA_VERSION);
         assert_eq!(
             fixture["values"]["route_blocked_reason_counts"],
             serde_json::json!({"unsupported_request": 1})
@@ -23569,7 +23773,7 @@ mod tests {
     #[actix_web::test]
     async fn explicit_flush_fails_closed_when_store_write_fails() {
         let root =
-            std::env::temp_dir().join(format!("dragontales-flush-failure-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("milk-carton-flush-failure-{}", Uuid::now_v7()));
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let objects = build_local(&root).unwrap();
@@ -23617,11 +23821,7 @@ mod tests {
     async fn corrupt_capture_does_not_poison_the_next_record() {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let scope = Scope {
-            tenant_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment_id: Uuid::new_v4(),
-            workload_id: Uuid::new_v4(),
-            eval_id: "44".repeat(32),
+            scope_id: Uuid::new_v4(),
         };
         let records = Records::start(objects, 128 * 1_024, 64 * 1_024, scope.clone(), 10_000)
             .await
@@ -23671,11 +23871,7 @@ mod tests {
     async fn queue_drop_is_visible_in_health() {
         let records = Records::stalled_for_test(1, 1).unwrap();
         let scope = Scope {
-            tenant_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment_id: Uuid::new_v4(),
-            workload_id: Uuid::new_v4(),
-            eval_id: "55".repeat(32),
+            scope_id: Uuid::new_v4(),
         };
         let now = Utc::now();
         let catalog = test_capture(
@@ -23912,7 +24108,7 @@ mod tests {
             writer_id: Uuid::now_v7(),
         };
         let directory =
-            std::env::temp_dir().join(format!("dragontales-multipart-identity-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("milk-carton-multipart-identity-{}", Uuid::now_v7()));
         fs::create_dir(&directory).unwrap();
         let artifact_path = directory.join("artifact");
         let payload = b"artifact";

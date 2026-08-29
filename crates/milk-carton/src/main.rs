@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use futures::Stream;
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -34,45 +35,49 @@ use records::{
     MAX_STUDENT_ARTIFACT_BYTES, MAX_STUDENT_ARTIFACT_FILES, MAX_STUDENT_RESULT_BYTES,
     MAX_STUDENT_UPLOAD_BYTES, MAX_WINNER_DEPLOYMENT_RESULT_BYTES, OutcomeDisposition, OutcomeKind,
     OutcomeSubmission, OutcomeValue, PartitionedObjectStore, ProviderTeardownResult, Records,
-    RouteFallbackReason, RouteObservation, Scope, SnapshotAnalysisAuthorization,
-    SnapshotAnalyzerConfig, SnapshotAnalyzerExecution, SnapshotAnalyzerReasoningEffort,
-    StoreAccess, StorePartition, StudentArtifactInput, StudentArtifactSource,
-    StudentBranchMaterialization, StudentBranchResult, StudentTrainResult, StudentUpload,
-    StudentVariant, StudentWinnerDeploymentResult, TICK_LEASE_TTL_SECONDS, TeacherGpuTickWrite,
-    TraceCapture, TraceCatalog, current_effective_uid, is_not_found,
+    RouteFallbackReason, RouteObservation, SamplingIndependence, SamplingUnitKind, Scope,
+    SnapshotAnalysisAuthorization, SnapshotAnalyzerConfig, SnapshotAnalyzerExecution,
+    SnapshotAnalyzerReasoningEffort, StoreAccess, StorePartition, StudentArtifactInput,
+    StudentArtifactSource, StudentBranchMaterialization, StudentBranchResult, StudentTrainResult,
+    StudentUpload, StudentVariant, StudentWinnerDeploymentResult, TICK_LEASE_TTL_SECONDS,
+    TeacherGpuTickWrite, TraceCapture, TraceCatalog, current_effective_uid, is_not_found,
 };
 use route::{
     CandidateReasoningEffort, CandidateRoute, ED25519_SIGNATURE_BYTES, MAX_ROUTE_MANIFEST_BYTES,
-    RouteDecision, RoutePolicy, RoutePublication, RouteRequest, RouteScope, RouteStartupConfig,
-    RouteTarget, WINNER_CANARY_BASIS_POINTS, WINNER_CANARY_VALID_FOR_SECONDS,
+    RouteDecision, RouteEndpoint, RoutePolicy, RoutePublication, RouteRequest, RouteScope,
+    RouteStartupConfig, RouteTarget, WINNER_CANARY_BASIS_POINTS, WINNER_CANARY_VALID_FOR_SECONDS,
     WINNER_ZERO_VALID_FOR_SECONDS, WinnerRouteAdvanceAction, WinnerRoutePhase,
-    advance_winner_route, prepare_route_manifest,
+    advance_winner_route, prepare_operator_route_manifest, prepare_route_manifest,
 };
 
 const CHAT_PATH: &str = "/v1/chat/completions";
-const OUTCOME_PATH: &str = "/v1/dragontales/outcomes";
+const RESPONSES_PATH: &str = "/v1/responses";
+const OUTCOME_PATH: &str = "/v1/milk/outcomes";
 const CANDIDATE_CREDENTIAL_PATH: &str = "/healthz/candidate-credential";
-const CONFIG_SHA256_HEADER: &str = "x-dragontales-config-sha256";
-const OUTCOME_KEY_HEADER: &str = "x-dragontales-key";
-const TRACE_ID_HEADER: &str = "x-dragontales-trace-id";
-const CAPTURE_INTENT_HEADER: &str = "x-dragontales-capture-intent";
-const ERROR_SOURCE_HEADER: &str = "x-dragontales-error-source";
-const ROUTE_REVISION_HEADER: &str = "x-dragontales-route-revision";
-const ROUTE_TARGET_HEADER: &str = "x-dragontales-route-target";
-const CANDIDATE_SHA256_HEADER: &str = "x-dragontales-candidate-sha256";
-const ARTIFACT_SHA256_HEADER: &str = "x-dragontales-artifact-sha256";
-const DEPLOYMENT_SHA256_HEADER: &str = "x-dragontales-deployment-sha256";
-const CANDIDATE_API_KEY_SHA256_HEADER: &str = "x-dragontales-candidate-api-key-sha256";
-const CANDIDATE_CREDENTIAL_STATE_HEADER: &str = "x-dragontales-candidate-credential-state";
-const ROUTE_SECRET_ENV: &str = "DRAGONTALES_ROUTE_SECRET_HEX";
-const CONFIG_JSON_ENV: &str = "DRAGONTALES_CONFIG_JSON";
-const OPENAI_API_KEY_ENV: &str = "DRAGONTALES_OPENAI_API_KEY";
-const TEACHER_API_KEY_ENV: &str = "DRAGONTALES_TEACHER_API_KEY";
-const CANDIDATE_API_KEY_ENV: &str = "DRAGONTALES_CANDIDATE_API_KEY";
+const CONFIG_SHA256_HEADER: &str = "x-milk-config-sha256";
+const OUTCOME_KEY_HEADER: &str = "x-milk-key";
+const TRACE_ID_HEADER: &str = "x-milk-trace-id";
+const CAPTURE_INTENT_HEADER: &str = "x-milk-capture-intent";
+const SESSION_ID_HEADER: &str = "x-milk-session-id";
+const ERROR_SOURCE_HEADER: &str = "x-milk-error-source";
+const ROUTE_REVISION_HEADER: &str = "x-milk-route-revision";
+const ROUTE_TARGET_HEADER: &str = "x-milk-route-target";
+const CANDIDATE_SHA256_HEADER: &str = "x-milk-candidate-sha256";
+const ARTIFACT_SHA256_HEADER: &str = "x-milk-artifact-sha256";
+const DEPLOYMENT_SHA256_HEADER: &str = "x-milk-deployment-sha256";
+const CANDIDATE_API_KEY_SHA256_HEADER: &str = "x-milk-candidate-api-key-sha256";
+const CANDIDATE_CREDENTIAL_STATE_HEADER: &str = "x-milk-candidate-credential-state";
+const ROUTE_SECRET_ENV: &str = "MILK_CARTON_ROUTE_SECRET_HEX";
+const CONFIG_JSON_ENV: &str = "MILK_CARTON_CONFIG_JSON";
+const OPENAI_API_KEY_ENV: &str = "MILK_CARTON_OPENAI_API_KEY";
+const TEACHER_API_KEY_ENV: &str = "MILK_CARTON_TEACHER_API_KEY";
+const CANDIDATE_API_KEY_ENV: &str = "MILK_CARTON_CANDIDATE_API_KEY";
+const CAPTURE_SAMPLING_KEY_ENV: &str = "MILK_CAPTURE_SAMPLING_KEY_HEX";
+const CAPTURE_SAMPLING_KEY_VERSION_ENV: &str = "MILK_CAPTURE_SAMPLING_KEY_VERSION";
+const NO_CAPTURE_SAMPLING_KEY_VERSION: &str = "not-applicable";
 const MAX_CONFIG_BYTES: usize = 64 * 1_024;
 const MAX_PROVIDER_API_KEY_BYTES: usize = 4_096;
 const MAX_TRAFFIC_KEYS: usize = 64;
-const MAX_COHORT_ID_BYTES: usize = 128;
 const TICK_LEASE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const TICK_MUTATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const _: () = assert!(
@@ -90,7 +95,7 @@ static OUTCOME_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long, env = "DRAGONTALES_CONFIG")]
+    #[arg(long, env = "MILK_CARTON_CONFIG")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -193,6 +198,13 @@ enum Command {
         manifest: PathBuf,
     },
     #[command(hide = true)]
+    PrepareRouteProposal {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    #[command(hide = true)]
     PublishRoute {
         #[arg(long)]
         manifest: PathBuf,
@@ -214,11 +226,7 @@ struct FileConfig {
     traffic_keys: Vec<TrafficKeyConfig>,
     outcome_key_id: Uuid,
     outcome_key_sha256: String,
-    tenant_id: Uuid,
-    project_id: Uuid,
-    environment_id: Uuid,
-    workload_id: Uuid,
-    eval_id: String,
+    scope_id: Uuid,
     max_request_bytes: usize,
     max_in_flight: usize,
     max_outcomes_in_flight: usize,
@@ -251,14 +259,19 @@ struct FileConfig {
 struct TrafficKeyConfig {
     api_key_sha256: String,
     capture_allowed: bool,
-    cohort_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ObjectStoreConfig {
-    Local { root: PathBuf },
-    CloudflareR2 { account_id: String, bucket: String },
+    Local {
+        root: PathBuf,
+    },
+    S3 {
+        endpoint: String,
+        region: String,
+        bucket: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -343,6 +356,10 @@ impl StoreAccessPlan {
                 routes: Some(ReadOnly),
                 ..Self::default()
             },
+            Command::PrepareRouteProposal { .. } => Self {
+                routes: Some(ReadOnly),
+                ..Self::default()
+            },
             Command::PublishRoute { check_only, .. } => Self {
                 control: Some(if *check_only { ReadOnly } else { ReadWrite }),
                 routes: Some(if *check_only { ReadOnly } else { ReadWrite }),
@@ -355,7 +372,7 @@ impl StoreAccessPlan {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OpenAiCompatibleEndpoint {
-    chat_completions_url: String,
+    api_base_url: String,
     allow_loopback_http: bool,
 }
 
@@ -404,7 +421,7 @@ struct CaptureConfig {
 #[derive(Clone)]
 struct Gateway {
     client: reqwest::Client,
-    upstream: Url,
+    upstream_api_base: Url,
     config_sha256: [u8; 32],
     route_runtime: Arc<RwLock<Arc<RouteRuntime>>>,
     candidate_api_key_sha256: Option<[u8; 32]>,
@@ -414,9 +431,12 @@ struct Gateway {
     scope: Scope,
     records: Option<Records>,
     capture: CaptureConfig,
+    capture_sampling_key: ring::hmac::Key,
+    capture_sampling_key_version: String,
     outcome_max_bytes: usize,
     max_request_bytes: usize,
     request_body_timeout: Duration,
+    upstream_total_timeout: Duration,
     storage_timeout: Duration,
     in_flight: Arc<Semaphore>,
     outcomes_in_flight: Arc<Semaphore>,
@@ -430,7 +450,6 @@ struct Gateway {
 struct TrafficKey {
     api_key_sha256: [u8; 32],
     capture_allowed: bool,
-    cohort_id: String,
 }
 
 #[derive(Clone)]
@@ -452,8 +471,8 @@ impl Gateway {
         records: Option<Records>,
         candidate_api_key: Option<&str>,
     ) -> Result<Self> {
-        let upstream = parse_openai_compatible_endpoint(
-            &config.baseline.chat_completions_url,
+        let upstream = parse_openai_compatible_api_base_url(
+            &config.baseline.api_base_url,
             config.baseline.allow_loopback_http,
         )?;
         let openai_api_key = required_env(OPENAI_API_KEY_ENV)?;
@@ -483,7 +502,7 @@ impl Gateway {
     #[cfg(test)]
     fn with_route(
         config: &FileConfig,
-        upstream: Url,
+        upstream_api_base: Url,
         records: Option<Records>,
         route: RoutePolicy,
         openai_api_key: Option<&str>,
@@ -491,8 +510,8 @@ impl Gateway {
     ) -> Result<Self> {
         Self::with_route_config_identity(
             config,
-            Sha256::digest(b"dragontales-test-config").into(),
-            upstream,
+            Sha256::digest(b"milk-carton-test-config").into(),
+            upstream_api_base,
             records,
             route,
             openai_api_key,
@@ -503,7 +522,7 @@ impl Gateway {
     fn with_route_config_identity(
         config: &FileConfig,
         config_sha256: [u8; 32],
-        upstream: Url,
+        upstream_api_base: Url,
         records: Option<Records>,
         route: RoutePolicy,
         openai_api_key: Option<&str>,
@@ -604,10 +623,11 @@ impl Gateway {
         let route_runtime = build_route_runtime(config, route, candidate_api_key)?;
         let candidate_api_key_sha256 =
             candidate_api_key.map(provider_api_key_sha256).transpose()?;
+        let (capture_sampling_key, capture_sampling_key_version) = capture_sampling_config()?;
 
         Ok(Self {
             client,
-            upstream,
+            upstream_api_base,
             config_sha256,
             route_runtime: Arc::new(RwLock::new(route_runtime)),
             candidate_api_key_sha256,
@@ -625,9 +645,12 @@ impl Gateway {
                 rights_state: config.capture_rights_state.clone(),
                 retention_days: config.capture_retention_days,
             },
+            capture_sampling_key,
+            capture_sampling_key_version,
             outcome_max_bytes: config.capture_record_bytes,
             max_request_bytes: config.max_request_bytes,
             request_body_timeout: Duration::from_millis(config.request_body_timeout_ms),
+            upstream_total_timeout: Duration::from_millis(config.total_timeout_ms),
             storage_timeout: Duration::from_millis(config.storage_timeout_ms),
             in_flight: Arc::new(Semaphore::new(config.max_in_flight)),
             outcomes_in_flight: Arc::new(Semaphore::new(config.max_outcomes_in_flight)),
@@ -651,6 +674,29 @@ impl Gateway {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime;
     }
+}
+
+fn capture_sampling_config() -> Result<(ring::hmac::Key, String)> {
+    let key_hex = match optional_env(CAPTURE_SAMPLING_KEY_ENV)? {
+        Some(value) => value,
+        None if cfg!(test) => "11".repeat(32),
+        None => bail!("{CAPTURE_SAMPLING_KEY_ENV} is required when capture is enabled"),
+    };
+    let version = match optional_env(CAPTURE_SAMPLING_KEY_VERSION_ENV)? {
+        Some(value) => value,
+        None if cfg!(test) => "test-v1".to_owned(),
+        None => bail!("{CAPTURE_SAMPLING_KEY_VERSION_ENV} is required when capture is enabled"),
+    };
+    if version.is_empty()
+        || version.len() > 128
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("{CAPTURE_SAMPLING_KEY_VERSION_ENV} must be a bounded identifier");
+    }
+    let key = decode_lowercase_sha256(&key_hex)?;
+    Ok((ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key), version))
 }
 
 fn build_route_runtime(
@@ -784,9 +830,9 @@ struct StatusWrite {
 }
 
 #[derive(Serialize)]
-struct GenerationStatusWrite<'a> {
+struct GenerationStatusWrite {
     schema_version: &'static str,
-    eval_id: &'a str,
+    scope_id: Uuid,
     max_decisions: u32,
     claimed_decisions: u32,
     remaining_decisions: u32,
@@ -799,6 +845,31 @@ struct OutcomeRequest {
     trace_id: Uuid,
     outcome_version: i64,
     value: OutcomeValue,
+}
+
+#[derive(Deserialize)]
+struct ResponsesSessionHints<'a> {
+    #[serde(borrow)]
+    conversation: Option<&'a RawValue>,
+    previous_response_id: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesConversation<'a> {
+    id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct RequestAnalytics {
+    stream: Option<bool>,
+}
+
+struct SamplingIdentity {
+    kind: SamplingUnitKind,
+    hmac_sha256: [u8; 32],
+    independence: SamplingIndependence,
+    previous_response_hmac_sha256: Option<[u8; 32]>,
+    content_capture_allowed: bool,
 }
 
 struct UpstreamBody {
@@ -825,6 +896,9 @@ struct TraceRecorder {
     record_limit: usize,
     selected: bool,
     oversized: bool,
+    stream_protocol: Option<RouteEndpoint>,
+    stream_terminal_seen: bool,
+    stream_terminal_tail: Vec<u8>,
 }
 
 impl Stream for UpstreamBody {
@@ -864,7 +938,8 @@ impl Stream for UpstreamBody {
 impl Drop for UpstreamBody {
     fn drop(&mut self) {
         if let Some(recorder) = self.recorder.as_mut() {
-            recorder.finish(Some("downstream_disconnected"));
+            let error_class = (!recorder.stream_terminal_seen).then_some("downstream_disconnected");
+            recorder.finish(error_class);
         }
     }
 }
@@ -877,6 +952,7 @@ impl TraceRecorder {
         if let Some(catalog) = self.catalog.as_mut() {
             catalog.response_bytes = catalog.response_bytes.saturating_add(bytes.len() as u64);
         }
+        self.observe_stream_terminal(bytes);
         if bytes.is_empty() || !self.selected || self.oversized {
             return;
         }
@@ -896,12 +972,66 @@ impl TraceRecorder {
         debug_assert_eq!(self.response.len(), response_bytes);
     }
 
+    fn observe_stream_terminal(&mut self, bytes: &[u8]) {
+        let Some(endpoint) = self.stream_protocol else {
+            return;
+        };
+        if self.stream_terminal_seen || bytes.is_empty() {
+            return;
+        }
+        let markers: &[&[u8]] = match endpoint {
+            RouteEndpoint::ChatCompletions => &[b"data: [DONE]"],
+            RouteEndpoint::Responses => &[
+                b"event: response.completed",
+                b"event: response.failed",
+                b"event: response.incomplete",
+            ],
+        };
+        let tail_limit = markers
+            .iter()
+            .map(|marker| marker.len().saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+        if markers.iter().any(|marker| contains_bytes(bytes, marker)) {
+            self.stream_terminal_seen = true;
+            self.stream_terminal_tail.clear();
+            return;
+        }
+        if !self.stream_terminal_tail.is_empty() {
+            let prefix_len = bytes.len().min(tail_limit);
+            let mut boundary = Vec::with_capacity(self.stream_terminal_tail.len() + prefix_len);
+            boundary.extend_from_slice(&self.stream_terminal_tail);
+            boundary.extend_from_slice(&bytes[..prefix_len]);
+            if markers
+                .iter()
+                .any(|marker| contains_bytes(&boundary, marker))
+            {
+                self.stream_terminal_seen = true;
+                self.stream_terminal_tail.clear();
+                return;
+            }
+        }
+        if bytes.len() >= tail_limit {
+            self.stream_terminal_tail.clear();
+            self.stream_terminal_tail
+                .extend_from_slice(&bytes[bytes.len().saturating_sub(tail_limit)..]);
+        } else {
+            let old_start = self
+                .stream_terminal_tail
+                .len()
+                .saturating_sub(tail_limit.saturating_sub(bytes.len()));
+            self.stream_terminal_tail.drain(..old_start);
+            self.stream_terminal_tail.extend_from_slice(bytes);
+        }
+    }
+
     fn capture_memory_bytes(&self) -> usize {
         self.catalog
             .as_ref()
             .map_or(0, TraceCatalog::memory_bytes)
             .saturating_add(self.request.as_ref().map_or(0, Bytes::len))
             .saturating_add(self.response.capacity())
+            .saturating_add(self.stream_terminal_tail.capacity())
             .saturating_add(
                 self.request_content_type
                     .as_ref()
@@ -940,6 +1070,10 @@ impl TraceRecorder {
         };
         catalog.ttft_ms = self.first_byte.map(duration_ms);
         catalog.completion_ms = Some(duration_ms(self.started.elapsed()));
+        let error_class = error_class.or_else(|| {
+            (self.stream_protocol.is_some() && !self.stream_terminal_seen)
+                .then_some("upstream_stream_incomplete")
+        });
         if let Some(error_class) = error_class {
             catalog.error_class = Some(error_class.to_owned());
         }
@@ -965,6 +1099,10 @@ impl TraceRecorder {
         };
         log_enqueue_failure(result);
     }
+}
+
+fn contains_bytes(value: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && value.windows(needle.len()).any(|window| window == needle)
 }
 
 #[actix_web::main]
@@ -1381,7 +1519,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(&WinnerRouteAdvanceWrite {
-                    schema_version: "dragontales.winner-route-advance.v1",
+                    schema_version: "milk.winner-route-advance.v1",
                     action: advance.action,
                     route_revision: advance.publication.revision_hex(),
                     not_after: advance.publication.not_after,
@@ -1453,6 +1591,54 @@ async fn main() -> Result<()> {
             )?;
             records
                 .verify_route_publication(&scope, &publication, previous.as_ref())
+                .await?;
+            write_private_output(&manifest, &manifest_bytes, "route manifest")?;
+            println!("{}", publication.revision_hex());
+            Ok(())
+        }
+        Command::PrepareRouteProposal { proposal, manifest } => {
+            let route_config = config
+                .route
+                .as_ref()
+                .context("route proposal preparation requires startup route configuration")?;
+            let mut proposal =
+                OperatorInput::open(&proposal, MAX_ROUTE_MANIFEST_BYTES, "route proposal")?;
+            let records = tokio::time::timeout(
+                Duration::from_millis(config.storage_timeout_ms),
+                start_records(&config, store_access),
+            )
+            .await
+            .context("storage initialization timed out")??;
+            let route_scope = config_route_scope(&config);
+            let previous = match records.load_live_route(&config_scope(&config)).await? {
+                Some((pointer, previous_manifest, previous_signature)) => {
+                    let publication = RoutePublication::parse_archived(
+                        route_config,
+                        &route_scope,
+                        &previous_manifest,
+                        &previous_signature,
+                    )?;
+                    if publication.revision != pointer.route_revision {
+                        bail!("live route pointer differs from its verified publication");
+                    }
+                    Some(publication)
+                }
+                None => None,
+            };
+            let proposal_bytes = proposal.reread_unchanged()?;
+            let route_secret = optional_env(ROUTE_SECRET_ENV)?;
+            let candidate_api_key = optional_env(CANDIDATE_API_KEY_ENV)?;
+            let (manifest_bytes, publication) = prepare_operator_route_manifest(
+                route_config,
+                &route_scope,
+                &proposal_bytes,
+                route_secret.as_deref(),
+                candidate_api_key.as_deref(),
+                previous.as_ref(),
+                Utc::now(),
+            )?;
+            records
+                .verify_route_publication(&config_scope(&config), &publication, previous.as_ref())
                 .await?;
             write_private_output(&manifest, &manifest_bytes, "route manifest")?;
             println!("{}", publication.revision_hex());
@@ -1679,7 +1865,7 @@ async fn status_once(config: &FileConfig, now: DateTime<Utc>) -> Result<String> 
         .await?;
     let route = route_status(config, &records, now).await?;
     Ok(serde_json::to_string(&StatusWrite {
-        schema_version: "dragontales.status.v2",
+        schema_version: "milk.status.v2",
         records: record_status,
         route,
     })?)
@@ -1699,8 +1885,8 @@ async fn generation_status_once(config: &FileConfig, now: DateTime<Utc>) -> Resu
         .await?;
     let generation = status.generation;
     Ok(serde_json::to_string(&GenerationStatusWrite {
-        schema_version: "dragontales.generation-status.v1",
-        eval_id: &config.eval_id,
+        schema_version: "milk.generation-status.v1",
+        scope_id: config.scope_id,
         max_decisions: generation.max_decisions,
         claimed_decisions: generation.claimed_decisions,
         remaining_decisions: generation.remaining_decisions,
@@ -1757,7 +1943,7 @@ async fn route_status(
     records
         .verify_route_publication(&config_scope(config), &publication, previous.as_ref())
         .await?;
-    if publication.candidate_basis_points == 0 {
+    if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
         records
             .verify_zero_route_retirement(&config_scope(config), &publication)
             .await?;
@@ -1773,7 +1959,8 @@ async fn route_status(
         configured: true,
         state,
         route_revision: Some(publication.revision_hex()),
-        student_job_id: Some(bytes_hex(&publication.student_job_id)),
+        student_job_id: (!publication.is_operator_proposal())
+            .then(|| bytes_hex(&publication.student_job_id)),
         candidate_basis_points: Some(publication.candidate_basis_points),
         not_after: Some(publication.not_after),
     })
@@ -1822,21 +2009,13 @@ fn command_uses_deployment_config(command: Option<&Command>) -> bool {
 
 fn config_scope(config: &FileConfig) -> Scope {
     Scope {
-        tenant_id: config.tenant_id,
-        project_id: config.project_id,
-        environment_id: config.environment_id,
-        workload_id: config.workload_id,
-        eval_id: config.eval_id.clone(),
+        scope_id: config.scope_id,
     }
 }
 
 fn config_route_scope(config: &FileConfig) -> RouteScope {
     RouteScope {
-        tenant_id: config.tenant_id,
-        project_id: config.project_id,
-        environment_id: config.environment_id,
-        workload_id: config.workload_id,
-        eval_id: config.eval_id.clone(),
+        scope_id: config.scope_id,
     }
 }
 
@@ -1925,11 +2104,11 @@ async fn start_records(config: &FileConfig, access: StoreAccessPlan) -> Result<R
 async fn start_records_with_timeout(
     config: &FileConfig,
     access: StoreAccessPlan,
-    qualify_r2: bool,
+    qualify_s3: bool,
 ) -> Result<Records> {
     tokio::time::timeout(
         Duration::from_millis(config.storage_timeout_ms),
-        open_records(config, access, qualify_r2),
+        open_records(config, access, qualify_s3),
     )
     .await
     .context("storage initialization timed out")?
@@ -1938,45 +2117,59 @@ async fn start_records_with_timeout(
 async fn open_records(
     config: &FileConfig,
     access: StoreAccessPlan,
-    qualify_r2: bool,
+    qualify_s3: bool,
 ) -> Result<Records> {
     let capture =
-        open_store_partition(config, StorePartition::Capture, access.capture, qualify_r2).await?;
+        open_store_partition(config, StorePartition::Capture, access.capture, qualify_s3).await?;
     let control =
-        open_store_partition(config, StorePartition::Control, access.control, qualify_r2).await?;
+        open_store_partition(config, StorePartition::Control, access.control, qualify_s3).await?;
     let routes =
-        open_store_partition(config, StorePartition::Routes, access.routes, qualify_r2).await?;
+        open_store_partition(config, StorePartition::Routes, access.routes, qualify_s3).await?;
     let objects = Arc::new(PartitionedObjectStore::new(capture, control, routes));
-    Records::start(
+    let sampling_key_version = records_sampling_key_version(access)?;
+    Records::start_with_sampling(
         objects,
         config.capture_queue_bytes,
         config.capture_record_bytes,
         config_scope(config),
         config.capture_basis_points,
+        (!config.capture_policy_version.is_empty()).then(|| config.capture_policy_version.clone()),
+        sampling_key_version,
     )
     .await
+}
+
+fn records_sampling_key_version(access: StoreAccessPlan) -> Result<String> {
+    if access.capture.is_none() {
+        return Ok(NO_CAPTURE_SAMPLING_KEY_VERSION.to_owned());
+    }
+    Ok(capture_sampling_config()?.1)
 }
 
 async fn open_store_partition(
     config: &FileConfig,
     partition: StorePartition,
     access: Option<StoreAccess>,
-    qualify_r2: bool,
+    qualify_s3: bool,
 ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, StoreAccess)>> {
     let Some(access) = access else {
         return Ok(None);
     };
-    let (objects, cloudflare_r2) = match config.stores.get(partition) {
+    let (objects, s3) = match config.stores.get(partition) {
         ObjectStoreConfig::Local { root } => (records::build_local(root)?, false),
-        ObjectStoreConfig::CloudflareR2 { account_id, bucket } => (
-            records::build_cloudflare_r2(account_id, bucket, partition)?,
+        ObjectStoreConfig::S3 {
+            endpoint,
+            region,
+            bucket,
+        } => (
+            records::build_s3(endpoint, region, bucket, partition)?,
             true,
         ),
     };
-    if qualify_r2 && cloudflare_r2 {
+    if qualify_s3 && s3 {
         match access {
-            StoreAccess::ReadOnly => records::probe_cloudflare_r2_read(&objects).await?,
-            StoreAccess::ReadWrite => records::probe_cloudflare_r2(&objects).await?,
+            StoreAccess::ReadOnly => records::probe_s3_read(&objects).await?,
+            StoreAccess::ReadWrite => records::probe_s3(&objects).await?,
         }
     }
     Ok(Some((objects, access)))
@@ -2050,23 +2243,16 @@ fn validate_serve_config_owner(config: &FileConfig, owner: InputOwner) -> Result
 }
 
 fn validate_config_identity(config: &FileConfig) -> Result<()> {
-    records::validate_eval_id(&config.eval_id)?;
-    let identities = [
-        config.outcome_key_id,
-        config.tenant_id,
-        config.project_id,
-        config.environment_id,
-        config.workload_id,
-    ];
+    let identities = [config.outcome_key_id, config.scope_id];
     if identities.iter().any(Uuid::is_nil) {
-        bail!("outcome key and scope UUIDs must be non-nil");
+        bail!("outcome key ID and scope_id must be non-nil");
     }
     if identities.into_iter().collect::<HashSet<_>>().len() != identities.len() {
-        bail!("outcome key and scope UUIDs must be pairwise distinct");
+        bail!("outcome key ID and scope_id must differ");
     }
     configured_traffic_keys(&config.traffic_keys)?;
     if let Some(route) = &config.route {
-        route.validate(config.max_in_flight)?;
+        route.validate_common(config.max_in_flight)?;
     }
     for store in [
         &config.stores.capture,
@@ -2077,16 +2263,14 @@ fn validate_config_identity(config: &FileConfig) -> Result<()> {
             ObjectStoreConfig::Local { root } => {
                 records::validate_local_store_identity(root)?;
             }
-            ObjectStoreConfig::CloudflareR2 { account_id, bucket } => {
-                records::validate_cloudflare_r2_identity(account_id, bucket)?;
+            ObjectStoreConfig::S3 {
+                endpoint,
+                region,
+                bucket,
+            } => {
+                records::validate_s3_identity(endpoint, region, bucket)?;
             }
         }
-    }
-    if config.stores.capture == config.stores.control
-        || config.stores.capture == config.stores.routes
-        || config.stores.control == config.stores.routes
-    {
-        bail!("capture, control, and route stores must have distinct identities");
     }
     Ok(())
 }
@@ -2094,8 +2278,8 @@ fn validate_config_identity(config: &FileConfig) -> Result<()> {
 fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -> Result<()> {
     match command.unwrap_or(&Command::Serve) {
         Command::Serve => {
-            parse_openai_compatible_endpoint(
-                &config.baseline.chat_completions_url,
+            parse_openai_compatible_api_base_url(
+                &config.baseline.api_base_url,
                 config.baseline.allow_loopback_http,
             )?;
         }
@@ -2112,9 +2296,13 @@ fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -
         | Command::IngestStudentBranchExecution { .. }
         | Command::IngestStudentWinnerDeploymentResult { .. }
         | Command::IngestProviderTeardownResult { .. }
-        | Command::AdvanceWinnerRoute { .. }
-        | Command::PrepareRoute { .. }
+        | Command::PrepareRouteProposal { .. }
         | Command::PublishRoute { .. } => {}
+        Command::AdvanceWinnerRoute { .. } | Command::PrepareRoute { .. } => config
+            .route
+            .as_ref()
+            .context("student route operation requires route configuration")?
+            .validate(config.max_in_flight)?,
     }
     Ok(())
 }
@@ -2131,23 +2319,26 @@ fn validate_teacher_config(config: &FileConfig) -> Result<()> {
         &teacher.student_branch_runtime_image_reference,
     )?;
     snapshot_analyzer_config(config, None)?;
-    if let Some(route) = &config.route
-        && route.authorized_student_branch_runtime_image_reference
-            != teacher.student_branch_runtime_image_reference
-    {
-        bail!("student branch runtime image must equal the route-authorized runtime image");
+    if let Some(route) = &config.route {
+        route.validate_common(config.max_in_flight)?;
+        if route.has_winner_deployment_authority() {
+            if route
+                .authorized_student_branch_runtime_image_reference
+                .as_deref()
+                != Some(teacher.student_branch_runtime_image_reference.as_str())
+            {
+                bail!("student branch runtime image must equal the route-authorized runtime image");
+            }
+            route.validate(config.max_in_flight)?;
+        }
     }
     if teacher.authorization_not_after.nanosecond() != 0 {
         bail!("teacher authorization expiry must use whole seconds");
     }
-    if !matches!(
-        config.stores.capture,
-        ObjectStoreConfig::CloudflareR2 { .. }
-    ) || !matches!(
-        config.stores.control,
-        ObjectStoreConfig::CloudflareR2 { .. }
-    ) {
-        bail!("GPU teacher jobs require shared R2 storage");
+    if !matches!(config.stores.capture, ObjectStoreConfig::S3 { .. })
+        || !matches!(config.stores.control, ObjectStoreConfig::S3 { .. })
+    {
+        bail!("GPU teacher jobs require shared S3-compatible storage");
     }
     Ok(())
 }
@@ -2192,6 +2383,40 @@ fn parse_openai_compatible_endpoint(value: &str, allow_loopback_http: bool) -> R
         );
     }
     Ok(endpoint)
+}
+
+fn parse_openai_compatible_api_base_url(value: &str, allow_loopback_http: bool) -> Result<Url> {
+    if value.is_empty() || value.len() > 2_048 {
+        bail!("OpenAI-compatible API base URL must contain 1..=2048 bytes");
+    }
+    let base = Url::parse(value).context("OpenAI-compatible API base URL is not a valid URL")?;
+    let loopback_http = allow_loopback_http
+        && base.scheme() == "http"
+        && base.path() == "/v1/"
+        && match base.host() {
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            _ => false,
+        };
+    if base.as_str() != value
+        || (base.scheme() != "https" && !loopback_http)
+        || !base.path().ends_with("/v1/")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        bail!(
+            "OpenAI-compatible API base URL must be canonical credential-free HTTPS ending in /v1/, or explicitly enabled literal-loopback HTTP at /v1/"
+        );
+    }
+    Ok(base)
+}
+
+fn api_endpoint_url(base: &Url, endpoint: RouteEndpoint) -> Result<Url> {
+    base.join(endpoint.relative_path())
+        .context("OpenAI-compatible endpoint could not be derived from API base URL")
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -2805,6 +3030,7 @@ fn build_server(listener: TcpListener, gateway: Gateway) -> Result<actix_web::de
                 web::get().to(candidate_credential),
             )
             .route(CHAT_PATH, web::post().to(chat))
+            .route(RESPONSES_PATH, web::post().to(responses))
             .route(OUTCOME_PATH, web::post().to(outcome))
     })
     .h1_allow_half_closed(false)
@@ -2866,7 +3092,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
         return HttpResponse::BadRequest()
             .insert_header((header::CACHE_CONTROL, "no-store"))
             .json(CandidateCredentialMismatch {
-                schema_version: "dragontales.candidate-credential-check.v1",
+                schema_version: "milk.candidate-credential-check.v1",
                 state: "invalid",
             });
     };
@@ -2874,7 +3100,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
         return HttpResponse::BadRequest()
             .insert_header((header::CACHE_CONTROL, "no-store"))
             .json(CandidateCredentialMismatch {
-                schema_version: "dragontales.candidate-credential-check.v1",
+                schema_version: "milk.candidate-credential-check.v1",
                 state: "invalid",
             });
     };
@@ -2885,7 +3111,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
             return HttpResponse::BadRequest()
                 .insert_header((header::CACHE_CONTROL, "no-store"))
                 .json(CandidateCredentialMismatch {
-                    schema_version: "dragontales.candidate-credential-check.v1",
+                    schema_version: "milk.candidate-credential-check.v1",
                     state: "invalid",
                 });
         };
@@ -2898,7 +3124,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
             return HttpResponse::Conflict()
                 .insert_header((header::CACHE_CONTROL, "no-store"))
                 .json(CandidateCredentialMismatch {
-                    schema_version: "dragontales.candidate-credential-check.v1",
+                    schema_version: "milk.candidate-credential-check.v1",
                     state: "mismatch",
                 });
         }
@@ -2908,7 +3134,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
         .insert_header((CANDIDATE_API_KEY_SHA256_HEADER, expected_text))
         .insert_header((CANDIDATE_CREDENTIAL_STATE_HEADER, state))
         .json(CandidateCredentialResponse {
-            schema_version: "dragontales.candidate-credential-check.v1",
+            schema_version: "milk.candidate-credential-check.v1",
             candidate_api_key_sha256: (state == "loaded").then_some(expected_text),
             state,
         })
@@ -2928,7 +3154,7 @@ async fn outcome(
         return local_error(
             StatusCode::UNAUTHORIZED,
             trace_id,
-            "Invalid Dragontales outcome key.",
+            "Invalid Milk Carton outcome key.",
             "invalid_outcome_key",
         );
     }
@@ -2946,7 +3172,7 @@ async fn outcome(
             return local_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 trace_id,
-                "Dragontales is at its configured request limit.",
+                "Milk Carton is at its configured request limit.",
                 "gateway_over_capacity",
             );
         }
@@ -3090,14 +3316,31 @@ async fn chat(
     payload: web::Payload,
     gateway: web::Data<Gateway>,
 ) -> HttpResponse {
+    proxy_openai(RouteEndpoint::ChatCompletions, request, payload, gateway).await
+}
+
+async fn responses(
+    request: HttpRequest,
+    payload: web::Payload,
+    gateway: web::Data<Gateway>,
+) -> HttpResponse {
+    proxy_openai(RouteEndpoint::Responses, request, payload, gateway).await
+}
+
+async fn proxy_openai(
+    endpoint: RouteEndpoint,
+    request: HttpRequest,
+    payload: web::Payload,
+    gateway: web::Data<Gateway>,
+) -> HttpResponse {
     let trace_id = Uuid::now_v7();
     let Some(traffic_key) = authenticate_traffic_key(request.headers(), &gateway.traffic_keys)
     else {
         return local_error(
             StatusCode::UNAUTHORIZED,
             trace_id,
-            "Invalid Dragontales API key.",
-            "invalid_dragontales_api_key",
+            "Invalid Milk Carton API key.",
+            "invalid_milk_api_key",
         );
     };
     let occurred_at = Utc::now();
@@ -3109,7 +3352,7 @@ async fn chat(
             return local_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 trace_id,
-                "Dragontales is at its configured request limit.",
+                "Milk Carton is at its configured request limit.",
                 "gateway_over_capacity",
             );
         }
@@ -3149,16 +3392,25 @@ async fn chat(
     };
     let (content_type, has_multiple_content_types) =
         one_header(request.headers(), header::CONTENT_TYPE.as_str());
+    let request_analytics = serde_json::from_slice::<RequestAnalytics>(&body);
+    let request_parse_success = request_analytics.is_ok();
+    let requested_streaming = request_analytics
+        .as_ref()
+        .ok()
+        .and_then(|analytics| analytics.stream)
+        .unwrap_or(false);
+    let sampling = sampling_identity(&gateway, endpoint, request.headers(), &body, trace_id);
     let route_runtime = gateway.route_runtime();
     let decision = route_runtime.policy.decide(
         &RouteRequest {
+            endpoint,
             body: &body,
             content_type,
             has_multiple_content_types,
             has_content_encoding: request.headers().contains_key(header::CONTENT_ENCODING),
             has_openai_beta: request.headers().contains_key("openai-beta"),
             query: request.query_string(),
-            routing_cohort: traffic_key.cohort_id.as_bytes(),
+            routing_cohort: &sampling.hmac_sha256,
         },
         Instant::now(),
     );
@@ -3200,20 +3452,23 @@ async fn chat(
         if gateway.records.is_some() {
             let request_content_type = header_text(request.headers(), header::CONTENT_TYPE);
             let request_content_encoding = header_text(request.headers(), header::CONTENT_ENCODING);
-            let capture_eligible = capture_eligible(
-                &gateway,
-                traffic_key.capture_allowed,
-                request_content_type.as_deref(),
-                request.headers(),
-            );
-            let selected =
-                capture_eligible && capture_selected(trace_id, gateway.capture.basis_points);
+            let capture_eligible = sampling.content_capture_allowed
+                && capture_eligible(
+                    &gateway,
+                    traffic_key.capture_allowed,
+                    request_content_type.as_deref(),
+                    request.headers(),
+                );
+            let selected = capture_eligible
+                && capture_selected(&sampling.hmac_sha256, gateway.capture.basis_points);
             let request_capture = selected.then(|| body.clone());
             let catalog = TraceCatalog {
                 scope: gateway.scope.clone(),
                 trace_id,
                 occurred_at,
-                endpoint: "chat_completions".to_owned(),
+                endpoint: endpoint_name(endpoint).to_owned(),
+                request_parse_success,
+                streaming: requested_streaming,
                 route_revision: decision.route_revision.to_owned(),
                 route: route_observation,
                 provider_status: None,
@@ -3223,6 +3478,14 @@ async fn chat(
                 request_bytes: body.len() as u64,
                 response_bytes: 0,
                 sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+                sampling_unit_kind: sampling.kind,
+                sampling_unit_hmac_sha256: bytes_hex(&sampling.hmac_sha256),
+                sampling_independence: sampling.independence,
+                sampling_key_version: gateway.capture_sampling_key_version.clone(),
+                previous_response_hmac_sha256: sampling
+                    .previous_response_hmac_sha256
+                    .as_ref()
+                    .map(|digest| bytes_hex(digest)),
                 capture_basis_points: gateway.capture.basis_points,
                 capture_eligible,
                 capture_selected: selected,
@@ -3243,7 +3506,8 @@ async fn chat(
             (None, false, None, None, None)
         };
 
-    let headers = match upstream_request_headers(request.headers(), target) {
+    let baseline_headers = match upstream_request_headers(request.headers(), RouteTarget::Baseline)
+    {
         Ok(headers) => headers,
         Err(_) => {
             finish_before_headers(&gateway, catalog, started, "invalid_request_headers");
@@ -3258,34 +3522,90 @@ async fn chat(
             );
         }
     };
-    let response = match match target {
-        RouteTarget::Baseline => {
-            let mut upstream = gateway.upstream.clone();
-            if !request.query_string().is_empty() {
-                upstream.set_query(Some(request.query_string()));
+    let candidate_headers = if target == RouteTarget::Candidate {
+        match upstream_request_headers(request.headers(), RouteTarget::Candidate) {
+            Ok(headers) => headers,
+            Err(_) => {
+                finish_before_headers(&gateway, catalog, started, "invalid_request_headers");
+                return routed_local_error(
+                    StatusCode::BAD_REQUEST,
+                    trace_id,
+                    "Request headers could not be forwarded.",
+                    "invalid_request_headers",
+                    &decision,
+                    target,
+                    candidate_route,
+                );
             }
-            gateway
-                .client
-                .post(upstream)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
+        }
+    } else {
+        baseline_headers.clone()
+    };
+    let upstream_started = Instant::now();
+    let response_result = match target {
+        RouteTarget::Baseline => {
+            send_baseline_request(
+                &gateway,
+                endpoint,
+                request.query_string(),
+                baseline_headers.clone(),
+                body.clone(),
+                upstream_started,
+            )
+            .await
         }
         RouteTarget::Candidate => {
             let candidate = candidate_route.expect("candidate decision contains route evidence");
-            route_runtime
-                .candidate
-                .as_ref()
-                .expect("active route has a candidate transport")
-                .client
-                .post(candidate.endpoint.clone())
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
+            match api_endpoint_url(candidate.endpoint, endpoint) {
+                Ok(candidate_endpoint) => {
+                    send_upstream_request(
+                        &route_runtime
+                            .candidate
+                            .as_ref()
+                            .expect("active route has a candidate transport")
+                            .client,
+                        candidate_endpoint,
+                        candidate_headers,
+                        body.clone(),
+                        upstream_started,
+                        gateway.upstream_total_timeout,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
         }
-    } {
+    };
+    let should_fallback = target == RouteTarget::Candidate
+        && match response_result.as_ref() {
+            Ok(response) => candidate_response_requires_fallback(response),
+            Err(_) => true,
+        };
+    let response_result = if should_fallback {
+        open_candidate_fuse(&route_runtime);
+        std::mem::drop(candidate_permit.take());
+        std::mem::drop(response_result);
+        target = RouteTarget::Baseline;
+        route_observation = RouteObservation::Fallback {
+            reason: RouteFallbackReason::CandidateFailure,
+        };
+        if let Some(catalog) = catalog.as_mut() {
+            catalog.route = route_observation;
+            catalog.provider_status = None;
+        }
+        send_baseline_request(
+            &gateway,
+            endpoint,
+            request.query_string(),
+            baseline_headers,
+            body,
+            upstream_started,
+        )
+        .await
+    } else {
+        response_result
+    };
+    let response = match response_result {
         Ok(response) => response,
         Err(_) => {
             if target == RouteTarget::Candidate {
@@ -3375,6 +3695,13 @@ async fn chat(
     } else {
         (None, None)
     };
+    let stream_protocol = response_content_type
+        .as_deref()
+        .filter(|content_type| is_event_stream_content_type(content_type))
+        .map(|_| endpoint);
+    if let Some(catalog) = catalog.as_mut() {
+        catalog.streaming = stream_protocol.is_some();
+    }
 
     let mut builder = HttpResponse::build(status);
     for (name, value) in response_headers {
@@ -3424,10 +3751,64 @@ async fn chat(
             record_limit: gateway.capture.record_bytes,
             selected,
             oversized: false,
+            stream_protocol,
+            stream_terminal_seen: false,
+            stream_terminal_tail: Vec::new(),
         }),
     });
     insert_route_headers(downstream.headers_mut(), &decision, target, candidate_route);
     downstream
+}
+
+async fn send_baseline_request(
+    gateway: &Gateway,
+    endpoint: RouteEndpoint,
+    query: &str,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+    started: Instant,
+) -> Result<reqwest::Response> {
+    let mut upstream = api_endpoint_url(&gateway.upstream_api_base, endpoint)?;
+    if !query.is_empty() {
+        upstream.set_query(Some(query));
+    }
+    send_upstream_request(
+        &gateway.client,
+        upstream,
+        headers,
+        body,
+        started,
+        gateway.upstream_total_timeout,
+    )
+    .await
+}
+
+async fn send_upstream_request(
+    client: &reqwest::Client,
+    endpoint: Url,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+    started: Instant,
+    total_timeout: Duration,
+) -> Result<reqwest::Response> {
+    let remaining = total_timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .context("upstream total deadline elapsed")?;
+    Ok(client
+        .post(endpoint)
+        .headers(headers)
+        .body(body)
+        .timeout(remaining)
+        .send()
+        .await?)
+}
+
+fn candidate_response_requires_fallback(response: &reqwest::Response) -> bool {
+    response.status().is_redirection()
+        || candidate_health_failure(response.status())
+        || StatusCode::from_u16(response.status().as_u16()).is_err()
+        || downstream_response_headers(response.headers(), RouteTarget::Candidate).is_err()
 }
 
 fn capture_eligible(
@@ -3449,8 +3830,134 @@ fn capture_eligible(
         })
 }
 
-fn capture_selected(trace_id: Uuid, basis_points: u16) -> bool {
-    let digest = Sha256::digest(trace_id.as_bytes());
+fn endpoint_name(endpoint: RouteEndpoint) -> &'static str {
+    match endpoint {
+        RouteEndpoint::ChatCompletions => "chat_completions",
+        RouteEndpoint::Responses => "responses",
+    }
+}
+
+fn sampling_identity(
+    gateway: &Gateway,
+    endpoint: RouteEndpoint,
+    headers: &HeaderMap,
+    body: &[u8],
+    request_id: Uuid,
+) -> SamplingIdentity {
+    let key = &gateway.capture_sampling_key;
+    let previous_response_id = (endpoint == RouteEndpoint::Responses)
+        .then(|| serde_json::from_slice::<ResponsesSessionHints<'_>>(body).ok())
+        .flatten()
+        .and_then(|hints| hints.previous_response_id.map(str::to_owned));
+    let previous_response_hmac_sha256 = previous_response_id
+        .as_deref()
+        .filter(|value| valid_sampling_identifier(value.as_bytes()))
+        .map(|value| {
+            sampling_hmac(
+                key,
+                &gateway.scope,
+                b"responses_previous_response",
+                value.as_bytes(),
+            )
+        });
+
+    let (session_id, multiple_session_ids) = one_header(headers, SESSION_ID_HEADER);
+    let session_id = (!multiple_session_ids)
+        .then_some(session_id)
+        .flatten()
+        .filter(|value| valid_sampling_identifier(value));
+    let selected = match endpoint {
+        RouteEndpoint::ChatCompletions => session_id.map(|value| {
+            (
+                SamplingUnitKind::ChatSessionHeader,
+                SamplingIndependence::Independent,
+                value.to_vec(),
+            )
+        }),
+        RouteEndpoint::Responses => serde_json::from_slice::<ResponsesSessionHints<'_>>(body)
+            .ok()
+            .and_then(|hints| hints.conversation)
+            .and_then(|raw| {
+                serde_json::from_str::<String>(raw.get()).ok().or_else(|| {
+                    serde_json::from_str::<ResponsesConversation<'_>>(raw.get())
+                        .ok()
+                        .map(|conversation| conversation.id.to_owned())
+                })
+            })
+            .filter(|value| valid_sampling_identifier(value.as_bytes()))
+            .map(|value| {
+                (
+                    SamplingUnitKind::ResponsesConversation,
+                    SamplingIndependence::Independent,
+                    value.into_bytes(),
+                )
+            })
+            .or_else(|| {
+                session_id.map(|value| {
+                    (
+                        SamplingUnitKind::ChatSessionHeader,
+                        SamplingIndependence::Independent,
+                        value.to_vec(),
+                    )
+                })
+            }),
+    };
+    let content_capture_allowed = selected.is_some() || previous_response_id.is_none();
+
+    let (kind, independence, hmac_sha256) = match selected {
+        Some((kind, independence, identifier)) => (
+            kind,
+            independence,
+            sampling_hmac(
+                key,
+                &gateway.scope,
+                sampling_kind_domain(kind),
+                identifier.as_ref(),
+            ),
+        ),
+        None => (
+            SamplingUnitKind::Request,
+            SamplingIndependence::Uncertain,
+            sampling_hmac(key, &gateway.scope, b"request", request_id.as_bytes()),
+        ),
+    };
+    SamplingIdentity {
+        kind,
+        hmac_sha256,
+        independence,
+        previous_response_hmac_sha256,
+        content_capture_allowed,
+    }
+}
+
+fn valid_sampling_identifier(value: &[u8]) -> bool {
+    (1..=1_024).contains(&value.len()) && !value.iter().any(u8::is_ascii_control)
+}
+
+fn sampling_kind_domain(kind: SamplingUnitKind) -> &'static [u8] {
+    match kind {
+        SamplingUnitKind::ChatSessionHeader => b"chat_session_header",
+        SamplingUnitKind::ResponsesConversation => b"responses_conversation",
+        SamplingUnitKind::Request => b"request",
+    }
+}
+
+fn sampling_hmac(key: &ring::hmac::Key, scope: &Scope, kind: &[u8], identifier: &[u8]) -> [u8; 32] {
+    let mut context = ring::hmac::Context::with_key(key);
+    context.update(b"milk.capture-sampling.v1\0");
+    context.update(scope.scope_id.as_bytes());
+    context.update(b"\0");
+    context.update(kind);
+    context.update(b"\0");
+    context.update(identifier);
+    context
+        .sign()
+        .as_ref()
+        .try_into()
+        .expect("HMAC-SHA256 is 32 bytes")
+}
+
+fn capture_selected(digest: &[u8; 32], basis_points: u16) -> bool {
     let sample = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"));
     capture_sample_selected(sample, basis_points)
 }
@@ -3470,6 +3977,13 @@ fn is_json_content_type(content_type: Option<&str>) -> bool {
     content_type
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn is_event_stream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 fn finish_before_headers(
@@ -3538,7 +4052,7 @@ fn valid_outcome_key(headers: &HeaderMap, expected_id: Uuid, expected_sha256: &[
     let Ok(raw) = value.to_str() else {
         return false;
     };
-    let Some(value) = raw.strip_prefix("dt_live_") else {
+    let Some(value) = raw.strip_prefix("milk_live_") else {
         return false;
     };
     let Some((key_id, secret)) = value.split_once('_') else {
@@ -3579,7 +4093,7 @@ fn authenticate_traffic_key<'a>(
 }
 
 fn valid_traffic_key(raw: &str) -> bool {
-    let Some(value) = raw.strip_prefix("dt_live_") else {
+    let Some(value) = raw.strip_prefix("milk_live_") else {
         return false;
     };
     let Some((key_id, secret)) = value.split_once('_') else {
@@ -3603,17 +4117,9 @@ fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<TrafficKey
         if !hashes.insert(sha256) {
             bail!("traffic_keys contains a duplicate API-key SHA-256");
         }
-        if !(1..=MAX_COHORT_ID_BYTES).contains(&value.cohort_id.len())
-            || !value.cohort_id.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-            })
-        {
-            bail!("traffic key cohort_id is invalid");
-        }
         configured.push(TrafficKey {
             api_key_sha256: sha256,
             capture_allowed: value.capture_allowed,
-            cohort_id: value.cohort_id.clone(),
         });
     }
     Ok(configured)
@@ -3628,7 +4134,8 @@ fn upstream_request_headers(
     for (name, value) in headers {
         let lower = name.as_str().to_ascii_lowercase();
         if stripped.contains(&lower)
-            || lower.starts_with("x-dragontales-")
+            || lower.starts_with("x-milk-")
+            || lower == SESSION_ID_HEADER
             || matches!(
                 lower.as_str(),
                 "authorization" | "openai-organization" | "openai-project"
@@ -3670,7 +4177,7 @@ fn downstream_response_headers(
     for (name, value) in headers {
         let lower = name.as_str().to_ascii_lowercase();
         if stripped.contains(&lower)
-            || lower.starts_with("x-dragontales-")
+            || lower.starts_with("x-milk-")
             || (target == RouteTarget::Candidate
                 && (lower.starts_with("openai-") || lower.starts_with("x-openai-")))
             || !allowed_downstream_response_header(&lower)
@@ -3959,9 +4466,17 @@ mod cli_tests {
         }
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/dragontales-config.example.json"
+            "/../../deploy/milk-carton-config.example.json"
         ))
-        .replace("/var/lib/dragontales", directory.to_str().unwrap())
+        .replace("/var/lib/milk-carton", directory.to_str().unwrap())
+    }
+
+    fn s3_store(bucket: &str) -> ObjectStoreConfig {
+        ObjectStoreConfig::S3 {
+            endpoint: "https://example.r2.cloudflarestorage.com".to_owned(),
+            region: "auto".to_owned(),
+            bucket: bucket.to_owned(),
+        }
     }
 
     #[test]
@@ -3979,6 +4494,7 @@ mod cli_tests {
             "ingest-student-branch-execution",
             "advance-winner-route",
             "prepare-route",
+            "prepare-route-proposal",
             "publish-route",
         ] {
             assert!(!help.contains(hidden), "hidden command leaked: {hidden}");
@@ -3991,13 +4507,9 @@ mod cli_tests {
     #[test]
     fn removed_commands_are_rejected() {
         for removed in REMOVED_COMMANDS {
-            let error = Cli::try_parse_from([
-                "dragontales-gateway",
-                "--config",
-                "/tmp/config.json",
-                removed,
-            ])
-            .unwrap_err();
+            let error =
+                Cli::try_parse_from(["milk-carton", "--config", "/tmp/config.json", removed])
+                    .unwrap_err();
             assert_eq!(
                 error.kind(),
                 ErrorKind::InvalidSubcommand,
@@ -4008,11 +4520,11 @@ mod cli_tests {
 
     #[test]
     fn retained_commands_parse_with_exact_inputs() {
-        let inline_serve = Cli::try_parse_from(["dragontales-gateway", "serve"]).unwrap();
+        let inline_serve = Cli::try_parse_from(["milk-carton", "serve"]).unwrap();
         assert!(inline_serve.config.is_none());
         assert!(matches!(inline_serve.command, Some(Command::Serve)));
 
-        let prefix = ["dragontales-gateway", "--config", "/tmp/config.json"];
+        let prefix = ["milk-carton", "--config", "/tmp/config.json"];
         assert!(matches!(
             Cli::try_parse_from([prefix[0], prefix[1], prefix[2], "serve"])
                 .unwrap()
@@ -4047,7 +4559,7 @@ mod cli_tests {
                 "--student-job-id",
                 &"a".repeat(64),
                 "--stage-dir",
-                "/run/dragontales/job",
+                "/run/milk-carton/job",
             ])
             .unwrap()
             .command,
@@ -4062,7 +4574,7 @@ mod cli_tests {
                 "--student-job-id",
                 &"b".repeat(64),
                 "--stage-dir",
-                "/run/dragontales/winner",
+                "/run/milk-carton/winner",
             ])
             .unwrap()
             .command,
@@ -4075,11 +4587,11 @@ mod cli_tests {
                 prefix[2],
                 "ingest-student-train-execution",
                 "--result",
-                "/run/dragontales/train-result.json",
+                "/run/milk-carton/train-result.json",
                 "--upload",
-                "/run/dragontales/upload.json",
+                "/run/milk-carton/upload.json",
                 "--artifact-dir",
-                "/run/dragontales/artifacts",
+                "/run/milk-carton/artifacts",
             ])
             .unwrap()
             .command,
@@ -4096,7 +4608,7 @@ mod cli_tests {
                 "--variant",
                 "static_fp8",
                 "--stage-dir",
-                "/run/dragontales/branch",
+                "/run/milk-carton/branch",
             ])
             .unwrap()
             .command,
@@ -4109,11 +4621,11 @@ mod cli_tests {
                 prefix[2],
                 "ingest-student-branch-execution",
                 "--result",
-                "/run/dragontales/branch-result.json",
+                "/run/milk-carton/branch-result.json",
                 "--upload",
-                "/run/dragontales/upload.json",
+                "/run/milk-carton/upload.json",
                 "--artifact-dir",
-                "/run/dragontales/artifacts",
+                "/run/milk-carton/artifacts",
             ])
             .unwrap()
             .command,
@@ -4126,7 +4638,7 @@ mod cli_tests {
                 prefix[2],
                 "ingest-student-winner-deployment-result",
                 "--result",
-                "/run/dragontales/winner-deployment-result.json",
+                "/run/milk-carton/winner-deployment-result.json",
             ])
             .unwrap()
             .command,
@@ -4139,7 +4651,7 @@ mod cli_tests {
                 prefix[2],
                 "ingest-provider-teardown-result",
                 "--result",
-                "/run/dragontales/provider-teardown-result.json",
+                "/run/milk-carton/provider-teardown-result.json",
             ])
             .unwrap()
             .command,
@@ -4156,7 +4668,7 @@ mod cli_tests {
                 "--phase",
                 "canary",
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
             ])
             .unwrap()
             .command,
@@ -4174,7 +4686,7 @@ mod cli_tests {
                 "--student-job-id",
                 &"c".repeat(64),
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
             ])
             .unwrap()
             .command,
@@ -4185,9 +4697,24 @@ mod cli_tests {
                 prefix[0],
                 prefix[1],
                 prefix[2],
+                "prepare-route-proposal",
+                "--proposal",
+                "/run/milk-carton/route-proposal.json",
+                "--manifest",
+                "/run/milk-carton/route.json",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::PrepareRouteProposal { .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                prefix[0],
+                prefix[1],
+                prefix[2],
                 "publish-route",
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
                 "--check-only",
             ])
             .unwrap()
@@ -4202,7 +4729,7 @@ mod cli_tests {
     #[test]
     fn winner_route_advance_output_is_strict_and_content_free() {
         let output = WinnerRouteAdvanceWrite {
-            schema_version: "dragontales.winner-route-advance.v1",
+            schema_version: "milk.winner-route-advance.v1",
             action: WinnerRouteAdvanceAction::Observe,
             route_revision: "a".repeat(64),
             not_after: "2026-08-25T12:15:00Z".parse().unwrap(),
@@ -4210,7 +4737,7 @@ mod cli_tests {
         assert_eq!(
             serde_json::to_string(&output).unwrap(),
             format!(
-                r#"{{"schema_version":"dragontales.winner-route-advance.v1","action":"observe","route_revision":"{}","not_after":"2026-08-25T12:15:00Z"}}"#,
+                r#"{{"schema_version":"milk.winner-route-advance.v1","action":"observe","route_revision":"{}","not_after":"2026-08-25T12:15:00Z"}}"#,
                 "a".repeat(64)
             )
         );
@@ -4219,7 +4746,7 @@ mod cli_tests {
     #[test]
     fn route_publication_is_strictly_two_phase() {
         let base = [
-            "dragontales-gateway",
+            "milk-carton",
             "--config",
             "/tmp/config.json",
             "publish-route",
@@ -4314,6 +4841,17 @@ mod cli_tests {
             }
         );
         assert_eq!(
+            StoreAccessPlan::for_command(&Command::PrepareRouteProposal {
+                proposal: "/tmp/proposal".into(),
+                manifest: "/tmp/manifest".into(),
+            }),
+            StoreAccessPlan {
+                capture: None,
+                control: None,
+                routes: Some(ReadOnly),
+            }
+        );
+        assert_eq!(
             StoreAccessPlan::for_command(&Command::PublishRoute {
                 manifest: "/tmp/manifest".into(),
                 signature: Some("/tmp/signature".into()),
@@ -4350,6 +4888,47 @@ mod cli_tests {
     }
 
     #[test]
+    fn one_s3_bucket_can_back_all_store_roles() {
+        let mut config: FileConfig = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/milk-carton-config.example.json"
+        )))
+        .unwrap();
+        let shared = s3_store("milk-pilot-test");
+        config.stores = StoresConfig {
+            capture: shared.clone(),
+            control: shared.clone(),
+            routes: shared,
+        };
+
+        validate_config_identity(&config).unwrap();
+        assert_eq!(config.stores.capture, config.stores.control);
+        assert_eq!(config.stores.control, config.stores.routes);
+    }
+
+    #[test]
+    fn s3_store_config_is_explicit() {
+        let parsed: ObjectStoreConfig = serde_json::from_str(
+            r#"{"type":"s3","endpoint":"https://objects.example.com","region":"us-east-1","bucket":"milk-test"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ObjectStoreConfig::S3 {
+                endpoint: "https://objects.example.com".to_owned(),
+                region: "us-east-1".to_owned(),
+                bucket: "milk-test".to_owned(),
+            }
+        );
+        assert!(
+            serde_json::from_str::<ObjectStoreConfig>(
+                r#"{"type":"cloudflare_r2","account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucket":"milk-test"}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn serve_opens_capture_and_routes_without_control_credentials() {
         let _lock = STORE_ENVIRONMENT_LOCK.lock().unwrap();
         let _restore = EnvironmentRestore::set(&[
@@ -4368,22 +4947,13 @@ mod cli_tests {
         ]);
         let mut config: FileConfig = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/dragontales-config.example.json"
+            "/../../deploy/milk-carton-config.example.json"
         )))
         .unwrap();
         config.stores = StoresConfig {
-            capture: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "milk-capture-test".to_owned(),
-            },
-            control: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "milk-control-test".to_owned(),
-            },
-            routes: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "milk-routes-test".to_owned(),
-            },
+            capture: s3_store("milk-capture-test"),
+            control: s3_store("milk-control-test"),
+            routes: s3_store("milk-routes-test"),
         };
         let plan = StoreAccessPlan::for_command(&Command::Serve);
         assert_eq!(plan.control, None);
@@ -4399,7 +4969,7 @@ mod cli_tests {
     fn inline_config_is_bounded_exclusive_and_serve_only() {
         let directory = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("dragontales-inline-config-test-{}", Uuid::now_v7()));
+            .join(format!("milk-carton-inline-config-test-{}", Uuid::now_v7()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&directory)
@@ -4464,14 +5034,14 @@ mod cli_tests {
             load_selected_config(None, Some(unknown.as_bytes()), Some(&Command::Serve))
                 .unwrap_err()
                 .to_string()
-                .contains("invalid DRAGONTALES_CONFIG_JSON")
+                .contains("invalid MILK_CARTON_CONFIG_JSON")
         );
         let legacy = config_json.replacen("\"stores\"", "\"object_store\"", 1);
         assert!(
             load_selected_config(None, Some(legacy.as_bytes()), Some(&Command::Serve))
                 .unwrap_err()
                 .to_string()
-                .contains("invalid DRAGONTALES_CONFIG_JSON")
+                .contains("invalid MILK_CARTON_CONFIG_JSON")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -4480,7 +5050,7 @@ mod cli_tests {
     fn local_serve_and_operator_commands_load_private_config() {
         let directory = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("dragontales-local-config-test-{}", Uuid::now_v7()));
+            .join(format!("milk-carton-local-config-test-{}", Uuid::now_v7()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&directory)
@@ -4511,10 +5081,7 @@ mod cli_tests {
         assert!(validate_serve_config_owner(&config, InputOwner::CurrentPrivate).is_err());
         validate_serve_config_owner(&config, InputOwner::RootDeployment).unwrap();
         config.listen = "127.0.0.1:8080".parse().unwrap();
-        config.stores.capture = ObjectStoreConfig::CloudflareR2 {
-            account_id: "a".repeat(32),
-            bucket: "dragontales-test".to_owned(),
-        };
+        config.stores.capture = s3_store("milk-carton-test");
         assert!(validate_serve_config_owner(&config, InputOwner::CurrentPrivate).is_err());
         validate_serve_config_owner(&config, InputOwner::RootDeployment).unwrap();
 
@@ -4524,7 +5091,7 @@ mod cli_tests {
     #[test]
     fn operator_input_rejects_unsafe_files_and_detects_rewrites() {
         let directory = std::env::temp_dir().join(format!(
-            "dragontales-operator-input-test-{}",
+            "milk-carton-operator-input-test-{}",
             Uuid::now_v7()
         ));
         fs::create_dir(&directory).unwrap();
@@ -4555,7 +5122,7 @@ mod cli_tests {
     #[test]
     fn private_output_is_create_only_and_exactly_0400() {
         let directory = std::env::temp_dir().join(format!(
-            "dragontales-private-output-test-{}",
+            "milk-carton-private-output-test-{}",
             Uuid::now_v7()
         ));
         fs::create_dir(&directory).unwrap();

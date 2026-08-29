@@ -29,7 +29,7 @@ async function within(promise, label) {
 
 const clientOptions = {
   apiKey:
-    "dt_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001",
+    "milk_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001",
   baseURL: `${gatewayURL}/v1`,
   maxRetries: 0,
   timeout: 2_000,
@@ -118,6 +118,42 @@ for (;;) {
 }
 assert.equal(streamText, "hello");
 
+const responsesRequest = {
+  model: "sdk-responses-nonstream",
+  input: [
+    {
+      role: "user",
+      content: [{ type: "input_text", text: "Return a Responses result." }],
+    },
+  ],
+  metadata: { smoke: "official-node-sdk" },
+  safety_identifier: "sdk-smoke-user",
+  unknown_extension: { keep: true },
+};
+const responsesResult = await client.responses.create(responsesRequest);
+assert.equal(responsesResult.output_text, "responses-ok");
+
+const responsesStreamRequest = {
+  model: "sdk-responses-stream",
+  input: "Stream a Responses result.",
+  stream: true,
+  unknown_extension: { keep: true },
+};
+const responsesStream = await client.responses.create(responsesStreamRequest);
+let responsesStreamText = "";
+let responsesStreamTerminal;
+for await (const event of responsesStream) {
+  if (event.type === "response.output_text.delta") {
+    responsesStreamText += event.delta;
+  }
+  if (event.type === "response.completed") {
+    responsesStreamTerminal = event.type;
+    assert.equal(event.response.status, "completed");
+  }
+}
+assert.equal(responsesStreamText, "responses-stream-ok");
+assert.equal(responsesStreamTerminal, "response.completed");
+
 const unkeyed = new OpenAI({ ...clientOptions, apiKey: "wrong" });
 let missingKeyStatus;
 await assert.rejects(
@@ -127,7 +163,7 @@ await assert.rejects(
   }),
   (error) => {
     assert.ok(error instanceof OpenAI.AuthenticationError);
-    assert.equal(error.code, "invalid_dragontales_api_key");
+    assert.equal(error.code, "invalid_milk_api_key");
     missingKeyStatus = error.status;
     return true;
   },
@@ -174,6 +210,11 @@ console.log(
     multimodal_request: JSON.stringify(multimodalRequest),
     multimodal_content: multimodal.choices[0]?.message.content,
     nonstream_content: completion.choices[0]?.message.content,
+    responses_nonstream_text: responsesResult.output_text,
+    responses_request: JSON.stringify(responsesRequest),
+    responses_stream_request: JSON.stringify(responsesStreamRequest),
+    responses_stream_terminal: responsesStreamTerminal,
+    responses_stream_text: responsesStreamText,
     stream_text: streamText,
     missing_key_status: missingKeyStatus,
     rate_limit_status: rateLimitStatus,

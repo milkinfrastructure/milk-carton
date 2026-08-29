@@ -3,8 +3,8 @@
 !Cargo.lock
 !LICENSE
 !crates/
-!crates/dragontales-gateway/
-!crates/dragontales-gateway/**
+!crates/milk-carton/
+!crates/milk-carton/**
 !deploy/
 !deploy/cloudflare/
 !deploy/cloudflare/Dockerfile

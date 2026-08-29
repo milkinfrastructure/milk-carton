@@ -13,12 +13,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "tools/manage-candidate-credential.py"
+ADMIN_URL = "https://carton.example/__milk/candidate-credential"
 ACCOUNT = "a" * 32
 APPLICATION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 PREVIOUS_WORKER = "11111111-1111-1111-1111-111111111111"
 INSTALLED_WORKER = "22222222-2222-2222-2222-222222222222"
 REMOVED_WORKER = "33333333-3333-3333-3333-333333333333"
-IMAGE = f"registry.cloudflare.com/{ACCOUNT}/milk-gateway:sha256-admitted"
+IMAGE = f"registry.cloudflare.com/{ACCOUNT}/milk-carton:sha256-admitted"
 ADMIN_KEY = "milk_admin_" + "A" * 48
 CANDIDATE_KEY = "bt_candidate_test_secret_123456789"
 CANDIDATE_SHA = hashlib.sha256(CANDIDATE_KEY.encode()).hexdigest()
@@ -66,7 +67,7 @@ def verify_request(frame=None):
 
 def route_receipt(revision, basis_points, previous_revision=None):
     return {
-        "schema_version": "dragontales.route-publication-receipt.v2",
+        "schema_version": "milk.route-publication-receipt.v2",
         "route_revision": revision,
         "student_job_id": "1" * 64,
         "student_result_sha256": "5" * 64,
@@ -76,7 +77,7 @@ def route_receipt(revision, basis_points, previous_revision=None):
         "candidate_basis_points": basis_points,
         "manifest_object_key": "routes/manifest.json",
         "signature_object_key": "routes/signature.json",
-        "live_pointer_object_key": "routes/live.json",
+        "live_pointer_object_key": "routes/current.json",
         "state": "published",
     }
 
@@ -87,7 +88,7 @@ def remove_request(installed_ack, trigger=None):
         "service_not_after": "2026-08-27T20:00:00Z",
     }
     authorization = {
-        "schema_version": "dragontales.provider-teardown-authorization.v1",
+        "schema_version": "milk.provider-teardown-authorization.v1",
         "scope": {
             "tenant_id": "10000000-0000-0000-0000-000000000001",
             "project_id": "20000000-0000-0000-0000-000000000002",
@@ -164,16 +165,16 @@ if name == "wrangler":
         print(json.dumps({
             "account_id": state["account"], "configuration": {"image": state["image"]},
             "id": state["application"], "jobs": False,
-            "name": "dragontales-gateway-dragontalesgateway", "version": state["application_version"],
+            "name": "milk-carton-milkcarton", "version": state["application_version"],
         }))
     elif args[:2] == ["containers", "instances"]:
         print(json.dumps([{"id": "gateway", "state": "running", "version": state["application_version"]}]))
     elif args[:2] == ["secret", "list"]:
-        values = [{"name": "DRAGONTALES_CONTAINER_ADMIN_KEY", "type": "secret_text"}]
+        values = [{"name": "MILK_CARTON_CONTAINER_ADMIN_KEY", "type": "secret_text"}]
         if state["candidate_installed"]:
-            values.append({"name": "DRAGONTALES_CANDIDATE_API_KEY", "type": "secret_text"})
+            values.append({"name": "MILK_CARTON_CANDIDATE_API_KEY", "type": "secret_text"})
         print(json.dumps(values))
-    elif args[:3] == ["secret", "put", "DRAGONTALES_CANDIDATE_API_KEY"]:
+    elif args[:3] == ["secret", "put", "MILK_CARTON_CANDIDATE_API_KEY"]:
         candidate = sys.stdin.buffer.read().removesuffix(b"\n")
         if hashlib.sha256(candidate).hexdigest() != state["candidate_sha256"]:
             done(93)
@@ -196,7 +197,7 @@ if name == "wrangler":
             while not release.exists():
                 import time
                 time.sleep(0.01)
-    elif args[:3] == ["secret", "delete", "DRAGONTALES_CANDIDATE_API_KEY"]:
+    elif args[:3] == ["secret", "delete", "MILK_CARTON_CANDIDATE_API_KEY"]:
         if not state["candidate_installed"]:
             done(96)
         if state["mode"] == "delete_fail_once" and not state.get("delete_failed"):
@@ -217,7 +218,7 @@ if name == "curl":
         done(94)
     if hashlib.sha256(authorization[len(prefix):-1]).hexdigest() != state["admin_sha256"]:
         done(95)
-    expected = next(value.split(": ", 1)[1] for value in args if value.startswith("x-dragontales-candidate-api-key-sha256: "))
+    expected = next(value.split(": ", 1)[1] for value in args if value.startswith("x-milk-candidate-api-key-sha256: "))
     operation = next(value.split(": ", 1)[1] for value in args if value.startswith("x-milk-candidate-operation: "))
     if state["mode"] == "restart_fail_once" and not state.get("restart_failed"):
         state["restart_failed"] = True
@@ -320,6 +321,7 @@ class Fixture:
                 "serve-baseten",
                 "--socket-path", str(socket_path),
                 "--admin-key-fd", str(read_descriptor),
+                "--admin-url", ADMIN_URL,
                 "--application-id", APPLICATION,
                 "--expected-application-version", "7",
                 "--expected-container-image", IMAGE,

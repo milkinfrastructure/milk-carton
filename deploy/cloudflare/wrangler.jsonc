@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "dragontales-gateway",
+  "name": "milk-carton",
   "main": ".milk-private-deploy-script-required",
   "compatibility_date": "2026-08-26",
   "compatibility_flags": ["nodejs_compat"],
@@ -8,14 +8,14 @@
   "preview_urls": false,
   "routes": [
     {
-      "pattern": "api.dragontales.milkinfrastructure.com",
+      "pattern": "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED",
       "custom_domain": true
     }
   ],
   "containers": [
     {
-      "class_name": "DragontalesGateway",
-      "image": "MILK_PRIVATE_GATEWAY_ADMITTED_IMAGE_REQUIRED",
+      "class_name": "MilkCarton",
+      "image": "MILK_CARTON_ADMITTED_IMAGE_REQUIRED",
       "instance_type": "lite",
       "max_instances": 1
     }
@@ -23,15 +23,15 @@
   "durable_objects": {
     "bindings": [
       {
-        "name": "DRAGONTALES_GATEWAY",
-        "class_name": "DragontalesGateway"
+        "name": "MILK_CARTON",
+        "class_name": "MilkCarton"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["DragontalesGateway"]
+      "new_sqlite_classes": ["MilkCarton"]
     }
   ],
   "observability": {
@@ -39,9 +39,11 @@
   },
   "secrets": {
     "required": [
-      "DRAGONTALES_CONFIG_JSON",
-      "DRAGONTALES_CONTAINER_ADMIN_KEY",
-      "DRAGONTALES_OPENAI_API_KEY",
+      "MILK_CARTON_CONFIG_JSON",
+      "MILK_CARTON_CONTAINER_ADMIN_KEY",
+      "MILK_CARTON_OPENAI_API_KEY",
+      "MILK_CAPTURE_SAMPLING_KEY_HEX",
+      "MILK_CAPTURE_SAMPLING_KEY_VERSION",
       "MILK_CAPTURE_STORE_ACCESS_KEY_ID",
       "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY",
       "MILK_ROUTE_STORE_ACCESS_KEY_ID",

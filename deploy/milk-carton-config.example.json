@@ -3,17 +3,12 @@
   "traffic_keys": [
     {
       "api_key_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "capture_allowed": true,
-      "cohort_id": "production-cohort-v1"
+      "capture_allowed": true
     }
   ],
   "outcome_key_id": "00000000-0000-4000-8000-000000000002",
   "outcome_key_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-  "tenant_id": "00000000-0000-4000-8000-000000000010",
-  "project_id": "00000000-0000-4000-8000-000000000011",
-  "environment_id": "00000000-0000-4000-8000-000000000012",
-  "workload_id": "00000000-0000-4000-8000-000000000013",
-  "eval_id": "2222222222222222222222222222222222222222222222222222222222222222",
+  "scope_id": "00000000-0000-4000-8000-000000000010",
   "max_request_bytes": 8388608,
   "max_in_flight": 4,
   "max_outcomes_in_flight": 2,
@@ -38,19 +33,19 @@
   "stores": {
     "capture": {
       "type": "local",
-      "root": "/var/lib/dragontales/capture"
+      "root": "/var/lib/milk-carton/capture"
     },
     "control": {
       "type": "local",
-      "root": "/var/lib/dragontales/control"
+      "root": "/var/lib/milk-carton/control"
     },
     "routes": {
       "type": "local",
-      "root": "/var/lib/dragontales/routes"
+      "root": "/var/lib/milk-carton/routes"
     }
   },
   "baseline": {
-    "chat_completions_url": "https://api.openai.com/v1/chat/completions",
+    "api_base_url": "https://api.openai.com/v1/",
     "allow_loopback_http": false
   },
   "route": null
