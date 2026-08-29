@@ -107,6 +107,8 @@ enum Command {
     },
     Status,
     #[command(hide = true)]
+    GenerationStatus,
+    #[command(hide = true)]
     BeginTeacherRun {
         #[arg(long)]
         teacher_run_id: String,
@@ -320,6 +322,11 @@ impl StoreAccessPlan {
                 capture: Some(ReadOnly),
                 control: Some(ReadOnly),
                 routes: Some(ReadOnly),
+            },
+            Command::GenerationStatus => Self {
+                capture: Some(ReadOnly),
+                control: Some(ReadOnly),
+                ..Self::default()
             },
             Command::BeginTeacherRun { .. } | Command::TerminalizeTeacherRun { .. } => Self {
                 control: Some(ReadWrite),
@@ -808,6 +815,16 @@ struct StatusWrite {
     route: RouteStatusWrite,
 }
 
+#[derive(Serialize)]
+struct GenerationStatusWrite<'a> {
+    schema_version: &'static str,
+    eval_id: &'a str,
+    max_decisions: u32,
+    claimed_decisions: u32,
+    remaining_decisions: u32,
+    generation_done: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OutcomeRequest {
@@ -1091,6 +1108,10 @@ async fn main() -> Result<()> {
         }
         Command::Status => {
             println!("{}", status_once(&config, Utc::now()).await?);
+            Ok(())
+        }
+        Command::GenerationStatus => {
+            println!("{}", generation_status_once(&config, Utc::now()).await?);
             Ok(())
         }
         Command::BeginTeacherRun { teacher_run_id } => {
@@ -1783,6 +1804,29 @@ async fn status_once(config: &FileConfig, now: DateTime<Utc>) -> Result<String> 
     })?)
 }
 
+async fn generation_status_once(config: &FileConfig, now: DateTime<Utc>) -> Result<String> {
+    let records = start_records_with_timeout(
+        config,
+        StoreAccessPlan::for_command(&Command::GenerationStatus),
+        false,
+    )
+    .await?;
+    let provider_binding = snapshot_provider_binding(config)?;
+    let max_decisions = teacher_config(config)?.max_decisions;
+    let status = records
+        .status(&config_scope(config), &provider_binding, max_decisions, now)
+        .await?;
+    let generation = status.generation;
+    Ok(serde_json::to_string(&GenerationStatusWrite {
+        schema_version: "dragontales.generation-status.v1",
+        eval_id: &config.eval_id,
+        max_decisions: generation.max_decisions,
+        claimed_decisions: generation.claimed_decisions,
+        remaining_decisions: generation.remaining_decisions,
+        generation_done: generation.remaining_decisions == 0,
+    })?)
+}
+
 async fn route_status(
     config: &FileConfig,
     records: &Records,
@@ -2176,6 +2220,7 @@ fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -
         }
         Command::Tick { .. }
         | Command::Status
+        | Command::GenerationStatus
         | Command::BeginTeacherRun { .. }
         | Command::ExecuteTeacherRun { .. }
         | Command::TerminalizeTeacherRun { .. } => validate_teacher_config(config)?,
@@ -4045,6 +4090,7 @@ mod cli_tests {
         assert!(help.contains("\n  tick"));
         assert!(help.contains("\n  status"));
         for hidden in [
+            "generation-status",
             "materialize-student-job",
             "materialize-student-winner",
             "ingest-student-train-execution",
@@ -4106,6 +4152,12 @@ mod cli_tests {
                 .unwrap()
                 .command,
             Some(Command::Status)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([prefix[0], prefix[1], prefix[2], "generation-status"])
+                .unwrap()
+                .command,
+            Some(Command::GenerationStatus)
         ));
         assert!(matches!(
             Cli::try_parse_from([
@@ -4363,6 +4415,9 @@ mod cli_tests {
         assert!(!command_uses_deployment_config(Some(&Command::Tick {
             once: true,
         })));
+        assert!(!command_uses_deployment_config(Some(
+            &Command::GenerationStatus
+        )));
     }
 
     #[test]
@@ -4390,6 +4445,14 @@ mod cli_tests {
                 capture: Some(ReadOnly),
                 control: Some(ReadOnly),
                 routes: Some(ReadOnly),
+            }
+        );
+        assert_eq!(
+            StoreAccessPlan::for_command(&Command::GenerationStatus),
+            StoreAccessPlan {
+                capture: Some(ReadOnly),
+                control: Some(ReadOnly),
+                routes: None,
             }
         );
         assert_eq!(

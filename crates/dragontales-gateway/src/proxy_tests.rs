@@ -31,9 +31,9 @@ use super::{
     OpenAiCompatibleEndpoint, OutcomeKind, StoreAccessPlan, StoresConfig, TeacherConfig,
     TraceRecorder, TrafficKeyConfig, authenticate_traffic_key, build_route_runtime, build_server,
     candidate_health_failure, capture_sample_selected, config_scope, configured_traffic_keys,
-    decode_lowercase_sha256, is_json_content_type, parse_openai_compatible_endpoint, start_records,
-    start_records_with_timeout, status_once, tick_once_with_records, validate_config_identity,
-    validate_teacher_config,
+    decode_lowercase_sha256, generation_status_once, is_json_content_type,
+    parse_openai_compatible_endpoint, start_records, start_records_with_timeout, status_once,
+    tick_once_with_records, validate_config_identity, validate_teacher_config,
 };
 use crate::records::{
     CAPTURE_SAMPLER_ID, Records, RouteBlockReason, RouteObservation, Scope,
@@ -477,6 +477,40 @@ async fn status_contract_exposes_eval_teacher_decision_limit() {
     assert_eq!(status.records.generation.max_decisions, 7);
     assert_eq!(status.records.generation.claimed_decisions, 0);
     assert_eq!(status.records.generation.remaining_decisions, 7);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[actix_web::test]
+async fn generation_status_is_content_free_and_eval_bound() {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GenerationStatusContract {
+        schema_version: String,
+        eval_id: String,
+        max_decisions: u32,
+        claimed_decisions: u32,
+        remaining_decisions: u32,
+        generation_done: bool,
+    }
+
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("dragontales-generation-status-{}", Uuid::now_v7()));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let mut config = config(4_096, 1);
+    config.stores = local_stores(&root);
+    config.teacher.as_mut().unwrap().max_decisions = 7;
+
+    let raw = generation_status_once(&config, Utc::now().with_nanosecond(0).unwrap())
+        .await
+        .unwrap();
+    let status: GenerationStatusContract = serde_json::from_str(&raw).unwrap();
+    assert_eq!(status.schema_version, "dragontales.generation-status.v1");
+    assert_eq!(status.eval_id, config.eval_id);
+    assert_eq!(status.max_decisions, 7);
+    assert_eq!(status.claimed_decisions, 0);
+    assert_eq!(status.remaining_decisions, 7);
+    assert!(!status.generation_done);
     fs::remove_dir_all(root).unwrap();
 }
 
