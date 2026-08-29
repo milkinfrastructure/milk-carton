@@ -63,6 +63,14 @@ fn local_stores(root: &Path) -> StoresConfig {
     }
 }
 
+fn s3_store(bucket: &str) -> ObjectStoreConfig {
+    ObjectStoreConfig::S3 {
+        endpoint: "https://example.r2.cloudflarestorage.com".to_owned(),
+        region: "auto".to_owned(),
+        bucket: bucket.to_owned(),
+    }
+}
+
 #[test]
 fn digest_requires_exact_lowercase_hex() {
     assert!(decode_lowercase_sha256(&"a".repeat(64)).is_ok());
@@ -302,7 +310,7 @@ fn student_runtime_images_are_immutable_and_branch_matches_route_authority() {
 }
 
 #[test]
-fn gpu_teacher_file_config_requires_shared_r2_storage() {
+fn gpu_teacher_file_config_requires_shared_s3_storage() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!("dragontales-gpu-local-{}", Uuid::now_v7()));
@@ -322,14 +330,8 @@ fn gpu_teacher_file_config_requires_shared_r2_storage() {
     };
     gpu.stores = local_stores(&root);
     assert!(validate_teacher_config(&gpu).is_err());
-    gpu.stores.capture = ObjectStoreConfig::CloudflareR2 {
-        account_id: "a".repeat(32),
-        bucket: "test-capture".to_owned(),
-    };
-    gpu.stores.control = ObjectStoreConfig::CloudflareR2 {
-        account_id: "a".repeat(32),
-        bucket: "test-control".to_owned(),
-    };
+    gpu.stores.capture = s3_store("test-capture");
+    gpu.stores.control = s3_store("test-control");
     gpu.teacher.as_mut().unwrap().max_decisions = 0;
     assert!(validate_teacher_config(&gpu).is_err());
     gpu.teacher.as_mut().unwrap().max_decisions = 4_097;
@@ -749,18 +751,9 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
         outcome_rights_state: "authorized".into(),
         outcome_retention_days: 1,
         stores: StoresConfig {
-            capture: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "test-capture".into(),
-            },
-            control: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "test-control".into(),
-            },
-            routes: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "test-routes".into(),
-            },
+            capture: s3_store("test-capture"),
+            control: s3_store("test-control"),
+            routes: s3_store("test-routes"),
         },
         baseline: OpenAiCompatibleEndpoint {
             api_base_url: "https://api.openai.com/v1/".into(),

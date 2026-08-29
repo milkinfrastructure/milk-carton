@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11758,24 +11759,25 @@ pub(crate) fn validate_local_store_identity(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_cloudflare_r2(
-    account_id: &str,
+pub(crate) fn build_s3(
+    endpoint: &str,
+    region: &str,
     bucket: &str,
     partition: StorePartition,
 ) -> Result<Arc<dyn ObjectStore>> {
-    validate_cloudflare_r2_identity(account_id, bucket)?;
+    validate_s3_identity(endpoint, region, bucket)?;
     let prefix = partition.credential_prefix();
     let access_key = required_utf8_environment(&format!("{prefix}_ACCESS_KEY_ID"))?;
     let secret_key = required_utf8_environment(&format!("{prefix}_SECRET_ACCESS_KEY"))?;
     let session_token = optional_utf8_environment(&format!("{prefix}_SESSION_TOKEN"))?;
-    let endpoint = format!("https://{account_id}.r2.cloudflarestorage.com");
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_region("auto")
+        .with_region(region)
         .with_endpoint(endpoint)
         .with_access_key_id(access_key)
         .with_secret_access_key(secret_key)
         .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_virtual_hosted_style_request(false)
         .with_allow_http(false);
     if let Some(session_token) = session_token {
         builder = builder.with_token(session_token);
@@ -11784,31 +11786,59 @@ pub(crate) fn build_cloudflare_r2(
     Ok(Arc::new(store))
 }
 
-pub(crate) fn validate_cloudflare_r2_identity(account_id: &str, bucket: &str) -> Result<()> {
-    if account_id.len() != 32
-        || !account_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("Cloudflare account_id must be exactly 32 lowercase hexadecimal characters");
+pub(crate) fn validate_s3_identity(endpoint: &str, region: &str, bucket: &str) -> Result<()> {
+    if endpoint.is_empty() || endpoint.len() > 2_048 {
+        bail!("S3 endpoint must contain 1..=2048 bytes");
     }
-    if !(3..=63).contains(&bucket.len())
-        || bucket.starts_with('-')
-        || bucket.ends_with('-')
-        || !bucket
+    let endpoint = Url::parse(endpoint).context("S3 endpoint is not a valid URL")?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.path() != "/"
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        bail!("S3 endpoint must be an HTTPS origin without credentials, path, query, or fragment");
+    }
+    if region.is_empty()
+        || region.len() > 64
+        || region.starts_with('-')
+        || region.ends_with('-')
+        || !region
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        bail!("Cloudflare R2 bucket must be a valid 3..=63 byte bucket name");
+        bail!("S3 region must contain 1..=64 lowercase letters, digits, or interior hyphens");
+    }
+    if !(3..=63).contains(&bucket.len())
+        || !bucket
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !bucket
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+        || bucket.contains("..")
+        || bucket.contains(".-")
+        || bucket.contains("-.")
+        || bucket.parse::<Ipv4Addr>().is_ok()
+    {
+        bail!("S3 bucket must be a valid 3..=63 byte DNS-compatible bucket name");
     }
     Ok(())
 }
 
-pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Result<()> {
-    let prefix = ObjectPath::from(format!("dt/v3/_r2_probe/{}", Uuid::new_v4()));
-    let object = prefix.child("semantics");
-    let first_payload = PutPayload::from_static(b"dragontales-r2-probe-v1");
-    let second_payload = PutPayload::from_static(b"dragontales-r2-probe-v2");
+pub(crate) async fn probe_s3(objects: &Arc<dyn ObjectStore>) -> Result<()> {
+    let prefix = ObjectPath::from(format!("dt/v3/_s3_probe/{}", Uuid::new_v4()));
+    let object = prefix.child("a-semantics");
+    let ordered_object = prefix.child("z-order");
+    let first_payload = PutPayload::from_static(b"dragontales-s3-probe-v1");
+    let second_payload = PutPayload::from_static(b"dragontales-s3-probe-v2");
     let result = async {
         let first = objects
             .put_opts(
@@ -11832,7 +11862,7 @@ pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Resul
             .await
         {
             Err(object_store::Error::AlreadyExists { .. }) => {}
-            Ok(_) => bail!("R2 conditional create overwrote the probe object"),
+            Ok(_) => bail!("S3 conditional create overwrote the probe object"),
             Err(error) => return Err(error.into()),
         }
         let second = objects
@@ -11857,43 +11887,67 @@ pub(crate) async fn probe_cloudflare_r2(objects: &Arc<dyn ObjectStore>) -> Resul
             .await
         {
             Err(object_store::Error::Precondition { .. }) => {}
-            Ok(_) => bail!("R2 stale ETag update overwrote the probe object"),
+            Ok(_) => bail!("S3 stale ETag update overwrote the probe object"),
             Err(error) => return Err(error.into()),
         }
         if second.e_tag.is_none() {
-            bail!("R2 conditional update did not return an ETag");
+            bail!("S3 conditional update did not return an ETag");
         }
         let bytes = objects.get(&object).await?.bytes().await?;
-        if bytes.as_ref() != b"dragontales-r2-probe-v2" {
-            bail!("R2 read did not return the conditionally updated probe object");
+        if bytes.as_ref() != b"dragontales-s3-probe-v2" {
+            bail!("S3 read did not return the conditionally updated probe object");
         }
+        objects
+            .put_opts(
+                &ordered_object,
+                PutPayload::from_static(b"dragontales-s3-probe-order"),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await?;
         let listed = objects
             .list(Some(&prefix))
             .map(|entry| entry.map(|entry| entry.location))
             .try_collect::<Vec<_>>()
             .await?;
-        if listed != [object.clone()] {
-            bail!("R2 list did not return exactly the probe object");
+        if listed != [object.clone(), ordered_object.clone()] {
+            bail!("S3 list did not return the probe objects in key order");
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    let deleted = objects.delete(&object).await;
-    match (result, deleted) {
-        (Ok(()), Ok(())) => match objects.get(&object).await {
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Ok(_) => bail!("R2 delete left the probe object readable"),
-            Err(error) => Err(error.into()),
-        },
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(error), Err(delete_error)) => Err(error.context(format!(
-            "R2 semantics probe cleanup also failed: {delete_error}"
+    let cleanup_failure = match (
+        objects.delete(&object).await,
+        objects.delete(&ordered_object).await,
+    ) {
+        (Ok(()), Ok(())) => None,
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Some(error.to_string()),
+        (Err(first), Err(second)) => Some(format!("{first}; {second}")),
+    };
+    match (result, cleanup_failure) {
+        (Err(error), Some(cleanup_failure)) => Err(error.context(format!(
+            "S3 semantics probe cleanup also failed: {cleanup_failure}"
         ))),
+        (Err(error), None) => Err(error),
+        (Ok(()), Some(cleanup_failure)) => {
+            bail!("S3 semantics probe cleanup failed: {cleanup_failure}")
+        }
+        (Ok(()), None) => {
+            for deleted in [&object, &ordered_object] {
+                match objects.get(deleted).await {
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Ok(_) => bail!("S3 delete left a probe object readable"),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        }
     }
 }
 
-pub(crate) async fn probe_cloudflare_r2_read(objects: &Arc<dyn ObjectStore>) -> Result<()> {
+pub(crate) async fn probe_s3_read(objects: &Arc<dyn ObjectStore>) -> Result<()> {
     let prefix = ObjectPath::from("dt/v3");
     let mut listed = objects.list(Some(&prefix));
     if let Some(result) = listed.next().await {
@@ -17169,7 +17223,7 @@ mod tests {
             );
         }
         for invalid in [
-            "dt/v3/_r2_probe/probe",
+            "dt/v3/_s3_probe/probe",
             "dt/v3/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/not-a-uuid/2/3/4/stats/x",
             "dt/v3/not-a-digest/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/00000000-0000-0000-0000-000000000003/00000000-0000-0000-0000-000000000004/stats/x",
             "dt/v3/00000000-0000-0000-0000-000000000001/stats/x",
@@ -23390,16 +23444,45 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn cloudflare_r2_identity_and_required_semantics_are_exact() {
-        assert!(validate_cloudflare_r2_identity(&"a".repeat(32), "valid-bucket").is_ok());
-        for account_id in ["a".repeat(31), "A".repeat(32), "g".repeat(32)] {
-            assert!(validate_cloudflare_r2_identity(&account_id, "valid-bucket").is_err());
+    async fn s3_identity_and_required_semantics_are_exact() {
+        assert!(
+            validate_s3_identity(
+                "https://example.r2.cloudflarestorage.com",
+                "auto",
+                "valid.bucket"
+            )
+            .is_ok()
+        );
+        for endpoint in [
+            "http://object-store.example.com",
+            "https://user@example.com",
+            "https://object-store.example.com/path",
+            "https://object-store.example.com?query=true",
+        ] {
+            assert!(validate_s3_identity(endpoint, "auto", "valid-bucket").is_err());
         }
-        for bucket in ["ab", "-bucket", "bucket-", "UPPER", "has_underscore"] {
-            assert!(validate_cloudflare_r2_identity(&"a".repeat(32), bucket).is_err());
+        for region in ["", "US-EAST-1", "-auto", "auto-"] {
+            assert!(
+                validate_s3_identity("https://object-store.example.com", region, "valid-bucket")
+                    .is_err()
+            );
+        }
+        for bucket in [
+            "ab",
+            "-bucket",
+            "bucket-",
+            "UPPER",
+            "has_underscore",
+            "bucket..name",
+            "127.0.0.1",
+        ] {
+            assert!(
+                validate_s3_identity("https://object-store.example.com", "us-east-1", bucket)
+                    .is_err()
+            );
         }
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        probe_cloudflare_r2(&objects).await.unwrap();
+        probe_s3(&objects).await.unwrap();
         assert_eq!(
             objects.list(None).try_collect::<Vec<_>>().await.unwrap(),
             []

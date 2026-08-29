@@ -19,7 +19,7 @@ response = client.chat.completions.create(
 The public contract is deliberately narrow:
 
 - The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK uses Chat Completions or Responses through the standard `Authorization: Bearer` header and receives the normal response.
-- The hosted operator owns the gateway and eval configuration, one R2 bucket with process-scoped logical roles, upstream and Baseten credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
+- The hosted operator owns the gateway and eval configuration, one S3-compatible bucket with process-scoped logical roles, upstream and Baseten credentials, capture policy, and route policy. The hosted deployment uses Cloudflare R2; self-hosters may use another qualified S3-compatible service.
 
 During the single-tenant pilot, Milk issues, rotates, and revokes `dt_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `dragontales-gateway`, `DRAGONTALES_*`, and `dt_live_...` remain the stable binary, environment, and wire identifiers.
 
@@ -57,7 +57,18 @@ Secrets stay in environment variables:
 | `tick --once` | capture read/write, control read/write |
 | `status` | capture, control, and routes read-only |
 
-All three store configs may name the same R2 bucket. The `MILK_CAPTURE_STORE_*`, `MILK_CONTROL_STORE_*`, and `MILK_ROUTE_STORE_*` bindings remain explicit, and each command opens only the logical roles in the table above.
+All three store configs may name the same S3-compatible bucket. The `MILK_CAPTURE_STORE_*`, `MILK_CONTROL_STORE_*`, and `MILK_ROUTE_STORE_*` bindings remain explicit, and each command opens only the logical roles in the table above. Each remote role uses the same strict config form:
+
+```json
+{
+  "type": "s3",
+  "endpoint": "https://<account-id>.r2.cloudflarestorage.com",
+  "region": "auto",
+  "bucket": "milk-production"
+}
+```
+
+Set `<ROLE>_ACCESS_KEY_ID`, `<ROLE>_SECRET_ACCESS_KEY`, and optionally `<ROLE>_SESSION_TOKEN` for each opened role. The endpoint must be an HTTPS origin; HTTP, embedded credentials, and endpoint paths are rejected. Remote startup qualifies create-if-absent, ETag compare-and-swap, immediate read, ordered prefix listing, and deletion before serving or mutating data. A backend that fails those semantics is unsupported even if it exposes an S3 API.
 
 ## Run locally
 
@@ -84,7 +95,7 @@ export MILK_CAPTURE_SAMPLING_KEY_VERSION='local-v1'
 target/release/dragontales-gateway --config "$PWD/dragontales.json" serve
 ```
 
-Keep the sampling key stable for a version so session selection remains deterministic. The local path can use one or three owner-only directories. The hosted configuration uses one R2 bucket through the three logical access roles.
+Keep the sampling key stable for a version so session selection remains deterministic. The local path can use one or three owner-only directories. The hosted configuration uses one Cloudflare R2 bucket through the three S3-compatible logical access roles.
 
 ## Bounded evaluation loop
 

@@ -264,8 +264,14 @@ struct TrafficKeyConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ObjectStoreConfig {
-    Local { root: PathBuf },
-    CloudflareR2 { account_id: String, bucket: String },
+    Local {
+        root: PathBuf,
+    },
+    S3 {
+        endpoint: String,
+        region: String,
+        bucket: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2098,11 +2104,11 @@ async fn start_records(config: &FileConfig, access: StoreAccessPlan) -> Result<R
 async fn start_records_with_timeout(
     config: &FileConfig,
     access: StoreAccessPlan,
-    qualify_r2: bool,
+    qualify_s3: bool,
 ) -> Result<Records> {
     tokio::time::timeout(
         Duration::from_millis(config.storage_timeout_ms),
-        open_records(config, access, qualify_r2),
+        open_records(config, access, qualify_s3),
     )
     .await
     .context("storage initialization timed out")?
@@ -2111,14 +2117,14 @@ async fn start_records_with_timeout(
 async fn open_records(
     config: &FileConfig,
     access: StoreAccessPlan,
-    qualify_r2: bool,
+    qualify_s3: bool,
 ) -> Result<Records> {
     let capture =
-        open_store_partition(config, StorePartition::Capture, access.capture, qualify_r2).await?;
+        open_store_partition(config, StorePartition::Capture, access.capture, qualify_s3).await?;
     let control =
-        open_store_partition(config, StorePartition::Control, access.control, qualify_r2).await?;
+        open_store_partition(config, StorePartition::Control, access.control, qualify_s3).await?;
     let routes =
-        open_store_partition(config, StorePartition::Routes, access.routes, qualify_r2).await?;
+        open_store_partition(config, StorePartition::Routes, access.routes, qualify_s3).await?;
     let objects = Arc::new(PartitionedObjectStore::new(capture, control, routes));
     let sampling_key_version = records_sampling_key_version(access)?;
     Records::start_with_sampling(
@@ -2144,22 +2150,26 @@ async fn open_store_partition(
     config: &FileConfig,
     partition: StorePartition,
     access: Option<StoreAccess>,
-    qualify_r2: bool,
+    qualify_s3: bool,
 ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, StoreAccess)>> {
     let Some(access) = access else {
         return Ok(None);
     };
-    let (objects, cloudflare_r2) = match config.stores.get(partition) {
+    let (objects, s3) = match config.stores.get(partition) {
         ObjectStoreConfig::Local { root } => (records::build_local(root)?, false),
-        ObjectStoreConfig::CloudflareR2 { account_id, bucket } => (
-            records::build_cloudflare_r2(account_id, bucket, partition)?,
+        ObjectStoreConfig::S3 {
+            endpoint,
+            region,
+            bucket,
+        } => (
+            records::build_s3(endpoint, region, bucket, partition)?,
             true,
         ),
     };
-    if qualify_r2 && cloudflare_r2 {
+    if qualify_s3 && s3 {
         match access {
-            StoreAccess::ReadOnly => records::probe_cloudflare_r2_read(&objects).await?,
-            StoreAccess::ReadWrite => records::probe_cloudflare_r2(&objects).await?,
+            StoreAccess::ReadOnly => records::probe_s3_read(&objects).await?,
+            StoreAccess::ReadWrite => records::probe_s3(&objects).await?,
         }
     }
     Ok(Some((objects, access)))
@@ -2253,8 +2263,12 @@ fn validate_config_identity(config: &FileConfig) -> Result<()> {
             ObjectStoreConfig::Local { root } => {
                 records::validate_local_store_identity(root)?;
             }
-            ObjectStoreConfig::CloudflareR2 { account_id, bucket } => {
-                records::validate_cloudflare_r2_identity(account_id, bucket)?;
+            ObjectStoreConfig::S3 {
+                endpoint,
+                region,
+                bucket,
+            } => {
+                records::validate_s3_identity(endpoint, region, bucket)?;
             }
         }
     }
@@ -2321,14 +2335,10 @@ fn validate_teacher_config(config: &FileConfig) -> Result<()> {
     if teacher.authorization_not_after.nanosecond() != 0 {
         bail!("teacher authorization expiry must use whole seconds");
     }
-    if !matches!(
-        config.stores.capture,
-        ObjectStoreConfig::CloudflareR2 { .. }
-    ) || !matches!(
-        config.stores.control,
-        ObjectStoreConfig::CloudflareR2 { .. }
-    ) {
-        bail!("GPU teacher jobs require shared R2 storage");
+    if !matches!(config.stores.capture, ObjectStoreConfig::S3 { .. })
+        || !matches!(config.stores.control, ObjectStoreConfig::S3 { .. })
+    {
+        bail!("GPU teacher jobs require shared S3-compatible storage");
     }
     Ok(())
 }
@@ -4461,6 +4471,14 @@ mod cli_tests {
         .replace("/var/lib/dragontales", directory.to_str().unwrap())
     }
 
+    fn s3_store(bucket: &str) -> ObjectStoreConfig {
+        ObjectStoreConfig::S3 {
+            endpoint: "https://example.r2.cloudflarestorage.com".to_owned(),
+            region: "auto".to_owned(),
+            bucket: bucket.to_owned(),
+        }
+    }
+
     #[test]
     fn public_help_exposes_serve_tick_and_status() {
         let help = Cli::command().render_long_help().to_string();
@@ -4874,16 +4892,13 @@ mod cli_tests {
     }
 
     #[test]
-    fn one_r2_bucket_can_back_all_store_roles() {
+    fn one_s3_bucket_can_back_all_store_roles() {
         let mut config: FileConfig = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../deploy/dragontales-config.example.json"
         )))
         .unwrap();
-        let shared = ObjectStoreConfig::CloudflareR2 {
-            account_id: "a".repeat(32),
-            bucket: "milk-pilot-test".to_owned(),
-        };
+        let shared = s3_store("milk-pilot-test");
         config.stores = StoresConfig {
             capture: shared.clone(),
             control: shared.clone(),
@@ -4893,6 +4908,28 @@ mod cli_tests {
         validate_config_identity(&config).unwrap();
         assert_eq!(config.stores.capture, config.stores.control);
         assert_eq!(config.stores.control, config.stores.routes);
+    }
+
+    #[test]
+    fn s3_store_config_is_explicit() {
+        let parsed: ObjectStoreConfig = serde_json::from_str(
+            r#"{"type":"s3","endpoint":"https://objects.example.com","region":"us-east-1","bucket":"milk-test"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ObjectStoreConfig::S3 {
+                endpoint: "https://objects.example.com".to_owned(),
+                region: "us-east-1".to_owned(),
+                bucket: "milk-test".to_owned(),
+            }
+        );
+        assert!(
+            serde_json::from_str::<ObjectStoreConfig>(
+                r#"{"type":"cloudflare_r2","account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bucket":"milk-test"}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4918,18 +4955,9 @@ mod cli_tests {
         )))
         .unwrap();
         config.stores = StoresConfig {
-            capture: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "milk-capture-test".to_owned(),
-            },
-            control: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "milk-control-test".to_owned(),
-            },
-            routes: ObjectStoreConfig::CloudflareR2 {
-                account_id: "a".repeat(32),
-                bucket: "milk-routes-test".to_owned(),
-            },
+            capture: s3_store("milk-capture-test"),
+            control: s3_store("milk-control-test"),
+            routes: s3_store("milk-routes-test"),
         };
         let plan = StoreAccessPlan::for_command(&Command::Serve);
         assert_eq!(plan.control, None);
@@ -5057,10 +5085,7 @@ mod cli_tests {
         assert!(validate_serve_config_owner(&config, InputOwner::CurrentPrivate).is_err());
         validate_serve_config_owner(&config, InputOwner::RootDeployment).unwrap();
         config.listen = "127.0.0.1:8080".parse().unwrap();
-        config.stores.capture = ObjectStoreConfig::CloudflareR2 {
-            account_id: "a".repeat(32),
-            bucket: "dragontales-test".to_owned(),
-        };
+        config.stores.capture = s3_store("dragontales-test");
         assert!(validate_serve_config_owner(&config, InputOwner::CurrentPrivate).is_err());
         validate_serve_config_owner(&config, InputOwner::RootDeployment).unwrap();
 
