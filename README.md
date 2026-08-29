@@ -105,7 +105,7 @@ See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.m
 The hosted release is production-qualified only after one cloud run proves the complete chain:
 
 1. An official SDK request returns normally and persists its completed trace.
-2. Real captured traffic reaches the fixed 251-request student corpus: 50 TRAIN, 73 DEV, and 128 CALIBRATION. Generated traffic does not count.
+2. Real captured traffic produces at least 251 retained teacher results: 50 TRAIN, 73 DEV, and 128 CALIBRATION. Partitioning or skipped traffic can require more requests. Generated traffic does not count.
 3. One student is trained and merged, then BF16, dynamic FP8, and static FP8 branches are evaluated on the same ordered DEV set.
 4. The deterministic winner passes authenticated canary and baseline-fallback checks.
 5. A signed zero route becomes active and Baseten and Modal are both observed at zero compute.
