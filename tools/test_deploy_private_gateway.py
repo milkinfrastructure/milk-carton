@@ -352,13 +352,7 @@ if name == "wrangler":
         names = state.get("installed_secret_names", [])
         print(json.dumps([{"name": value, "type": "secret_text"} for value in names]))
     elif values[:2] == ["secret", "bulk"]:
-        if state["mode"] == "bootstrap_secret_fail":
-            done(1)
-        supplied = json.loads(sys.stdin.read())
-        state["installed_secret_names"] = sorted(supplied)
-        state["active_config_sha256"] = hashlib.sha256(
-            supplied["MILK_CARTON_CONFIG_JSON"].encode()
-        ).hexdigest()
+        done(2)
     elif values[:2] == ["deployments", "status"]:
         version = state["previous_worker"] if state["deployment"] in {"initial", "rollback"} else state["current_worker"]
         print(json.dumps({"id": "deployment", "source": "api", "strategy": "percentage", "versions": [{"percentage": 100, "version_id": version}]}))
@@ -410,23 +404,37 @@ if name == "wrangler":
         config = json.loads(config_path.read_text())
         state["deploy_config"] = config
         state["target_image"] = config["containers"][0]["image"]
-        if not state.get("bootstrap", False):
-            if "--secrets-file" not in values:
+        if "--secrets-file" not in values:
+            done(2)
+        secrets_path = Path(values[values.index("--secrets-file") + 1])
+        if secrets_path.stat().st_mode & 0o777 != 0o600:
+            done(2)
+        supplied = json.loads(secrets_path.read_text())
+        state["deployment_secrets_path"] = str(secrets_path)
+        state["deployment_secrets_mode"] = secrets_path.stat().st_mode & 0o777
+        if state.get("bootstrap", False):
+            required = {
+                "MILK_CARTON_CONFIG_JSON", "MILK_CARTON_CONTAINER_ADMIN_KEY",
+                "MILK_CARTON_OPENAI_API_KEY", "MILK_CARTON_ROUTE_SECRET_HEX",
+                "MILK_CAPTURE_SAMPLING_KEY_HEX", "MILK_CAPTURE_SAMPLING_KEY_VERSION",
+                "MILK_CAPTURE_STORE_ACCESS_KEY_ID", "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY",
+                "MILK_ROUTE_STORE_ACCESS_KEY_ID", "MILK_ROUTE_STORE_SECRET_ACCESS_KEY",
+            }
+            optional = {
+                "MILK_CAPTURE_STORE_SESSION_TOKEN", "MILK_ROUTE_STORE_SESSION_TOKEN",
+            }
+            if not required.issubset(supplied) or not set(supplied).issubset(required | optional):
                 done(2)
-            secrets_path = Path(values[values.index("--secrets-file") + 1])
-            if secrets_path.stat().st_mode & 0o777 != 0o600:
-                done(2)
-            supplied = json.loads(secrets_path.read_text())
+            state["installed_secret_names"] = sorted(supplied)
+        else:
             if set(supplied) != {"MILK_CARTON_CONFIG_JSON"}:
                 done(2)
-            state["deployed_secret_names"] = sorted(supplied)
-            state["active_config_sha256"] = hashlib.sha256(
-                supplied["MILK_CARTON_CONFIG_JSON"].encode()
-            ).hexdigest()
-            if state["mode"] == "config_mismatch":
-                state["active_config_sha256"] = "0" * 64
-        elif "--secrets-file" in values:
-            done(2)
+        state["deployed_secret_names"] = sorted(supplied)
+        state["active_config_sha256"] = hashlib.sha256(
+            supplied["MILK_CARTON_CONFIG_JSON"].encode()
+        ).hexdigest()
+        if state["mode"] == "config_mismatch":
+            state["active_config_sha256"] = "0" * 64
         state["deployment"] = "partial" if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"} else "deployed"
         if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"}:
             done(1)
@@ -579,6 +587,11 @@ class DeployPrivateGatewayTests(unittest.TestCase):
                 with self.assertRaises(DEPLOY_CONTRACT.DeployFailure):
                     DEPLOY_CONTRACT.validate_api_base_url(invalid)
 
+    def test_sensitive_secret_buffer_is_zeroed(self):
+        value = bytearray(b"private-bootstrap-secret")
+        DEPLOY_CONTRACT.clear_sensitive_bytes(value)
+        self.assertEqual(value, bytearray(len(value)))
+
     def test_bootstrap_with_optional_r2_session_tokens_installs_exact_submitted_set(self):
         fixture = Fixture(bootstrap=True)
         self.addCleanup(fixture.close)
@@ -595,6 +608,10 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(
             fixture.state["installed_secret_names"],
+            sorted(value["secrets"]),
+        )
+        self.assertEqual(
+            fixture.state["deployed_secret_names"],
             sorted(value["secrets"]),
         )
 
@@ -839,6 +856,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             rollback["previous_gateway_config_sha256"],
             fixture.state["previous_config_sha256"],
         )
+        self.assertFalse(Path(fixture.state["deployment_secrets_path"]).exists())
         self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
 
     def test_official_sdk_smoke_failure_rolls_back(self):
@@ -898,24 +916,26 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         state = fixture.state
         self.assertEqual(state["installed_secret_names"], sorted(BOOTSTRAP_SECRETS))
+        self.assertEqual(state["deployed_secret_names"], sorted(BOOTSTRAP_SECRETS))
+        self.assertEqual(state["deployment_secrets_mode"], 0o600)
+        self.assertFalse(Path(state["deployment_secrets_path"]).exists())
         commands = state["commands"]
         deploy_index = next(
             index for index, item in enumerate(commands)
             if item["command"] == "wrangler" and "deploy" in item["arguments"]
         )
-        bulk_index = next(
-            index for index, item in enumerate(commands)
-            if item["command"] == "wrangler"
-            and item["arguments"][:2] == ["secret", "bulk"]
-        )
         acceptance_index = next(
             index for index, item in enumerate(commands)
             if item["command"] == "curl"
         )
-        self.assertLess(deploy_index, bulk_index)
-        self.assertLess(bulk_index, acceptance_index)
+        self.assertLess(deploy_index, acceptance_index)
         deploy = commands[deploy_index]
-        self.assertNotIn("--secrets-file", deploy["arguments"])
+        self.assertIn("--secrets-file", deploy["arguments"])
+        self.assertFalse(any(
+            item["command"] == "wrangler"
+            and item["arguments"][:2] == ["secret", "bulk"]
+            for item in commands
+        ))
         self.assertFalse(any("delete" in item["arguments"] for item in commands))
 
         intent = json.loads((fixture.evidence / "intent.json").read_text())
@@ -973,6 +993,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         ))
         cleanup = json.loads((fixture.evidence / "bootstrap-cleanup.json").read_text())
         self.assertIs(cleanup["absence_proved"], True)
+        self.assertFalse(Path(state["deployment_secrets_path"]).exists())
         self.assertEqual(fixture.terminal()["outcome"], "bootstrap_failed_cleaned")
         self.assertFalse(any(
             item["command"] == "wrangler"
@@ -987,24 +1008,36 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         cleanup = json.loads((fixture.evidence / "bootstrap-cleanup.json").read_text())
         self.assertIs(cleanup["absence_proved"], False)
+        self.assertFalse(Path(fixture.state["deployment_secrets_path"]).exists())
         self.assertEqual(fixture.terminal()["outcome"], "bootstrap_cleanup_failed")
 
     def test_bootstrap_secrets_file_must_be_canonical_owner_only_mode_0600(self):
-        for defect in ("mode", "noncanonical"):
+        for defect in ("mode", "noncanonical", "missing-secret"):
             with self.subTest(defect=defect):
                 fixture = Fixture(bootstrap=True)
                 self.addCleanup(fixture.close)
                 if defect == "mode":
                     fixture.bootstrap_secrets.chmod(0o640)
                 else:
-                    fixture.bootstrap_secrets.write_text(json.dumps({
+                    value = {
                         "schema_version": "milk.gateway-bootstrap-secrets.v1",
-                        "secrets": BOOTSTRAP_SECRETS,
-                    }, indent=2) + "\n")
+                        "secrets": dict(BOOTSTRAP_SECRETS),
+                    }
+                    if defect == "noncanonical":
+                        fixture.bootstrap_secrets.write_text(json.dumps(value, indent=2) + "\n")
+                    else:
+                        value["secrets"].pop("MILK_CARTON_OPENAI_API_KEY")
+                        fixture.bootstrap_secrets.write_bytes(canonical(value))
                 result = fixture.run()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(fixture.evidence.exists())
-                self.assertEqual(fixture.state["commands"], [])
+                state = fixture.state
+                self.assertEqual(state["commands"], [])
+                self.assertEqual(state["milk_tags"], [])
+                self.assertEqual(state["deployment"], "initial")
+                self.assertNotIn("deploy_config", state)
+                self.assertNotIn("worker_deleted", state)
+                self.assertNotIn("application_deleted", state)
 
     def test_dirty_checkout_fails_before_any_provider_mutation(self):
         fixture = Fixture("dirty")
@@ -1057,6 +1090,29 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertNotIn("containers images delete", script_raw)
         self.assertIn('"containers", "delete", matches[0]', script_raw)
         self.assertNotRegex(script_raw, r"\bgh\b")
+
+    def test_committed_lite_config_preserves_runtime_memory_headroom(self):
+        config = json.loads(
+            (ROOT / "deploy/milk-carton-config.example.json").read_text()
+        )
+        self.assertEqual(config["max_request_bytes"], 4 * 1024 * 1024)
+        self.assertEqual(config["max_in_flight"], 4)
+        self.assertEqual(config["max_outcomes_in_flight"], 1)
+        self.assertEqual(config["max_active_body_bytes"], 80 * 1024 * 1024)
+        self.assertEqual(config["capture_response_bytes"], 4 * 1024 * 1024)
+        self.assertEqual(config["capture_record_bytes"], 12 * 1024 * 1024)
+        self.assertEqual(config["capture_queue_bytes"], 48 * 1024 * 1024)
+        worst_active_bodies = (
+            (config["max_request_bytes"] + config["capture_record_bytes"])
+            * config["max_in_flight"]
+            + config["capture_record_bytes"] * config["max_outcomes_in_flight"]
+        )
+        self.assertEqual(worst_active_bodies, 76 * 1024 * 1024)
+        self.assertLessEqual(worst_active_bodies, config["max_active_body_bytes"])
+        self.assertEqual(
+            config["max_active_body_bytes"] + config["capture_queue_bytes"],
+            128 * 1024 * 1024,
+        )
 
 
 if __name__ == "__main__":
