@@ -1,6 +1,7 @@
 /target/
 /node_modules/
 /evidence-local/
+/.dragontales-secrets/
 /deploy/cloudflare/node_modules/
 /deploy/cloudflare/.build-context/
 /deploy/cloudflare/.wrangler/
