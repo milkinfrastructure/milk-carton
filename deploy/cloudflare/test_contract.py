@@ -13,7 +13,7 @@ dockerfile = (root / "Dockerfile").read_text()
 package = json.loads((root / "package.json").read_text())
 deploy_script = (root.parents[1] / "tools/deploy-private-gateway.sh").read_text()
 production_smoke = (root.parents[1] / "tools/openai-production-smoke.mjs").read_text()
-operator_notes = (root.parents[1] / "crates/dragontales-gateway/README.md").read_text()
+operator_notes = (root.parents[1] / "crates/milk-carton/README.md").read_text()
 assert not (root / "entrypoint.sh").exists()
 assert not (root / "prepare-context.sh").exists()
 assert package["scripts"]["deploy"] == "../../tools/deploy-private-gateway.sh"
@@ -24,8 +24,10 @@ assert '"official_openai_sdk_baseline_receipt_sha256"' in deploy_script
 assert 'PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf"' in deploy_script
 assert "validate_deployment_baseline_binding" in deploy_script
 assert 'deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])' in deploy_script
-assert '"DRAGONTALES_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
+assert '"MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
 assert "expected_config_sha256" in deploy_script
+assert 'CUSTOM_DOMAIN_SENTINEL = "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED"' in deploy_script
+assert 'config["routes"][0]["pattern"] = api_hostname' in deploy_script
 assert 'import OpenAI from "openai"' in production_smoke
 assert "maxRetries: 0" in production_smoke
 assert 'model: "zai-org/GLM-5.3-Flash"' in production_smoke
@@ -48,14 +50,14 @@ assert config["main"] == ".milk-private-deploy-script-required"
 assert config["observability"] == {"enabled": True}
 assert config["routes"] == [
     {
-        "pattern": "api.dragontales.milkinfrastructure.com",
+        "pattern": "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED",
         "custom_domain": True,
     }
 ]
 assert config["containers"] == [
     {
-        "class_name": "DragontalesGateway",
-        "image": "MILK_PRIVATE_GATEWAY_ADMITTED_IMAGE_REQUIRED",
+        "class_name": "MilkCarton",
+        "image": "MILK_CARTON_ADMITTED_IMAGE_REQUIRED",
         "instance_type": "lite",
         "max_instances": 1,
     }
@@ -63,18 +65,18 @@ assert config["containers"] == [
 assert config["durable_objects"] == {
     "bindings": [
         {
-            "name": "DRAGONTALES_GATEWAY",
-            "class_name": "DragontalesGateway",
+            "name": "MILK_CARTON",
+            "class_name": "MilkCarton",
         }
     ]
 }
 assert config["migrations"] == [
-    {"tag": "v1", "new_sqlite_classes": ["DragontalesGateway"]}
+    {"tag": "v1", "new_sqlite_classes": ["MilkCarton"]}
 ]
 assert config["secrets"]["required"] == [
-    "DRAGONTALES_CONFIG_JSON",
-    "DRAGONTALES_CONTAINER_ADMIN_KEY",
-    "DRAGONTALES_OPENAI_API_KEY",
+    "MILK_CARTON_CONFIG_JSON",
+    "MILK_CARTON_CONTAINER_ADMIN_KEY",
+    "MILK_CARTON_OPENAI_API_KEY",
     "MILK_CAPTURE_SAMPLING_KEY_HEX",
     "MILK_CAPTURE_SAMPLING_KEY_VERSION",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID",
@@ -82,7 +84,7 @@ assert config["secrets"]["required"] == [
     "MILK_ROUTE_STORE_ACCESS_KEY_ID",
     "MILK_ROUTE_STORE_SECRET_ACCESS_KEY",
 ]
-assert "DRAGONTALES_CANDIDATE_API_KEY" not in config["secrets"]["required"]
+assert "MILK_CARTON_CANDIDATE_API_KEY" not in config["secrets"]["required"]
 assert not set(config) & {
     "d1_databases",
     "kv_namespaces",
@@ -93,7 +95,7 @@ assert not set(config) & {
 }
 
 direct = re.compile(
-    r"return\s+getContainer\(env\.DRAGONTALES_GATEWAY,\s*GATEWAY_INSTANCE\)"
+    r"return\s+getContainer\(env\.MILK_CARTON,\s*GATEWAY_INSTANCE\)"
     r"\s*\.fetch\(\s*request,?\s*\);"
 )
 assert direct.search(worker)
@@ -124,8 +126,8 @@ assert "MILK_CONTROL_STORE" not in worker
 assert worker.count("=== undefined") == 5
 assert "? {}" in worker
 container_env = worker.split("function containerEnvVars", 1)[1].split("\n}\n", 1)[0]
-assert "DRAGONTALES_CANDIDATE_API_KEY" in container_env
-assert "DRAGONTALES_CONTAINER_ADMIN_KEY" not in container_env
+assert "MILK_CARTON_CANDIDATE_API_KEY" in container_env
+assert "MILK_CARTON_CONTAINER_ADMIN_KEY" not in container_env
 assert 'const CANDIDATE_ADMIN_PATH = "/__milk/candidate-credential"' in worker
 assert 'const CANDIDATE_OPERATION_HEADER = "x-milk-candidate-operation"' in worker
 inspection = worker.split("async inspectCandidateCredential", 1)[1].split(
@@ -143,7 +145,7 @@ assert "await this.startAndWaitForPorts" in worker
 assert "R2Bucket" not in worker
 assert "AWS" not in worker.upper()
 
-assert "cargo build --locked --release --package dragontales-gateway" in dockerfile
+assert "cargo build --locked --release --package milk-carton" in dockerfile
 runtime_base = (
     "FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:"
     "d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a"
@@ -152,12 +154,12 @@ assert dockerfile.count(runtime_base) == 1
 runtime = dockerfile.split(runtime_base, 1)[1]
 assert runtime.count("COPY ") == 2
 assert (
-    "COPY --from=build --chmod=0555 /src/target/release/dragontales-gateway "
-    "/usr/local/bin/dragontales-gateway"
+    "COPY --from=build --chmod=0555 /src/target/release/milk-carton "
+    "/usr/local/bin/milk-carton"
 ) in runtime
 assert (
     "COPY --from=build --chmod=0444 /src/LICENSE /src/THIRD_PARTY_LICENSES.txt "
-    "/usr/share/licenses/dragontales/"
+    "/usr/share/licenses/milk-carton/"
 ) in runtime
 assert "COPY LICENSE ./" in dockerfile
 assert "COPY deploy/licenses/bundle-rust.sh ./deploy/licenses/bundle-rust.sh" in dockerfile
@@ -166,17 +168,17 @@ assert (
     in dockerfile
 )
 assert "USER 65532:65532" in runtime
-assert 'ENTRYPOINT ["/usr/local/bin/dragontales-gateway"]' in runtime
+assert 'ENTRYPOINT ["/usr/local/bin/milk-carton"]' in runtime
 assert 'CMD ["serve"]' in runtime
 for forbidden in ("run ", "/bin/sh", "apt", "apk", "dnf", "yum", "python", "node"):
     assert forbidden not in runtime.lower()
 assert "entrypoint.sh" not in dockerfile
-assert "DRAGONTALES_CONFIG=" not in dockerfile
+assert "MILK_CARTON_CONFIG=" not in dockerfile
 assert "FUSE" not in dockerfile.upper()
 assert "AWS" not in dockerfile.upper()
 assert "MODAL" not in dockerfile.upper()
 license_bundle = root.parent / "licenses/bundle-rust.sh"
-with tempfile.TemporaryDirectory(prefix="dragontales-license-failure-") as temporary:
+with tempfile.TemporaryDirectory(prefix="milk-carton-license-failure-") as temporary:
     output = Path(temporary) / "THIRD_PARTY_LICENSES.txt"
     environment = os.environ.copy()
     environment["CARGO"] = str(Path(temporary) / "missing-cargo")

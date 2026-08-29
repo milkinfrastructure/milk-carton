@@ -10,11 +10,11 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use uuid::Uuid;
 
-pub(crate) const ROUTE_SCHEMA_VERSION: &str = "dragontales.route.v4";
+pub(crate) const ROUTE_SCHEMA_VERSION: &str = "milk.route.v4";
 pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v1";
 pub(crate) const OPERATOR_ROUTE_SCHEMA_VERSION: &str = "milk.route.v1";
-pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "dragontales.winner-admission-receipt.v2";
-const ROUTE_LIVE_SCHEMA_VERSION: &str = "dragontales.route-live.v1";
+pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "milk.winner-admission-receipt.v2";
+const ROUTE_LIVE_SCHEMA_VERSION: &str = "milk.route-live.v1";
 const BASELINE_ROUTE_REVISION: &str = "openai-baseline-v1";
 pub(crate) const MAX_ROUTE_MANIFEST_BYTES: usize = 8 * 1_024;
 pub(crate) const MAX_WINNER_ADMISSION_BYTES: usize = 8 * 1_024;
@@ -101,7 +101,7 @@ impl RouteStartupConfig {
 
     pub(crate) fn winner_deployment_authority(&self) -> Result<WinnerDeploymentAuthority> {
         let authority = WinnerDeploymentAuthority {
-            schema_version: "dragontales.winner-deployment-authority.v3".to_owned(),
+            schema_version: "milk.winner-deployment-authority.v3".to_owned(),
             provider_policy: WinnerProviderPolicy {
                 only: WINNER_PROVIDER.to_owned(),
             },
@@ -189,7 +189,7 @@ impl WinnerDeploymentAuthority {
             &self.admission_program_sha256,
             "authorized admission program SHA-256",
         )?;
-        if self.schema_version != "dragontales.winner-deployment-authority.v3"
+        if self.schema_version != "milk.winner-deployment-authority.v3"
             || self.provider_policy.only != WINNER_PROVIDER
             || self.authorization_not_after.nanosecond() != 0
             || !(60..=MAX_WINNER_DEPLOYMENT_WALL_SECONDS).contains(&self.max_wall_seconds)
@@ -213,7 +213,7 @@ impl WinnerDeploymentAuthority {
     pub(crate) fn provider_binding_sha256(&self) -> Result<[u8; 32]> {
         self.validate()?;
         let mut digest = Sha256::new();
-        digest.update(b"dragontales.winner-provider-binding.v1\0");
+        digest.update(b"milk.winner-provider-binding.v1\0");
         digest.update(serde_json::to_vec(self)?);
         Ok(digest.finalize().into())
     }
@@ -442,7 +442,7 @@ impl WinnerAdmissionReceipt {
 
     pub(crate) fn deployment_sha256(&self) -> Result<[u8; 32]> {
         let mut deployment = Sha256::new();
-        deployment.update(b"dragontales.student-deployment.v2\0");
+        deployment.update(b"milk.student-deployment.v2\0");
         deployment.update(serde_json::to_vec(self)?);
         Ok(deployment.finalize().into())
     }
@@ -2743,13 +2743,13 @@ mod tests {
         let authority = fixture.config.winner_deployment_authority().unwrap();
         let encoded = serde_json::to_string(&authority).unwrap();
         assert!(encoded.starts_with(
-            r#"{"schema_version":"dragontales.winner-deployment-authority.v3","provider_policy":{"only":"baseten"},"provider_terms_sha256":"#
+            r#"{"schema_version":"milk.winner-deployment-authority.v3","provider_policy":{"only":"baseten"},"provider_terms_sha256":"#
         ));
         assert!(!encoded.contains("primary"));
         assert!(!encoded.contains("fallback"));
 
         let mut obsolete = authority;
-        obsolete.schema_version = "dragontales.winner-deployment-authority.v2".to_owned();
+        obsolete.schema_version = "milk.winner-deployment-authority.v2".to_owned();
         assert!(obsolete.validate().is_err());
     }
 

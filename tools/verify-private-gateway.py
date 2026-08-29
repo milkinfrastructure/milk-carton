@@ -15,8 +15,8 @@ import urllib.request
 from github_registry import package_visibility
 
 
-REPOSITORY = "ghcr.io/milkinfrastructure/milk-gateway"
-SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-gateway"
+REPOSITORY = "ghcr.io/milkinfrastructure/milk-carton"
+SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-carton"
 GITHUB_USERNAME = "ShantanuJoshi"
 BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
 BUILDKIT_VERSION = "v0.23.2"
@@ -36,7 +36,7 @@ SLSA_V1 = "https://slsa.dev/provenance/v1"
 SPDX = "https://spdx.dev/Document"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-TAGGED = re.compile(r"ghcr\.io/milkinfrastructure/milk-gateway:source-[0-9a-f]{40}\Z")
+TAGGED = re.compile(r"ghcr\.io/milkinfrastructure/milk-carton:source-[0-9a-f]{40}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 MAX_TOKEN_BYTES = 8_192
 MAX_AUTH_BYTES = 1_048_576
@@ -131,7 +131,7 @@ def _registry_bearer(github_token):
     query = urllib.parse.urlencode(
         {
             "service": "ghcr.io",
-            "scope": "repository:milkinfrastructure/milk-gateway:pull",
+            "scope": "repository:milkinfrastructure/milk-carton:pull",
         }
     )
     basic = base64.b64encode(
@@ -142,7 +142,7 @@ def _registry_bearer(github_token):
         headers={
             "Accept": "application/json",
             "Authorization": "Basic " + basic,
-            "User-Agent": "milk-gateway-release/1",
+            "User-Agent": "milk-carton-release/1",
         },
     )
     response = _object(_open_bytes(request, MAX_AUTH_BYTES, "GHCR authorization"), "GHCR authorization")
@@ -156,12 +156,12 @@ def _registry_blob(bearer, digest):
     if DIGEST.fullmatch(digest) is None:
         raise ValueError("registry blob digest is invalid")
     request = urllib.request.Request(
-        "https://ghcr.io/v2/milkinfrastructure/milk-gateway/blobs/"
+        "https://ghcr.io/v2/milkinfrastructure/milk-carton/blobs/"
         + urllib.parse.quote(digest, safe=":"),
         headers={
             "Accept": "application/octet-stream",
             "Authorization": "Bearer " + bearer,
-            "User-Agent": "milk-gateway-release/1",
+            "User-Agent": "milk-carton-release/1",
         },
     )
     raw = _open_bytes(request, MAX_BLOB_BYTES, "GHCR content blob")
@@ -543,7 +543,7 @@ def verify(arguments, github_token):
         raise ValueError("runtime configuration payload is missing")
     if runtime.get("User") != "65532:65532":
         raise ValueError("gateway runtime user is not 65532:65532")
-    if runtime.get("Entrypoint") != ["/usr/local/bin/dragontales-gateway"]:
+    if runtime.get("Entrypoint") != ["/usr/local/bin/milk-carton"]:
         raise ValueError("gateway runtime entrypoint is invalid")
     if runtime.get("Cmd") != ["serve"]:
         raise ValueError("gateway runtime command is invalid")
@@ -606,10 +606,10 @@ def verify(arguments, github_token):
     statements.sort(key=lambda item: (item["predicate_type"], item["layer_sha256"]))
 
     visibility = package_visibility(
-        github_token.encode("ascii"), "milkinfrastructure", "milk-gateway"
+        github_token.encode("ascii"), "milkinfrastructure", "milk-carton"
     )
     if visibility != "private":
-        raise ValueError("Milk gateway package is not private")
+        raise ValueError("Milk Carton package is not private")
 
     build_log = _object(
         arguments.evidence_dir.joinpath("build-log.json").read_bytes(),

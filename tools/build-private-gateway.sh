@@ -2,8 +2,8 @@
 set -eu
 umask 077
 
-REPOSITORY=ghcr.io/milkinfrastructure/milk-gateway
-SOURCE_REPOSITORY=https://github.com/milkinfrastructure/milk-gateway
+REPOSITORY=ghcr.io/milkinfrastructure/milk-carton
+SOURCE_REPOSITORY=https://github.com/milkinfrastructure/milk-carton
 BUILDKIT_IMAGE=moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
 BUILDKIT_VERSION=v0.23.2
 DOCKERFILE_FRONTEND=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
@@ -64,14 +64,14 @@ done
 
 credential_names=$(env | sed 's/=.*//' | LC_ALL=C sort)
 if printf '%s\n' "$credential_names" | grep -Eq \
-  '^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|CLOUDFLARE_|TEACHER_|WANDB_|DRAGONTALES_|DOCKER_|BUILDX_|BUILDKIT_).*|^(GOOGLE_APPLICATION_CREDENTIALS|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|NVIDIA_API_KEY|NGC_API_KEY|CODEX_API_KEY|CODEX_AUTH_TOKEN|CODEX_TOKEN|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|CR_PAT|CI_JOB_TOKEN|CI_REGISTRY_PASSWORD|NPM_TOKEN|PYPI_TOKEN|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|REGISTRY_AUTH_FILE|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy)$|^CARGO_REGISTRIES_.*_TOKEN$|^MILK_.*(AWS|R2|S3|STORE|TEACHER|PROVIDER|CREDENTIAL|SECRET|TOKEN|ACCESS_KEY)'; then
+  '^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|CLOUDFLARE_|TEACHER_|WANDB_|MILK_CARTON_|DOCKER_|BUILDX_|BUILDKIT_).*|^(GOOGLE_APPLICATION_CREDENTIALS|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|NVIDIA_API_KEY|NGC_API_KEY|CODEX_API_KEY|CODEX_AUTH_TOKEN|CODEX_TOKEN|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|CR_PAT|CI_JOB_TOKEN|CI_REGISTRY_PASSWORD|NPM_TOKEN|PYPI_TOKEN|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|REGISTRY_AUTH_FILE|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy)$|^CARGO_REGISTRIES_.*_TOKEN$|^MILK_.*(AWS|R2|S3|STORE|TEACHER|PROVIDER|CREDENTIAL|SECRET|TOKEN|ACCESS_KEY)'; then
   fail 'build shell contains an ambient registry, provider, store, teacher, OpenAI, or Codex credential/configuration' 64
 fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 cd "$repo"
 top_level=$(git rev-parse --show-toplevel 2>/dev/null) || fail 'release source is not a git checkout' 64
-[ "$top_level" = "$repo" ] || fail 'release script must run from the milk-gateway checkout' 64
+[ "$top_level" = "$repo" ] || fail 'release script must run from the milk-carton checkout' 64
 commit=$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || fail 'release checkout has no commit' 64
 [ "${#commit}" -eq 40 ] || fail 'source commit must be a full SHA-1' 64
 case "$commit" in
@@ -84,8 +84,8 @@ esac
 [ -z "$(git status --porcelain=v1 --untracked-files=all)" ] || fail 'release checkout must be clean' 64
 origin=$(git remote get-url origin 2>/dev/null) || fail 'release checkout has no origin' 64
 case "$origin" in
-  git@github.com:milkinfrastructure/milk-gateway.git|https://github.com/milkinfrastructure/milk-gateway.git) ;;
-  *) fail 'origin must be milkinfrastructure/milk-gateway' 64 ;;
+  git@github.com:milkinfrastructure/milk-carton.git|https://github.com/milkinfrastructure/milk-carton.git) ;;
+  *) fail 'origin must be milkinfrastructure/milk-carton' 64 ;;
 esac
 remote_head=$(git ls-remote --exit-code origin HEAD 2>/dev/null) || fail 'cannot resolve origin HEAD' 64
 set -- $remote_head
@@ -160,11 +160,11 @@ PY
     "$docker" --config "$docker_config" buildx rm --force "$builder" >/dev/null 2>&1 || :
   fi
   case "$scratch" in
-    "${TMPDIR:-/tmp}"/milk-gateway-release.*) rm -rf -- "$scratch" ;;
+    "${TMPDIR:-/tmp}"/milk-carton-release.*) rm -rf -- "$scratch" ;;
   esac
   if [ -n "$cache_work" ] && [ -n "$cache_parent" ]; then
     case "$cache_work" in
-      "$cache_parent"/.milk-gateway-cache.*) rm -rf -- "$cache_work" ;;
+      "$cache_parent"/.milk-carton-cache.*) rm -rf -- "$cache_work" ;;
     esac
   fi
   exit "$status"
@@ -174,7 +174,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/milk-gateway-release.XXXXXX") || \
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/milk-carton-release.XXXXXX") || \
   fail 'cannot create release scratch directory' 73
 registry_token=$scratch/github-registry-token
 if [ "$registry_token_stdin" -eq 1 ]; then
@@ -234,7 +234,7 @@ PY
   cache_dir=$(printf '%s\n' "$cache_validation" | sed -n '1p')
   cache_parent=$(printf '%s\n' "$cache_validation" | sed -n '2p')
   cache_imported=$(printf '%s\n' "$cache_validation" | sed -n '3p')
-  cache_work=$(mktemp -d "$cache_parent/.milk-gateway-cache.XXXXXX") || \
+  cache_work=$(mktemp -d "$cache_parent/.milk-carton-cache.XXXXXX") || \
     fail 'cannot create local BuildKit cache export directory' 73
   cache_enabled=true
 fi
@@ -260,7 +260,7 @@ ln -s -- "$buildx_plugin" "$docker_config/cli-plugins/docker-buildx" || \
   fail 'cannot install buildx in the isolated Docker configuration' 73
 "$docker" --config "$docker_config" buildx version >/dev/null 2>&1 || \
   fail 'docker buildx is unavailable in the isolated Docker configuration' 69
-builder=milk-gateway-$(printf '%.12s' "$commit")-$$
+builder=milk-carton-$(printf '%.12s' "$commit")-$$
 
 failure_stage=source-context
 source_context=$scratch/source-context.tar
@@ -295,7 +295,7 @@ Path(path).write_text(json.dumps({
     "schema_version": "milk.private-gateway-release-input.v1",
     "source_commit": commit,
     "source_date_epoch": int(source_epoch),
-    "source_repository": "https://github.com/milkinfrastructure/milk-gateway",
+    "source_repository": "https://github.com/milkinfrastructure/milk-carton",
     "source_context_method": "git-archive-tar-v1",
     "source_context_sha256": context_sha256,
     "buildkit_image_reference": buildkit,
@@ -308,11 +308,11 @@ PY
 failure_stage=package-preflight
 package_visibility=$(
   "$python" "$repo/tools/github_registry.py" --repository "$repo" \
-    --token-file "$registry_token" package-visibility milkinfrastructure milk-gateway
+    --token-file "$registry_token" package-visibility milkinfrastructure milk-carton
 ) || fail 'cannot inspect Milk container package' 77
 case "$package_visibility" in
   absent|private) ;;
-  *) fail 'an existing milk-gateway package is not private' 77 ;;
+  *) fail 'an existing milk-carton package is not private' 77 ;;
 esac
 
 failure_stage=registry-auth
@@ -484,7 +484,7 @@ from pathlib import Path
     path, commit, source_epoch, image_reference, admission_sha256, buildkit,
     frontend, started_at, completed_at, ops_log_path,
 ) = sys.argv[1:]
-if re.fullmatch(r"ghcr\.io/milkinfrastructure/milk-gateway@sha256:[0-9a-f]{64}", image_reference) is None:
+if re.fullmatch(r"ghcr\.io/milkinfrastructure/milk-carton@sha256:[0-9a-f]{64}", image_reference) is None:
     raise SystemExit(1)
 if re.fullmatch(r"[0-9a-f]{64}", admission_sha256) is None:
     raise SystemExit(1)
@@ -492,7 +492,7 @@ Path(path).write_text(json.dumps({
     "schema_version": "milk.private-gateway-release.v1",
     "source_commit": commit,
     "source_date_epoch": int(source_epoch),
-    "source_repository": "https://github.com/milkinfrastructure/milk-gateway",
+    "source_repository": "https://github.com/milkinfrastructure/milk-carton",
     "buildkit_image_reference": buildkit,
     "dockerfile_frontend_reference": frontend,
     "build_authority": "local-socket",

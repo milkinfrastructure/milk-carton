@@ -52,26 +52,26 @@ use route::{
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 const RESPONSES_PATH: &str = "/v1/responses";
-const OUTCOME_PATH: &str = "/v1/dragontales/outcomes";
+const OUTCOME_PATH: &str = "/v1/milk/outcomes";
 const CANDIDATE_CREDENTIAL_PATH: &str = "/healthz/candidate-credential";
-const CONFIG_SHA256_HEADER: &str = "x-dragontales-config-sha256";
-const OUTCOME_KEY_HEADER: &str = "x-dragontales-key";
-const TRACE_ID_HEADER: &str = "x-dragontales-trace-id";
-const CAPTURE_INTENT_HEADER: &str = "x-dragontales-capture-intent";
+const CONFIG_SHA256_HEADER: &str = "x-milk-config-sha256";
+const OUTCOME_KEY_HEADER: &str = "x-milk-key";
+const TRACE_ID_HEADER: &str = "x-milk-trace-id";
+const CAPTURE_INTENT_HEADER: &str = "x-milk-capture-intent";
 const SESSION_ID_HEADER: &str = "x-milk-session-id";
-const ERROR_SOURCE_HEADER: &str = "x-dragontales-error-source";
-const ROUTE_REVISION_HEADER: &str = "x-dragontales-route-revision";
-const ROUTE_TARGET_HEADER: &str = "x-dragontales-route-target";
-const CANDIDATE_SHA256_HEADER: &str = "x-dragontales-candidate-sha256";
-const ARTIFACT_SHA256_HEADER: &str = "x-dragontales-artifact-sha256";
-const DEPLOYMENT_SHA256_HEADER: &str = "x-dragontales-deployment-sha256";
-const CANDIDATE_API_KEY_SHA256_HEADER: &str = "x-dragontales-candidate-api-key-sha256";
-const CANDIDATE_CREDENTIAL_STATE_HEADER: &str = "x-dragontales-candidate-credential-state";
-const ROUTE_SECRET_ENV: &str = "DRAGONTALES_ROUTE_SECRET_HEX";
-const CONFIG_JSON_ENV: &str = "DRAGONTALES_CONFIG_JSON";
-const OPENAI_API_KEY_ENV: &str = "DRAGONTALES_OPENAI_API_KEY";
-const TEACHER_API_KEY_ENV: &str = "DRAGONTALES_TEACHER_API_KEY";
-const CANDIDATE_API_KEY_ENV: &str = "DRAGONTALES_CANDIDATE_API_KEY";
+const ERROR_SOURCE_HEADER: &str = "x-milk-error-source";
+const ROUTE_REVISION_HEADER: &str = "x-milk-route-revision";
+const ROUTE_TARGET_HEADER: &str = "x-milk-route-target";
+const CANDIDATE_SHA256_HEADER: &str = "x-milk-candidate-sha256";
+const ARTIFACT_SHA256_HEADER: &str = "x-milk-artifact-sha256";
+const DEPLOYMENT_SHA256_HEADER: &str = "x-milk-deployment-sha256";
+const CANDIDATE_API_KEY_SHA256_HEADER: &str = "x-milk-candidate-api-key-sha256";
+const CANDIDATE_CREDENTIAL_STATE_HEADER: &str = "x-milk-candidate-credential-state";
+const ROUTE_SECRET_ENV: &str = "MILK_CARTON_ROUTE_SECRET_HEX";
+const CONFIG_JSON_ENV: &str = "MILK_CARTON_CONFIG_JSON";
+const OPENAI_API_KEY_ENV: &str = "MILK_CARTON_OPENAI_API_KEY";
+const TEACHER_API_KEY_ENV: &str = "MILK_CARTON_TEACHER_API_KEY";
+const CANDIDATE_API_KEY_ENV: &str = "MILK_CARTON_CANDIDATE_API_KEY";
 const CAPTURE_SAMPLING_KEY_ENV: &str = "MILK_CAPTURE_SAMPLING_KEY_HEX";
 const CAPTURE_SAMPLING_KEY_VERSION_ENV: &str = "MILK_CAPTURE_SAMPLING_KEY_VERSION";
 const NO_CAPTURE_SAMPLING_KEY_VERSION: &str = "not-applicable";
@@ -95,7 +95,7 @@ static OUTCOME_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long, env = "DRAGONTALES_CONFIG")]
+    #[arg(long, env = "MILK_CARTON_CONFIG")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -510,7 +510,7 @@ impl Gateway {
     ) -> Result<Self> {
         Self::with_route_config_identity(
             config,
-            Sha256::digest(b"dragontales-test-config").into(),
+            Sha256::digest(b"milk-carton-test-config").into(),
             upstream_api_base,
             records,
             route,
@@ -1519,7 +1519,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(&WinnerRouteAdvanceWrite {
-                    schema_version: "dragontales.winner-route-advance.v1",
+                    schema_version: "milk.winner-route-advance.v1",
                     action: advance.action,
                     route_revision: advance.publication.revision_hex(),
                     not_after: advance.publication.not_after,
@@ -1865,7 +1865,7 @@ async fn status_once(config: &FileConfig, now: DateTime<Utc>) -> Result<String> 
         .await?;
     let route = route_status(config, &records, now).await?;
     Ok(serde_json::to_string(&StatusWrite {
-        schema_version: "dragontales.status.v2",
+        schema_version: "milk.status.v2",
         records: record_status,
         route,
     })?)
@@ -1885,7 +1885,7 @@ async fn generation_status_once(config: &FileConfig, now: DateTime<Utc>) -> Resu
         .await?;
     let generation = status.generation;
     Ok(serde_json::to_string(&GenerationStatusWrite {
-        schema_version: "dragontales.generation-status.v1",
+        schema_version: "milk.generation-status.v1",
         scope_id: config.scope_id,
         max_decisions: generation.max_decisions,
         claimed_decisions: generation.claimed_decisions,
@@ -3092,7 +3092,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
         return HttpResponse::BadRequest()
             .insert_header((header::CACHE_CONTROL, "no-store"))
             .json(CandidateCredentialMismatch {
-                schema_version: "dragontales.candidate-credential-check.v1",
+                schema_version: "milk.candidate-credential-check.v1",
                 state: "invalid",
             });
     };
@@ -3100,7 +3100,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
         return HttpResponse::BadRequest()
             .insert_header((header::CACHE_CONTROL, "no-store"))
             .json(CandidateCredentialMismatch {
-                schema_version: "dragontales.candidate-credential-check.v1",
+                schema_version: "milk.candidate-credential-check.v1",
                 state: "invalid",
             });
     };
@@ -3111,7 +3111,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
             return HttpResponse::BadRequest()
                 .insert_header((header::CACHE_CONTROL, "no-store"))
                 .json(CandidateCredentialMismatch {
-                    schema_version: "dragontales.candidate-credential-check.v1",
+                    schema_version: "milk.candidate-credential-check.v1",
                     state: "invalid",
                 });
         };
@@ -3124,7 +3124,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
             return HttpResponse::Conflict()
                 .insert_header((header::CACHE_CONTROL, "no-store"))
                 .json(CandidateCredentialMismatch {
-                    schema_version: "dragontales.candidate-credential-check.v1",
+                    schema_version: "milk.candidate-credential-check.v1",
                     state: "mismatch",
                 });
         }
@@ -3134,7 +3134,7 @@ async fn candidate_credential(request: HttpRequest, gateway: web::Data<Gateway>)
         .insert_header((CANDIDATE_API_KEY_SHA256_HEADER, expected_text))
         .insert_header((CANDIDATE_CREDENTIAL_STATE_HEADER, state))
         .json(CandidateCredentialResponse {
-            schema_version: "dragontales.candidate-credential-check.v1",
+            schema_version: "milk.candidate-credential-check.v1",
             candidate_api_key_sha256: (state == "loaded").then_some(expected_text),
             state,
         })
@@ -3154,7 +3154,7 @@ async fn outcome(
         return local_error(
             StatusCode::UNAUTHORIZED,
             trace_id,
-            "Invalid Dragontales outcome key.",
+            "Invalid Milk Carton outcome key.",
             "invalid_outcome_key",
         );
     }
@@ -3172,7 +3172,7 @@ async fn outcome(
             return local_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 trace_id,
-                "Dragontales is at its configured request limit.",
+                "Milk Carton is at its configured request limit.",
                 "gateway_over_capacity",
             );
         }
@@ -3339,8 +3339,8 @@ async fn proxy_openai(
         return local_error(
             StatusCode::UNAUTHORIZED,
             trace_id,
-            "Invalid Dragontales API key.",
-            "invalid_dragontales_api_key",
+            "Invalid Milk Carton API key.",
+            "invalid_milk_api_key",
         );
     };
     let occurred_at = Utc::now();
@@ -3352,7 +3352,7 @@ async fn proxy_openai(
             return local_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 trace_id,
-                "Dragontales is at its configured request limit.",
+                "Milk Carton is at its configured request limit.",
                 "gateway_over_capacity",
             );
         }
@@ -4052,7 +4052,7 @@ fn valid_outcome_key(headers: &HeaderMap, expected_id: Uuid, expected_sha256: &[
     let Ok(raw) = value.to_str() else {
         return false;
     };
-    let Some(value) = raw.strip_prefix("dt_live_") else {
+    let Some(value) = raw.strip_prefix("milk_live_") else {
         return false;
     };
     let Some((key_id, secret)) = value.split_once('_') else {
@@ -4093,7 +4093,7 @@ fn authenticate_traffic_key<'a>(
 }
 
 fn valid_traffic_key(raw: &str) -> bool {
-    let Some(value) = raw.strip_prefix("dt_live_") else {
+    let Some(value) = raw.strip_prefix("milk_live_") else {
         return false;
     };
     let Some((key_id, secret)) = value.split_once('_') else {
@@ -4134,7 +4134,7 @@ fn upstream_request_headers(
     for (name, value) in headers {
         let lower = name.as_str().to_ascii_lowercase();
         if stripped.contains(&lower)
-            || lower.starts_with("x-dragontales-")
+            || lower.starts_with("x-milk-")
             || lower == SESSION_ID_HEADER
             || matches!(
                 lower.as_str(),
@@ -4177,7 +4177,7 @@ fn downstream_response_headers(
     for (name, value) in headers {
         let lower = name.as_str().to_ascii_lowercase();
         if stripped.contains(&lower)
-            || lower.starts_with("x-dragontales-")
+            || lower.starts_with("x-milk-")
             || (target == RouteTarget::Candidate
                 && (lower.starts_with("openai-") || lower.starts_with("x-openai-")))
             || !allowed_downstream_response_header(&lower)
@@ -4466,9 +4466,9 @@ mod cli_tests {
         }
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/dragontales-config.example.json"
+            "/../../deploy/milk-carton-config.example.json"
         ))
-        .replace("/var/lib/dragontales", directory.to_str().unwrap())
+        .replace("/var/lib/milk-carton", directory.to_str().unwrap())
     }
 
     fn s3_store(bucket: &str) -> ObjectStoreConfig {
@@ -4507,13 +4507,9 @@ mod cli_tests {
     #[test]
     fn removed_commands_are_rejected() {
         for removed in REMOVED_COMMANDS {
-            let error = Cli::try_parse_from([
-                "dragontales-gateway",
-                "--config",
-                "/tmp/config.json",
-                removed,
-            ])
-            .unwrap_err();
+            let error =
+                Cli::try_parse_from(["milk-carton", "--config", "/tmp/config.json", removed])
+                    .unwrap_err();
             assert_eq!(
                 error.kind(),
                 ErrorKind::InvalidSubcommand,
@@ -4524,11 +4520,11 @@ mod cli_tests {
 
     #[test]
     fn retained_commands_parse_with_exact_inputs() {
-        let inline_serve = Cli::try_parse_from(["dragontales-gateway", "serve"]).unwrap();
+        let inline_serve = Cli::try_parse_from(["milk-carton", "serve"]).unwrap();
         assert!(inline_serve.config.is_none());
         assert!(matches!(inline_serve.command, Some(Command::Serve)));
 
-        let prefix = ["dragontales-gateway", "--config", "/tmp/config.json"];
+        let prefix = ["milk-carton", "--config", "/tmp/config.json"];
         assert!(matches!(
             Cli::try_parse_from([prefix[0], prefix[1], prefix[2], "serve"])
                 .unwrap()
@@ -4563,7 +4559,7 @@ mod cli_tests {
                 "--student-job-id",
                 &"a".repeat(64),
                 "--stage-dir",
-                "/run/dragontales/job",
+                "/run/milk-carton/job",
             ])
             .unwrap()
             .command,
@@ -4578,7 +4574,7 @@ mod cli_tests {
                 "--student-job-id",
                 &"b".repeat(64),
                 "--stage-dir",
-                "/run/dragontales/winner",
+                "/run/milk-carton/winner",
             ])
             .unwrap()
             .command,
@@ -4591,11 +4587,11 @@ mod cli_tests {
                 prefix[2],
                 "ingest-student-train-execution",
                 "--result",
-                "/run/dragontales/train-result.json",
+                "/run/milk-carton/train-result.json",
                 "--upload",
-                "/run/dragontales/upload.json",
+                "/run/milk-carton/upload.json",
                 "--artifact-dir",
-                "/run/dragontales/artifacts",
+                "/run/milk-carton/artifacts",
             ])
             .unwrap()
             .command,
@@ -4612,7 +4608,7 @@ mod cli_tests {
                 "--variant",
                 "static_fp8",
                 "--stage-dir",
-                "/run/dragontales/branch",
+                "/run/milk-carton/branch",
             ])
             .unwrap()
             .command,
@@ -4625,11 +4621,11 @@ mod cli_tests {
                 prefix[2],
                 "ingest-student-branch-execution",
                 "--result",
-                "/run/dragontales/branch-result.json",
+                "/run/milk-carton/branch-result.json",
                 "--upload",
-                "/run/dragontales/upload.json",
+                "/run/milk-carton/upload.json",
                 "--artifact-dir",
-                "/run/dragontales/artifacts",
+                "/run/milk-carton/artifacts",
             ])
             .unwrap()
             .command,
@@ -4642,7 +4638,7 @@ mod cli_tests {
                 prefix[2],
                 "ingest-student-winner-deployment-result",
                 "--result",
-                "/run/dragontales/winner-deployment-result.json",
+                "/run/milk-carton/winner-deployment-result.json",
             ])
             .unwrap()
             .command,
@@ -4655,7 +4651,7 @@ mod cli_tests {
                 prefix[2],
                 "ingest-provider-teardown-result",
                 "--result",
-                "/run/dragontales/provider-teardown-result.json",
+                "/run/milk-carton/provider-teardown-result.json",
             ])
             .unwrap()
             .command,
@@ -4672,7 +4668,7 @@ mod cli_tests {
                 "--phase",
                 "canary",
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
             ])
             .unwrap()
             .command,
@@ -4690,7 +4686,7 @@ mod cli_tests {
                 "--student-job-id",
                 &"c".repeat(64),
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
             ])
             .unwrap()
             .command,
@@ -4703,9 +4699,9 @@ mod cli_tests {
                 prefix[2],
                 "prepare-route-proposal",
                 "--proposal",
-                "/run/dragontales/route-proposal.json",
+                "/run/milk-carton/route-proposal.json",
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
             ])
             .unwrap()
             .command,
@@ -4718,7 +4714,7 @@ mod cli_tests {
                 prefix[2],
                 "publish-route",
                 "--manifest",
-                "/run/dragontales/route.json",
+                "/run/milk-carton/route.json",
                 "--check-only",
             ])
             .unwrap()
@@ -4733,7 +4729,7 @@ mod cli_tests {
     #[test]
     fn winner_route_advance_output_is_strict_and_content_free() {
         let output = WinnerRouteAdvanceWrite {
-            schema_version: "dragontales.winner-route-advance.v1",
+            schema_version: "milk.winner-route-advance.v1",
             action: WinnerRouteAdvanceAction::Observe,
             route_revision: "a".repeat(64),
             not_after: "2026-08-25T12:15:00Z".parse().unwrap(),
@@ -4741,7 +4737,7 @@ mod cli_tests {
         assert_eq!(
             serde_json::to_string(&output).unwrap(),
             format!(
-                r#"{{"schema_version":"dragontales.winner-route-advance.v1","action":"observe","route_revision":"{}","not_after":"2026-08-25T12:15:00Z"}}"#,
+                r#"{{"schema_version":"milk.winner-route-advance.v1","action":"observe","route_revision":"{}","not_after":"2026-08-25T12:15:00Z"}}"#,
                 "a".repeat(64)
             )
         );
@@ -4750,7 +4746,7 @@ mod cli_tests {
     #[test]
     fn route_publication_is_strictly_two_phase() {
         let base = [
-            "dragontales-gateway",
+            "milk-carton",
             "--config",
             "/tmp/config.json",
             "publish-route",
@@ -4895,7 +4891,7 @@ mod cli_tests {
     fn one_s3_bucket_can_back_all_store_roles() {
         let mut config: FileConfig = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/dragontales-config.example.json"
+            "/../../deploy/milk-carton-config.example.json"
         )))
         .unwrap();
         let shared = s3_store("milk-pilot-test");
@@ -4951,7 +4947,7 @@ mod cli_tests {
         ]);
         let mut config: FileConfig = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/dragontales-config.example.json"
+            "/../../deploy/milk-carton-config.example.json"
         )))
         .unwrap();
         config.stores = StoresConfig {
@@ -4973,7 +4969,7 @@ mod cli_tests {
     fn inline_config_is_bounded_exclusive_and_serve_only() {
         let directory = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("dragontales-inline-config-test-{}", Uuid::now_v7()));
+            .join(format!("milk-carton-inline-config-test-{}", Uuid::now_v7()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&directory)
@@ -5038,14 +5034,14 @@ mod cli_tests {
             load_selected_config(None, Some(unknown.as_bytes()), Some(&Command::Serve))
                 .unwrap_err()
                 .to_string()
-                .contains("invalid DRAGONTALES_CONFIG_JSON")
+                .contains("invalid MILK_CARTON_CONFIG_JSON")
         );
         let legacy = config_json.replacen("\"stores\"", "\"object_store\"", 1);
         assert!(
             load_selected_config(None, Some(legacy.as_bytes()), Some(&Command::Serve))
                 .unwrap_err()
                 .to_string()
-                .contains("invalid DRAGONTALES_CONFIG_JSON")
+                .contains("invalid MILK_CARTON_CONFIG_JSON")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5054,7 +5050,7 @@ mod cli_tests {
     fn local_serve_and_operator_commands_load_private_config() {
         let directory = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("dragontales-local-config-test-{}", Uuid::now_v7()));
+            .join(format!("milk-carton-local-config-test-{}", Uuid::now_v7()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&directory)
@@ -5085,7 +5081,7 @@ mod cli_tests {
         assert!(validate_serve_config_owner(&config, InputOwner::CurrentPrivate).is_err());
         validate_serve_config_owner(&config, InputOwner::RootDeployment).unwrap();
         config.listen = "127.0.0.1:8080".parse().unwrap();
-        config.stores.capture = s3_store("dragontales-test");
+        config.stores.capture = s3_store("milk-carton-test");
         assert!(validate_serve_config_owner(&config, InputOwner::CurrentPrivate).is_err());
         validate_serve_config_owner(&config, InputOwner::RootDeployment).unwrap();
 
@@ -5095,7 +5091,7 @@ mod cli_tests {
     #[test]
     fn operator_input_rejects_unsafe_files_and_detects_rewrites() {
         let directory = std::env::temp_dir().join(format!(
-            "dragontales-operator-input-test-{}",
+            "milk-carton-operator-input-test-{}",
             Uuid::now_v7()
         ));
         fs::create_dir(&directory).unwrap();
@@ -5126,7 +5122,7 @@ mod cli_tests {
     #[test]
     fn private_output_is_create_only_and_exactly_0400() {
         let directory = std::env::temp_dir().join(format!(
-            "dragontales-private-output-test-{}",
+            "milk-carton-private-output-test-{}",
             Uuid::now_v7()
         ));
         fs::create_dir(&directory).unwrap();

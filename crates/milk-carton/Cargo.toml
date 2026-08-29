@@ -1,5 +1,5 @@
 [package]
-name = "dragontales-gateway"
+name = "milk-carton"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

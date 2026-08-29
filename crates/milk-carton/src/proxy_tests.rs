@@ -44,10 +44,10 @@ use crate::records::{
 use crate::route::{RouteEndpoint, RoutePolicy, RouteStartupConfig};
 
 const OUTCOME_KEY_ID: &str = "018f3f54-7a5b-7cc0-8000-000000000002";
-const KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001";
-const SMOKE_KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000003_test-smoke-secret-0003";
+const KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001";
+const SMOKE_KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000003_test-smoke-secret-0003";
 const SESSION_ID: &str = "production-test-session";
-const OUTCOME_KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000002_test-outcome-secret-0002";
+const OUTCOME_KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000002_test-outcome-secret-0002";
 const CANDIDATE_KEY: &str = "candidate-test-secret";
 
 fn local_stores(root: &Path) -> StoresConfig {
@@ -117,7 +117,7 @@ fn traffic_authentication_returns_only_capture_authority() {
         actix_web::http::header::HeaderValue::from_str(&format!("Bearer {KEY}")).unwrap(),
     );
     headers.insert(
-        actix_web::http::header::HeaderName::from_static("x-dragontales-route-unit"),
+        actix_web::http::header::HeaderName::from_static("x-milk-route-unit"),
         actix_web::http::header::HeaderValue::from_static("caller-choice"),
     );
     let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
@@ -313,7 +313,7 @@ fn student_runtime_images_are_immutable_and_branch_matches_route_authority() {
 fn gpu_teacher_file_config_requires_shared_s3_storage() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-gpu-local-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-gpu-local-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let mut gpu = config(1_024, 4);
     let teacher = gpu.teacher.as_mut().unwrap();
@@ -435,7 +435,7 @@ async fn due_expiry_returns_before_teacher_readiness() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!(
-            "dragontales-expiry-before-teacher-{}",
+            "milk-carton-expiry-before-teacher-{}",
             Uuid::now_v7()
         ));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -513,7 +513,7 @@ async fn due_expiry_returns_before_teacher_readiness() {
     .await
     .unwrap();
     let output = tick_once_with_records(&config, now, records).await.unwrap();
-    assert!(output.starts_with(r#"{"schema_version":"dragontales.expiry-receipt.v1""#));
+    assert!(output.starts_with(r#"{"schema_version":"milk.expiry-receipt.v1""#));
     assert!(!output.contains("teacher-required"));
     fs::remove_dir_all(root).unwrap();
 }
@@ -541,7 +541,7 @@ async fn status_contract_exposes_eval_teacher_decision_limit() {
 
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-status-contract-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-status-contract-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let mut config = config(4_096, 1);
     config.stores = local_stores(&root);
@@ -551,11 +551,8 @@ async fn status_contract_exposes_eval_teacher_decision_limit() {
         .await
         .unwrap();
     let status: StatusContract = serde_json::from_str(&raw).unwrap();
-    assert_eq!(status.schema_version, "dragontales.status.v2");
-    assert_eq!(
-        status.records.schema_version,
-        "dragontales.status-records.v5"
-    );
+    assert_eq!(status.schema_version, "milk.status.v2");
+    assert_eq!(status.records.schema_version, "milk.status-records.v5");
     assert_eq!(status.records.generation.max_decisions, 7);
     assert_eq!(status.records.generation.claimed_decisions, 0);
     assert_eq!(status.records.generation.remaining_decisions, 7);
@@ -577,7 +574,7 @@ async fn generation_status_is_content_free_and_scope_bound() {
 
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-generation-status-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-generation-status-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let mut config = config(4_096, 1);
     config.stores = local_stores(&root);
@@ -587,7 +584,7 @@ async fn generation_status_is_content_free_and_scope_bound() {
         .await
         .unwrap();
     let status: GenerationStatusContract = serde_json::from_str(&raw).unwrap();
-    assert_eq!(status.schema_version, "dragontales.generation-status.v1");
+    assert_eq!(status.schema_version, "milk.generation-status.v1");
     assert_eq!(status.scope_id, config.scope_id);
     assert_eq!(status.max_decisions, 7);
     assert_eq!(status.claimed_decisions, 0);
@@ -600,13 +597,13 @@ async fn generation_status_is_content_free_and_scope_bound() {
 fn serve_example_is_current_and_has_no_teacher_execution_config() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("dragontales-example-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-example-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let json = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/dragontales-config.example.json"
+        "/../../deploy/milk-carton-config.example.json"
     ))
-    .replace("/var/lib/dragontales/objects", root.to_str().unwrap());
+    .replace("/var/lib/milk-carton/objects", root.to_str().unwrap());
     let config: FileConfig = serde_json::from_str(&json).unwrap();
     assert!(config.teacher.is_none());
     validate_config_identity(&config).unwrap();
@@ -843,10 +840,7 @@ async fn disabled_capture_still_emits_content_free_statistics() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["x-dragontales-capture-intent"],
-        "not_selected"
-    );
+    assert_eq!(response.headers()["x-milk-capture-intent"], "not_selected");
     std::mem::drop(response.bytes().await.unwrap());
 
     let stats_bytes = timeout(Duration::from_secs(1), async {
@@ -1056,10 +1050,7 @@ async fn candidate_credential_check_proves_loaded_absent_and_mismatch_without_ke
             .any(|part| part == CANDIDATE_KEY.as_bytes())
     );
     let probe: CandidateCredentialProbe = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        probe.schema_version,
-        "dragontales.candidate-credential-check.v1"
-    );
+    assert_eq!(probe.schema_version, "milk.candidate-credential-check.v1");
     assert_eq!(
         probe.candidate_api_key_sha256.as_deref(),
         Some(candidate_sha256.as_str())
@@ -1117,7 +1108,7 @@ async fn health_reports_config_identity_without_credential_content() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    let expected_config_sha256 = format!("{:x}", Sha256::digest(b"dragontales-test-config"));
+    let expected_config_sha256 = format!("{:x}", Sha256::digest(b"milk-carton-test-config"));
     assert_eq!(
         response
             .headers()
@@ -1413,7 +1404,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
                             .insert_header(("x-request-id", "provider-request"))
                             .insert_header(("x-openai-proxy-wasm", "diagnostic"))
                             .insert_header(("set-cookie", "provider-cookie=must-not-stick"))
-                            .insert_header(("x-dragontales-trace-id", "spoofed"))
+                            .insert_header(("x-milk-trace-id", "spoofed"))
                             .body(Bytes::from_static(b"{ \"provider\": \"error\" }\n"))
                     }
                 }),
@@ -1435,7 +1426,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         .post(format!("{}/v1/chat/completions?beta=true", gateway.address))
         .bearer_auth(KEY)
         .header("openai-organization", "org-test")
-        .header("x-dragontales-internal", "remove-me")
+        .header("x-milk-internal", "remove-me")
         .header("cookie", "session=must-not-leak")
         .header("x-forwarded-for", "198.51.100.1")
         .header("connection", "x-remove-me")
@@ -1448,14 +1439,9 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
     assert_eq!(response.headers()["retry-after"], "7");
     assert_eq!(response.headers()["x-request-id"], "provider-request");
     assert_eq!(response.headers()["x-openai-proxy-wasm"], "diagnostic");
-    assert_eq!(
-        response.headers()["x-dragontales-capture-intent"],
-        "unavailable"
-    );
+    assert_eq!(response.headers()["x-milk-capture-intent"], "unavailable");
     assert!(response.headers().get("set-cookie").is_none());
-    let trace_id = response.headers()["x-dragontales-trace-id"]
-        .to_str()
-        .unwrap();
+    let trace_id = response.headers()["x-milk-trace-id"].to_str().unwrap();
     Uuid::parse_str(trace_id).unwrap();
     assert_ne!(trace_id, "spoofed");
     assert_eq!(
@@ -1471,8 +1457,8 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         Some(b"Bearer test-managed-openai-key".as_slice())
     );
     assert!(header(&seen.headers, "openai-organization").is_none());
-    assert!(header(&seen.headers, "x-dragontales-key").is_none());
-    assert!(header(&seen.headers, "x-dragontales-internal").is_none());
+    assert!(header(&seen.headers, "x-milk-key").is_none());
+    assert!(header(&seen.headers, "x-milk-internal").is_none());
     assert!(header(&seen.headers, "x-remove-me").is_none());
     assert!(header(&seen.headers, "cookie").is_none());
     assert!(header(&seen.headers, "x-forwarded-for").is_none());
@@ -1485,7 +1471,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         let response = request.body("{}").send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
         let error: LocalEnvelope = response.json().await.unwrap();
-        assert_eq!(error.error.code, "invalid_dragontales_api_key");
+        assert_eq!(error.error.code, "invalid_milk_api_key");
     }
     let mut duplicate_headers = reqwest::header::HeaderMap::new();
     duplicate_headers.append(
@@ -1507,7 +1493,7 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
     let traffic_key_on_outcomes = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
         .bearer_auth(KEY)
         .body("{}")
         .send()
@@ -1518,8 +1504,8 @@ async fn baseline_is_byte_transparent_and_isolates_headers() {
         reqwest::StatusCode::UNAUTHORIZED
     );
     let outcome_key_without_storage = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
-        .header("x-dragontales-key", OUTCOME_KEY)
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
+        .header("x-milk-key", OUTCOME_KEY)
         .body("{}")
         .send()
         .await
@@ -1678,11 +1664,8 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        response.headers()["x-dragontales-capture-intent"],
-        "selected"
-    );
-    let trace_id = response.headers()["x-dragontales-trace-id"]
+    assert_eq!(response.headers()["x-milk-capture-intent"], "selected");
+    let trace_id = response.headers()["x-milk-trace-id"]
         .to_str()
         .unwrap()
         .to_owned();
@@ -1695,8 +1678,8 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
     );
     assert_eq!(encoding_rx.await.unwrap(), Some(b"identity".to_vec()));
     let outcome = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
-        .header("x-dragontales-key", OUTCOME_KEY)
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
+        .header("x-milk-key", OUTCOME_KEY)
         .header("content-type", "application/json")
         .body(format!(
             r#"{{"trace_id":"{trace_id}","outcome_version":1,"value":{{"kind":"accepted"}}}}"#
@@ -1739,10 +1722,7 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        synthetic.headers()["x-dragontales-capture-intent"],
-        "not_selected"
-    );
+    assert_eq!(synthetic.headers()["x-milk-capture-intent"], "not_selected");
     std::mem::drop(synthetic.bytes().await.unwrap());
 
     let not_selected = client(false)
@@ -1754,7 +1734,7 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .await
         .unwrap();
     assert_eq!(
-        not_selected.headers()["x-dragontales-capture-intent"],
+        not_selected.headers()["x-milk-capture-intent"],
         "not_selected"
     );
     std::mem::drop(not_selected.bytes().await.unwrap());
@@ -1769,16 +1749,13 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
         .await
         .unwrap();
     assert_eq!(encoded.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        encoded.headers()["x-dragontales-capture-intent"],
-        "not_selected"
-    );
+    assert_eq!(encoded.headers()["x-milk-capture-intent"], "not_selected");
     std::mem::drop(encoded.bytes().await.unwrap());
 
     let unavailable_trace = Uuid::now_v7();
     let unavailable = client(false)
-        .post(format!("{}/v1/dragontales/outcomes", gateway.address))
-        .header("x-dragontales-key", OUTCOME_KEY)
+        .post(format!("{}/v1/milk/outcomes", gateway.address))
+        .header("x-milk-key", OUTCOME_KEY)
         .header("content-type", "application/json")
         .body(format!(
             r#"{{"trace_id":"{unavailable_trace}","outcome_version":1,"value":{{"kind":"accepted"}}}}"#
@@ -1851,7 +1828,7 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
                             .insert_header(("content-type", "application/json"))
                             .insert_header(("x-request-id", "candidate-request"))
                             .insert_header(("x-openai-internal", "remove-me"))
-                            .insert_header(("x-dragontales-candidate-sha256", "spoofed"))
+                            .insert_header(("x-milk-candidate-sha256", "spoofed"))
                             .body(Bytes::from_static(b"{ \"candidate\": true }\n"))
                     }
                 }),
@@ -1884,24 +1861,18 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(response.headers()["x-milk-route-target"], "candidate");
+    assert_eq!(response.headers()["x-milk-route-revision"], "test-route-v1");
     assert_eq!(
-        response.headers()["x-dragontales-route-target"],
-        "candidate"
-    );
-    assert_eq!(
-        response.headers()["x-dragontales-route-revision"],
-        "test-route-v1"
-    );
-    assert_eq!(
-        response.headers()["x-dragontales-candidate-sha256"],
+        response.headers()["x-milk-candidate-sha256"],
         "33".repeat(32)
     );
     assert_eq!(
-        response.headers()["x-dragontales-artifact-sha256"],
+        response.headers()["x-milk-artifact-sha256"],
         "44".repeat(32)
     );
     assert_eq!(
-        response.headers()["x-dragontales-deployment-sha256"],
+        response.headers()["x-milk-deployment-sha256"],
         "55".repeat(32)
     );
     assert_eq!(response.headers()["x-request-id"], "candidate-request");
@@ -1920,7 +1891,7 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
     );
     assert!(header(&seen.headers, "openai-organization").is_none());
     assert!(header(&seen.headers, "openai-project").is_none());
-    assert!(header(&seen.headers, "x-dragontales-key").is_none());
+    assert!(header(&seen.headers, "x-milk-key").is_none());
     assert_eq!(
         header(&seen.headers, "x-client-request-id"),
         Some(b"logical-call".as_slice())
@@ -1936,7 +1907,7 @@ async fn candidate_is_byte_transparent_and_isolates_credentials() {
         .send()
         .await
         .unwrap();
-    assert_eq!(beta.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(beta.headers()["x-milk-route-target"], "openai");
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
 
     gateway.stop().await;
@@ -2021,7 +1992,7 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
     };
 
     let first = request().send().await.unwrap();
-    assert_eq!(first.headers()["x-dragontales-route-target"], "candidate");
+    assert_eq!(first.headers()["x-milk-route-target"], "candidate");
     let mut first_body = first.bytes_stream();
     assert_eq!(
         timeout(Duration::from_secs(1), first_body.next())
@@ -2033,10 +2004,7 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
     );
 
     let at_capacity = request().send().await.unwrap();
-    assert_eq!(
-        at_capacity.headers()["x-dragontales-route-target"],
-        "openai"
-    );
+    assert_eq!(at_capacity.headers()["x-milk-route-target"], "openai");
     assert_eq!(at_capacity.text().await.unwrap(), "baseline-capacity");
     assert_eq!(candidate_count.load(Ordering::SeqCst), 1);
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
@@ -2050,10 +2018,7 @@ async fn candidate_capacity_routes_baseline_and_recovers_after_stream_eof() {
     drop(first_body);
 
     let recovered = request().send().await.unwrap();
-    assert_eq!(
-        recovered.headers()["x-dragontales-route-target"],
-        "candidate"
-    );
+    assert_eq!(recovered.headers()["x-milk-route-target"], "candidate");
     assert_eq!(recovered.text().await.unwrap(), "candidate-recovered");
     assert_eq!(candidate_count.load(Ordering::SeqCst), 2);
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
@@ -2120,7 +2085,7 @@ async fn candidate_transport_failure_falls_back_once_and_opens_sticky_fuse() {
 
     let fallback = request().send().await.unwrap();
     assert_eq!(fallback.status(), reqwest::StatusCode::OK);
-    assert_eq!(fallback.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(fallback.headers()["x-milk-route-target"], "openai");
     assert_eq!(fallback.text().await.unwrap(), "baseline-after-fuse");
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
     assert_eq!(candidate_attempts.load(Ordering::SeqCst), 1);
@@ -2132,7 +2097,7 @@ async fn candidate_transport_failure_falls_back_once_and_opens_sticky_fuse() {
 
     let later_call = request().send().await.unwrap();
     assert_eq!(later_call.status(), reqwest::StatusCode::OK);
-    assert_eq!(later_call.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(later_call.headers()["x-milk-route-target"], "openai");
     assert_eq!(later_call.text().await.unwrap(), "baseline-after-fuse");
     assert_eq!(baseline_count.load(Ordering::SeqCst), 2);
     assert_eq!(candidate_attempts.load(Ordering::SeqCst), 1);
@@ -2215,7 +2180,7 @@ async fn candidate_fallback_shares_one_total_upstream_deadline() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
-    assert_eq!(response.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(response.headers()["x-milk-route-target"], "openai");
     let error: LocalEnvelope = response.json().await.unwrap();
     assert_eq!(error.error.code, "upstream_unavailable");
     assert_eq!(candidate_count.load(Ordering::SeqCst), 1);
@@ -2279,7 +2244,7 @@ async fn candidate_stream_transport_failure_opens_sticky_fuse() {
     };
 
     let failed = request().send().await.unwrap();
-    assert_eq!(failed.headers()["x-dragontales-route-target"], "candidate");
+    assert_eq!(failed.headers()["x-milk-route-target"], "candidate");
     assert!(failed.bytes().await.is_err());
     timeout(Duration::from_secs(1), candidate_task)
         .await
@@ -2287,7 +2252,7 @@ async fn candidate_stream_transport_failure_opens_sticky_fuse() {
         .unwrap();
 
     let later = request().send().await.unwrap();
-    assert_eq!(later.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(later.headers()["x-milk-route-target"], "openai");
     assert_eq!(later.text().await.unwrap(), "baseline-after-stream-fuse");
     assert_eq!(baseline_count.load(Ordering::SeqCst), 1);
 
@@ -2340,7 +2305,7 @@ async fn candidate_408_opens_sticky_fuse() {
         .await
         .unwrap();
     assert_eq!(fallback.status(), reqwest::StatusCode::OK);
-    assert_eq!(fallback.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(fallback.headers()["x-milk-route-target"], "openai");
     assert_eq!(
         fallback.text().await.unwrap(),
         "baseline-after-auth-failure"
@@ -2355,7 +2320,7 @@ async fn candidate_408_opens_sticky_fuse() {
         .await
         .unwrap();
     assert_eq!(later.status(), reqwest::StatusCode::OK);
-    assert_eq!(later.headers()["x-dragontales-route-target"], "openai");
+    assert_eq!(later.headers()["x-milk-route-target"], "openai");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     gateway.stop().await;
@@ -2893,7 +2858,7 @@ async fn official_sdk_traces_persist_once_across_restarts() {
 
     let test_directory = fs::canonicalize(std::env::temp_dir())
         .unwrap()
-        .join(format!("milk-gateway-capture-{}", Uuid::now_v7()));
+        .join(format!("milk-carton-capture-{}", Uuid::now_v7()));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&test_directory)
@@ -3304,7 +3269,7 @@ data: [DONE]
                 "sdk-missing-key" => missing_key += 1,
                 model => panic!("unexpected SDK smoke request model {model}"),
             }
-            assert!(header(&request.headers, "x-dragontales-key").is_none());
+            assert!(header(&request.headers, "x-milk-key").is_none());
         }
         assert_eq!(
             (

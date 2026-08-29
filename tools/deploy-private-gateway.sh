@@ -17,19 +17,20 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
 
-WORKER = "dragontales-gateway"
-APPLICATION_NAME = "dragontales-gateway-dragontalesgateway"
-SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-gateway"
-GHCR_REPOSITORY = "ghcr.io/milkinfrastructure/milk-gateway"
+WORKER = "milk-carton"
+APPLICATION_NAME = "milk-carton-milkcarton"
+SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-carton"
+GHCR_REPOSITORY = "ghcr.io/milkinfrastructure/milk-carton"
 REGISTRY = "registry.cloudflare.com"
-HEALTH_URL = "https://api.dragontales.milkinfrastructure.com/healthz"
 WRANGLER_VERSION = "4.126.0"
 MAIN_SENTINEL = ".milk-private-deploy-script-required"
-IMAGE_SENTINEL = "MILK_PRIVATE_GATEWAY_ADMITTED_IMAGE_REQUIRED"
+IMAGE_SENTINEL = "MILK_CARTON_ADMITTED_IMAGE_REQUIRED"
+CUSTOM_DOMAIN_SENTINEL = "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED"
 BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
 DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
 SLSA_V1 = "https://slsa.dev/provenance/v1"
@@ -42,6 +43,10 @@ RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 TAG = re.compile(r"[a-z0-9_][a-z0-9._-]{0,127}")
 REPOSITORY = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")
 COHORT_ID = re.compile(r"[A-Za-z0-9._~-]{1,128}")
+HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
 PRODUCTION_PROOF = {
     "baseline_requests": 322,
     "candidate_requests": 2,
@@ -76,10 +81,10 @@ POLL_ATTEMPTS = 20
 POLL_INTERVAL_SECONDS = 15
 MAX_JSON = 1024 * 1024
 BOOTSTRAP_REQUIRED_SECRET_NAMES = {
-    "DRAGONTALES_CONFIG_JSON",
-    "DRAGONTALES_CONTAINER_ADMIN_KEY",
-    "DRAGONTALES_OPENAI_API_KEY",
-    "DRAGONTALES_ROUTE_SECRET_HEX",
+    "MILK_CARTON_CONFIG_JSON",
+    "MILK_CARTON_CONTAINER_ADMIN_KEY",
+    "MILK_CARTON_OPENAI_API_KEY",
+    "MILK_CARTON_ROUTE_SECRET_HEX",
     "MILK_CAPTURE_SAMPLING_KEY_HEX",
     "MILK_CAPTURE_SAMPLING_KEY_VERSION",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID",
@@ -116,6 +121,29 @@ class Interrupted(DeployFailure):
 
 def canonical_json(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def validate_api_base_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise DeployFailure("API base URL is invalid") from error
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or HOSTNAME.fullmatch(hostname) is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.netloc != hostname
+        or parsed.path != "/v1"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise DeployFailure("API base URL must be a lowercase HTTPS domain ending in /v1")
+    return value, hostname, f"https://{hostname}/healthz"
 
 
 def utc_now():
@@ -701,7 +729,7 @@ def validate_bootstrap_secrets(path, repository):
         or raw != canonical_json(value)
     ):
         raise DeployFailure("bootstrap secrets file is invalid")
-    gateway_config_raw = secrets_value["DRAGONTALES_CONFIG_JSON"].encode("utf-8")
+    gateway_config_raw = secrets_value["MILK_CARTON_CONFIG_JSON"].encode("utf-8")
     gateway_config = parse_gateway_config(gateway_config_raw)
     return canonical_json(secrets_value), set(secrets_value), gateway_config_raw, gateway_config
 
@@ -711,7 +739,7 @@ def validate_smoke_credential(path, gateway_config):
     credential = parse_json(raw, "gateway credential", 8192)
     require_keys(credential, {"api_key", "cohort_id", "model"}, "gateway credential")
     api_key = credential["api_key"]
-    value = api_key.removeprefix("dt_live_") if isinstance(api_key, str) else ""
+    value = api_key.removeprefix("milk_live_") if isinstance(api_key, str) else ""
     key_id, separator, secret = value.partition("_")
     if (
         raw != canonical_json(credential)
@@ -763,10 +791,14 @@ def validate_base_config(path):
         config.get("name") != WORKER
         or config.get("main") != MAIN_SENTINEL
         or config.get("observability") != {"enabled": True}
+        or config.get("routes") != [{
+            "pattern": CUSTOM_DOMAIN_SENTINEL,
+            "custom_domain": True,
+        }]
         or not isinstance(containers, list)
         or len(containers) != 1
         or containers[0] != {
-            "class_name": "DragontalesGateway",
+            "class_name": "MilkCarton",
             "image": IMAGE_SENTINEL,
             "instance_type": "lite",
             "max_instances": 1,
@@ -789,12 +821,19 @@ def write_private(path, raw, mode=0o600):
         os.fsync(output.fileno())
 
 
-def make_deploy_config(base, path, image, entrypoint):
+def make_deploy_config(base, path, image, entrypoint, api_hostname):
     config = copy.deepcopy(base)
     config["main"] = str(entrypoint)
     config["containers"][0]["image"] = image
+    config["routes"][0]["pattern"] = api_hostname
     raw = canonical_json(config)
-    if b"Dockerfile" in raw or b"image_build_context" in raw or image.encode() not in raw:
+    if (
+        b"Dockerfile" in raw
+        or b"image_build_context" in raw
+        or image.encode() not in raw
+        or api_hostname.encode() not in raw
+        or CUSTOM_DOMAIN_SENTINEL.encode() in raw
+    ):
         raise ContractFailure("temporary deploy config is invalid")
     write_private(path, raw)
 
@@ -813,12 +852,13 @@ def main():
             raise DeployFailure("registry credential input must be selected exactly once")
     if registry_token_file is None and not registry_token_stdin:
         raise DeployFailure("registry credential input must be selected exactly once")
-    bootstrap = len(arguments) == 5 and arguments[0] == "--bootstrap"
-    if not bootstrap and len(arguments) != 5:
+    bootstrap = len(arguments) == 6 and arguments[0] == "--bootstrap"
+    if not bootstrap and len(arguments) != 6:
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE\n"
-            "       deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE"
+            "usage: deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
+            "       deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
         )
+    api_base_url, api_hostname, health_url = validate_api_base_url(arguments.pop())
     script = Path(sys.argv[1]).resolve(strict=True)
     repository = script.parent.parent.resolve(strict=True)
     sys.path.insert(0, str(repository / "tools"))
@@ -872,7 +912,7 @@ def main():
 
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}
     forbidden = re.compile(
-        r"^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|TEACHER_|WANDB_|DRAGONTALES_|DOCKER_|BUILDX_|BUILDKIT_).*"
+        r"^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|TEACHER_|WANDB_|MILK_CARTON_|DOCKER_|BUILDX_|BUILDKIT_).*"
         r"|^(GOOGLE_APPLICATION_CREDENTIALS|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|NVIDIA_API_KEY|NGC_API_KEY|CODEX_API_KEY|CODEX_AUTH_TOKEN|CODEX_TOKEN|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|CR_PAT|CI_JOB_TOKEN|CI_REGISTRY_PASSWORD|NPM_TOKEN|PYPI_TOKEN|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|REGISTRY_AUTH_FILE|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy)$"
         r"|^CARGO_REGISTRIES_.*_TOKEN$|^MILK_.*(AWS|R2|S3|STORE|TEACHER|PROVIDER|CREDENTIAL|SECRET|TOKEN|ACCESS_KEY)"
     )
@@ -929,7 +969,7 @@ def main():
     previous_worker = None
     temporary_config = None
     deployment_secrets = None
-    scratch = Path(tempfile.mkdtemp(prefix="milk-gateway-deploy."))
+    scratch = Path(tempfile.mkdtemp(prefix="milk-carton-deploy."))
     docker_config = scratch / "docker-config"
     docker_config.mkdir(mode=0o700)
     docker_plugins = docker_config / "cli-plugins"
@@ -1058,7 +1098,7 @@ def main():
             [
                 commands["curl"], "--proto", "=https", "--tlsv1.2", "--silent",
                 "--show-error", "--max-time", "15", "--max-filesize", "65536",
-                "--output", str(body_path), "--write-out", "%{http_code}", HEALTH_URL,
+                "--output", str(body_path), "--write-out", "%{http_code}", health_url,
             ],
             timeout=20,
             check=False,
@@ -1201,7 +1241,7 @@ def main():
         stage = "source-authority"
         top = runner.run("git-top-level", [commands["git"], "rev-parse", "--show-toplevel"]).stdout.decode().strip()
         if Path(top).resolve() != repository:
-            raise ContractFailure("deploy script is not running from the Milk gateway checkout")
+            raise ContractFailure("deploy script is not running from the Milk Carton checkout")
         commit = runner.run(
             "git-head", [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
         ).stdout.decode().strip()
@@ -1216,10 +1256,10 @@ def main():
             "git-origin", [commands["git"], "remote", "get-url", "origin"],
         ).stdout.decode().strip()
         if origin not in {
-            "git@github.com:milkinfrastructure/milk-gateway.git",
-            "https://github.com/milkinfrastructure/milk-gateway.git",
+            "git@github.com:milkinfrastructure/milk-carton.git",
+            "https://github.com/milkinfrastructure/milk-carton.git",
         }:
-            raise ContractFailure("origin is not milkinfrastructure/milk-gateway")
+            raise ContractFailure("origin is not milkinfrastructure/milk-carton")
         remote_head = runner.run(
             "git-published-main",
             [
@@ -1274,7 +1314,7 @@ def main():
         )
 
         image_tag = f"sha256-{admitted['child_sha256']}-op-{operation_id}"
-        remote_image = f"{REGISTRY}/{account_id}/milk-gateway:{image_tag}"
+        remote_image = f"{REGISTRY}/{account_id}/milk-carton:{image_tag}"
         evidence.write("intent.json", {
             "schema_version": "milk.private-gateway-deploy-intent.v1",
             "operation_id": operation_id,
@@ -1306,7 +1346,7 @@ def main():
             images = parse_images(wrangler(
                 "preflight-image-list", "containers", "images", "list", "--json",
             ).stdout)
-            if image_tag in images.get("milk-gateway", set()):
+            if image_tag in images.get("milk-carton", set()):
                 raise ContractFailure("target Cloudflare image tag already exists")
             evidence.write("bootstrap-preflight.json", {
                 "schema_version": "milk.private-gateway-bootstrap-preflight.v1",
@@ -1343,7 +1383,7 @@ def main():
             ).stdout)
             if previous_tag not in images.get(previous_repository, set()):
                 raise ContractFailure("previous rollback image is not retained")
-            if image_tag in images.get("milk-gateway", set()):
+            if image_tag in images.get("milk-carton", set()):
                 raise ContractFailure("target Cloudflare image tag already exists")
             previous = {
                 "worker_version_id": previous_worker,
@@ -1373,7 +1413,7 @@ def main():
             "pull-admitted-amd64-child", "pull", "--platform", "linux/amd64", admitted["child_reference"],
             timeout=900,
         )
-        local_image = f"milk-gateway:{image_tag}"
+        local_image = f"milk-carton:{image_tag}"
         docker("tag-admitted-child", "tag", admitted["child_reference"], local_image)
         docker_config.joinpath("config.json").unlink()
 
@@ -1393,7 +1433,7 @@ def main():
         images_after_push = parse_images(wrangler(
             "post-push-image-list", "containers", "images", "list", "--json",
         ).stdout)
-        if image_tag not in images_after_push.get("milk-gateway", set()):
+        if image_tag not in images_after_push.get("milk-carton", set()):
             raise ContractFailure("pushed Cloudflare image tag is not visible")
 
         stage = "cloudflare-copy-verification"
@@ -1451,6 +1491,7 @@ def main():
             temporary_config,
             remote_image,
             repository / "deploy/cloudflare/worker.js",
+            api_hostname,
         )
         deploy_arguments = [
             "deploy", "--strict", "--containers-rollout", "immediate",
@@ -1459,7 +1500,7 @@ def main():
         if not bootstrap:
             deployment_secrets = scratch / "deploy-secrets.json"
             write_private(deployment_secrets, canonical_json({
-                "DRAGONTALES_CONFIG_JSON": gateway_config_raw.decode("utf-8"),
+                "MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8"),
             }))
             deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
         rechecked_head = runner.run(
@@ -1554,7 +1595,7 @@ def main():
             [
                 commands["node"],
                 str(repository / "tools/openai-production-smoke.mjs"),
-                "https://api.dragontales.milkinfrastructure.com/v1",
+                api_base_url,
                 str(credential_file),
             ],
             timeout=150,

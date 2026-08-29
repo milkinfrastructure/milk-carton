@@ -2,12 +2,12 @@
 set -euo pipefail
 
 readonly SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-readonly RUNNER=$SCRIPT_DIR/dragontales-key.sh
+readonly RUNNER=$SCRIPT_DIR/milk-carton-key.sh
 readonly TEST_DIR=$(mktemp -d)
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 
 fail() {
-  printf 'dragontales-key.test: %s\n' "$*" >&2
+  printf 'milk-carton-key.test: %s\n' "$*" >&2
   exit 1
 }
 
@@ -27,7 +27,7 @@ readonly METADATA_RE='^\{"api_key_sha256":"([0-9a-f]{64})"\}$'
 [[ $metadata =~ $METADATA_RE ]] || fail "metadata output changed"
 expected_sha=${BASH_REMATCH[1]}
 token=$(<"$TEST_DIR/private/traffic.token")
-[[ $token =~ ^dt_live_[0-9a-f-]{36}_[0-9a-f]{64}$ ]] || fail "token format is invalid"
+[[ $token =~ ^milk_live_[0-9a-f-]{36}_[0-9a-f]{64}$ ]] || fail "token format is invalid"
 [[ $metadata != *"$token"* ]] || fail "raw token leaked to stdout"
 actual_sha=$(printf '%s' "$token" | "$OPENSSL" dgst -sha256 -r)
 actual_sha=${actual_sha%% *}
@@ -53,4 +53,4 @@ export POISON_MARKER=$TEST_DIR/poison-used
 PATH=$TEST_DIR/poison:$PATH "$RUNNER" "$OPENSSL" "$UUIDGEN" "$TEST_DIR/private/outcome.token" >/dev/null
 [[ ! -e $POISON_MARKER ]] || fail "generator used an operator-controlled PATH tool"
 
-printf 'dragontales-key.test: ok\n'
+printf 'milk-carton-key.test: ok\n'

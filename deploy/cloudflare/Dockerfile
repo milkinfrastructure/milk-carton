@@ -10,15 +10,15 @@ ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY LICENSE ./
-COPY crates/dragontales-gateway ./crates/dragontales-gateway
+COPY crates/milk-carton ./crates/milk-carton
 COPY deploy/licenses/bundle-rust.sh ./deploy/licenses/bundle-rust.sh
-RUN cargo build --locked --release --package dragontales-gateway --jobs 4 && \
+RUN cargo build --locked --release --package milk-carton --jobs 4 && \
     /bin/sh deploy/licenses/bundle-rust.sh /src/THIRD_PARTY_LICENSES.txt
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a
-COPY --from=build --chmod=0555 /src/target/release/dragontales-gateway /usr/local/bin/dragontales-gateway
-COPY --from=build --chmod=0444 /src/LICENSE /src/THIRD_PARTY_LICENSES.txt /usr/share/licenses/dragontales/
+COPY --from=build --chmod=0555 /src/target/release/milk-carton /usr/local/bin/milk-carton
+COPY --from=build --chmod=0444 /src/LICENSE /src/THIRD_PARTY_LICENSES.txt /usr/share/licenses/milk-carton/
 USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/dragontales-gateway"]
+ENTRYPOINT ["/usr/local/bin/milk-carton"]
 CMD ["serve"]

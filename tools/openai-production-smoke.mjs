@@ -13,10 +13,11 @@ const MAX_HEALTH_BYTES = 16_384;
 const MAX_RESPONSE_BYTES = 65_536;
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MECHANICS_EVAL_ID =
   "959caacb397004bf3e60f13613da50f4ed3160a65d18b178c3d996398e29b5a0";
 const MECHANICS_PARTITION_DOMAIN = Buffer.from(
-  "dragontales.teacher-partition.v1\0",
+  "milk.teacher-partition.v1\0",
 );
 const MECHANICS_PHASES = [
   { train: 50, dev: 73, calibration: 128 },
@@ -129,7 +130,7 @@ async function generatedMechanicsHealth(endpoint, expectedConfigSha256, transpor
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("cache-control"), "no-store");
     assert.equal(
-      response.headers.get("x-dragontales-config-sha256"),
+      response.headers.get("x-milk-config-sha256"),
       expectedConfigSha256,
     );
     assert.equal(value.config_sha256, expectedConfigSha256);
@@ -171,7 +172,7 @@ async function privateCredential(path, route) {
   );
   assert.match(
     value.api_key,
-    /^dt_live_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[A-Za-z0-9._~-]{16,256}$/,
+    /^milk_live_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[A-Za-z0-9._~-]{16,256}$/,
   );
   assertProofModel(value.model);
   assert.match(value.cohort_id, /^[A-Za-z0-9._~-]{1,128}$/);
@@ -263,11 +264,11 @@ export async function runCandidateSmoke(client, endpoint, credential, expectedRo
   const responseRaw = JSON.stringify(data);
   assert.ok(responseRaw.length > 0 && responseRaw.length <= MAX_RESPONSE_BYTES);
   assert.equal(response.status, 200);
-  assert.equal(response.headers.get("x-dragontales-route-revision"), expectedRouteRevision);
-  assert.equal(response.headers.get("x-dragontales-route-target"), "candidate");
-  const candidateSha256 = response.headers.get("x-dragontales-candidate-sha256");
-  const artifactSha256 = response.headers.get("x-dragontales-artifact-sha256");
-  const deploymentSha256 = response.headers.get("x-dragontales-deployment-sha256");
+  assert.equal(response.headers.get("x-milk-route-revision"), expectedRouteRevision);
+  assert.equal(response.headers.get("x-milk-route-target"), "candidate");
+  const candidateSha256 = response.headers.get("x-milk-candidate-sha256");
+  const artifactSha256 = response.headers.get("x-milk-artifact-sha256");
+  const deploymentSha256 = response.headers.get("x-milk-deployment-sha256");
   assert.match(candidateSha256 ?? "", SHA256);
   assert.match(artifactSha256 ?? "", SHA256);
   assert.match(deploymentSha256 ?? "", SHA256);
@@ -319,18 +320,18 @@ export async function runSaturationFallbackSmoke(
     candidate = await client.chat.completions.create(request).withResponse();
     assert.equal(candidate.response.status, 200);
     assert.equal(
-      candidate.response.headers.get("x-dragontales-route-revision"),
+      candidate.response.headers.get("x-milk-route-revision"),
       expectedRouteRevision,
     );
-    assert.equal(candidate.response.headers.get("x-dragontales-route-target"), "candidate");
+    assert.equal(candidate.response.headers.get("x-milk-route-target"), "candidate");
     const candidateSha256 = candidate.response.headers.get(
-      "x-dragontales-candidate-sha256",
+      "x-milk-candidate-sha256",
     );
     const artifactSha256 = candidate.response.headers.get(
-      "x-dragontales-artifact-sha256",
+      "x-milk-artifact-sha256",
     );
     const deploymentSha256 = candidate.response.headers.get(
-      "x-dragontales-deployment-sha256",
+      "x-milk-deployment-sha256",
     );
     assert.match(candidateSha256 ?? "", SHA256);
     assert.match(artifactSha256 ?? "", SHA256);
@@ -340,10 +341,10 @@ export async function runSaturationFallbackSmoke(
     fallback = await client.chat.completions.create(request).withResponse();
     assert.equal(fallback.response.status, 200);
     assert.equal(
-      fallback.response.headers.get("x-dragontales-route-revision"),
+      fallback.response.headers.get("x-milk-route-revision"),
       expectedRouteRevision,
     );
-    assert.equal(fallback.response.headers.get("x-dragontales-route-target"), "openai");
+    assert.equal(fallback.response.headers.get("x-milk-route-target"), "openai");
     assert.equal(typeof fallback.data?.controller?.abort, "function");
 
     return {
@@ -436,13 +437,13 @@ export async function runGeneratedMechanics(
             Buffer.byteLength(responseRaw) <= MAX_RESPONSE_BYTES,
         );
         assert.equal(response.status, 200);
-        assert.equal(response.headers.get("x-dragontales-capture-intent"), "selected");
+        assert.equal(response.headers.get("x-milk-capture-intent"), "selected");
         assert.equal(
-          response.headers.get("x-dragontales-route-revision"),
+          response.headers.get("x-milk-route-revision"),
           MECHANICS_ROUTE_REVISION,
         );
-        assert.equal(response.headers.get("x-dragontales-route-target"), "openai");
-        const traceId = response.headers.get("x-dragontales-trace-id");
+        assert.equal(response.headers.get("x-milk-route-target"), "openai");
+        const traceId = response.headers.get("x-milk-trace-id");
         assert.match(traceId ?? "", UUID);
         assert.equal(data.choices.length, 1);
         assert.equal(typeof data.choices[0]?.message?.content, "string");
@@ -550,7 +551,8 @@ async function main() {
   const route = process.argv.length >= 5 && !generatedMechanics;
   const endpoint = new URL(process.argv[2]);
   assert.equal(endpoint.protocol, "https:");
-  assert.equal(endpoint.hostname, "api.dragontales.milkinfrastructure.com");
+  assert.match(endpoint.hostname, HOSTNAME);
+  assert.equal(endpoint.host, endpoint.hostname);
   assert.equal(endpoint.pathname, "/v1");
   assert.equal(endpoint.search, "");
   assert.equal(endpoint.hash, "");

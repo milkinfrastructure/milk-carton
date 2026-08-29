@@ -10,7 +10,7 @@ output=$1
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT HUP INT TERM
 
-LC_ALL=C "${CARGO:-cargo}" tree --locked --package dragontales-gateway \
+LC_ALL=C "${CARGO:-cargo}" tree --locked --package milk-carton \
   --target x86_64-unknown-linux-gnu --edges normal,build \
   --prefix none --format '{p}' > "$temporary/tree"
 sed -E 's/ \(\*\)$//; s/ \(proc-macro\)$//' \
@@ -23,7 +23,7 @@ if [ "$package_count" -le 1 ]; then
 fi
 
 cat > "$output" <<'EOF'
-Dragontales Rust dependency licenses and notices
+Milk Carton Rust dependency licenses and notices
 
 This deterministic bundle contains the legal files shipped in every registry
 crate linked into the x86_64 Linux gateway. When a crate ships no separate
@@ -31,7 +31,7 @@ legal file, its registry Cargo.toml is preserved instead.
 EOF
 
 while IFS=' ' read -r name tagged_version _rest; do
-  [ "$name" = "dragontales-gateway" ] && continue
+  [ "$name" = "milk-carton" ] && continue
   case "$tagged_version" in
     v*) version=${tagged_version#v} ;;
     *) echo "invalid cargo tree package: $name $tagged_version" >&2; exit 1 ;;

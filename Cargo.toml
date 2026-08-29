@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dragontales-gateway"]
+members = ["crates/milk-carton"]
 resolver = "2"
 
 [workspace.package]

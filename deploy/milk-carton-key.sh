@@ -5,7 +5,7 @@ readonly PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 die() {
-  printf 'dragontales-key: %s\n' "$*" >&2
+  printf 'milk-carton-key: %s\n' "$*" >&2
   exit 64
 }
 
@@ -50,7 +50,7 @@ main() {
   [[ $key_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || die "uuidgen returned an invalid UUID"
   secret=$("$openssl" rand -hex 32)
   [[ $secret =~ ^[0-9a-f]{64}$ ]] || die "OpenSSL returned an invalid secret"
-  token="dt_live_${key_id}_${secret}"
+  token="milk_live_${key_id}_${secret}"
   read -r sha256 digest_tail < <(printf '%s' "$token" | "$openssl" dgst -sha256 -r)
   [[ $sha256 =~ ^[0-9a-f]{64}$ && $digest_tail == '*stdin' ]] || die "OpenSSL returned an invalid SHA-256 digest"
 

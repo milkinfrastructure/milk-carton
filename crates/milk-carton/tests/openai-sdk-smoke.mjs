@@ -29,7 +29,7 @@ async function within(promise, label) {
 
 const clientOptions = {
   apiKey:
-    "dt_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001",
+    "milk_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001",
   baseURL: `${gatewayURL}/v1`,
   maxRetries: 0,
   timeout: 2_000,
@@ -163,7 +163,7 @@ await assert.rejects(
   }),
   (error) => {
     assert.ok(error instanceof OpenAI.AuthenticationError);
-    assert.equal(error.code, "invalid_dragontales_api_key");
+    assert.equal(error.code, "invalid_milk_api_key");
     missingKeyStatus = error.status;
     return true;
   },

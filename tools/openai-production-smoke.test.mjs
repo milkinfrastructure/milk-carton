@@ -13,7 +13,7 @@ import {
 
 const digest = (byte) => byte.repeat(64);
 const credential = {
-  api_key: "dt_live_00000000-0000-4000-8000-000000000001_test_secret_123456789",
+  api_key: "milk_live_00000000-0000-4000-8000-000000000001_test_secret_123456789",
   cohort_id: "paid-proof-selected-cohort-v1",
   model: "zai-org/GLM-5.3-Flash",
   reasoning_effort: "high",
@@ -55,11 +55,11 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
                 data,
                 response: {
                   headers: new Headers({
-                    "x-dragontales-artifact-sha256": digest("2"),
-                    "x-dragontales-candidate-sha256": digest("3"),
-                    "x-dragontales-deployment-sha256": digest("4"),
-                    "x-dragontales-route-revision": routeRevision,
-                    "x-dragontales-route-target": routeTarget,
+                    "x-milk-artifact-sha256": digest("2"),
+                    "x-milk-candidate-sha256": digest("3"),
+                    "x-milk-deployment-sha256": digest("4"),
+                    "x-milk-route-revision": routeRevision,
+                    "x-milk-route-target": routeTarget,
                   }),
                   status: 200,
                 },
@@ -80,7 +80,7 @@ assert.deepEqual(candidateRequest({ ...credential, reasoning_effort: null }), {
 assert.throws(() => candidateRequest({ ...credential, model: "another-model" }));
 const receipt = await runCandidateSmoke(
   client(),
-  new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+  new URL("https://carton.example/v1"),
   credential,
   revision,
 );
@@ -102,7 +102,7 @@ assert.match(receipt.traffic_cohort_sha256, /^[0-9a-f]{64}$/);
 
 const baseline = await runBaselineSmoke(
   client(revision, "candidate", false),
-  new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+  new URL("https://carton.example/v1"),
   { api_key: credential.api_key, cohort_id: credential.cohort_id, model: credential.model },
 );
 assert.equal(baseline.schema_version, "milk.official-openai-sdk-smoke.v2");
@@ -120,7 +120,7 @@ assert.match(baseline.traffic_cohort_sha256, /^[0-9a-f]{64}$/);
 await assert.rejects(
   runBaselineSmoke(
     null,
-    new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+    new URL("https://carton.example/v1"),
     { ...credential, model: "another-model" },
   ),
 );
@@ -128,7 +128,7 @@ await assert.rejects(
 await assert.rejects(
   runCandidateSmoke(
     client(digest("5")),
-    new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+    new URL("https://carton.example/v1"),
     credential,
     revision,
   ),
@@ -136,7 +136,7 @@ await assert.rejects(
 await assert.rejects(
   runCandidateSmoke(
     client(revision, "openai"),
-    new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+    new URL("https://carton.example/v1"),
     credential,
     revision,
   ),
@@ -176,11 +176,11 @@ const saturationClient = {
               },
               response: {
                 headers: new Headers({
-                  "x-dragontales-artifact-sha256": digest("2"),
-                  "x-dragontales-candidate-sha256": digest("3"),
-                  "x-dragontales-deployment-sha256": digest("4"),
-                  "x-dragontales-route-revision": revision,
-                  "x-dragontales-route-target": call === 0 ? "candidate" : "openai",
+                  "x-milk-artifact-sha256": digest("2"),
+                  "x-milk-candidate-sha256": digest("3"),
+                  "x-milk-deployment-sha256": digest("4"),
+                  "x-milk-route-revision": revision,
+                  "x-milk-route-target": call === 0 ? "candidate" : "openai",
                 }),
                 status: 200,
               },
@@ -193,7 +193,7 @@ const saturationClient = {
 };
 const saturation = await runSaturationFallbackSmoke(
   saturationClient,
-  new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+  new URL("https://carton.example/v1"),
   credential,
   revision,
 );
@@ -213,12 +213,12 @@ assert.deepEqual(aborted.sort(), [0, 1]);
 function mechanicsResponse(call, omitRouteRevision = false) {
   const headers = {
     "content-type": "application/json",
-    "x-dragontales-capture-intent": "selected",
-    "x-dragontales-route-revision": "openai-baseline-v1",
-    "x-dragontales-route-target": "openai",
-    "x-dragontales-trace-id": `00000000-0000-7000-8000-${String(call).padStart(12, "0")}`,
+    "x-milk-capture-intent": "selected",
+    "x-milk-route-revision": "openai-baseline-v1",
+    "x-milk-route-target": "openai",
+    "x-milk-trace-id": `00000000-0000-7000-8000-${String(call).padStart(12, "0")}`,
   };
-  if (omitRouteRevision) delete headers["x-dragontales-route-revision"];
+  if (omitRouteRevision) delete headers["x-milk-route-revision"];
   return new Response(
     JSON.stringify({
       choices: [
@@ -248,7 +248,7 @@ function mechanicsHealthResponse(configSha256 = "a".repeat(64)) {
       headers: {
         "cache-control": "no-store",
         "content-type": "application/json",
-        "x-dragontales-config-sha256": configSha256,
+        "x-milk-config-sha256": configSha256,
       },
     },
   );
@@ -258,7 +258,7 @@ assert.throws(() => generatedMechanicsPlan("another-model"));
 let wrongModelTransportCalls = 0;
 await assert.rejects(
   runGeneratedMechanics(
-    new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+    new URL("https://carton.example/v1"),
     { api_key: credential.api_key, cohort_id: "generated-mechanics-v1", model: "another-model" },
     "a".repeat(64),
     async () => {
@@ -281,7 +281,7 @@ assert.deepEqual(
 let mechanicsCalls = 0;
 let mechanicsHealthCalls = 0;
 const mechanics = await runGeneratedMechanics(
-  new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+  new URL("https://carton.example/v1"),
   {
     api_key: credential.api_key,
     cohort_id: "generated-mechanics-v1",
@@ -295,7 +295,7 @@ const mechanics = await runGeneratedMechanics(
     }
     const call = mechanicsCalls;
     mechanicsCalls += 1;
-    assert.equal(request.url, "https://api.dragontales.milkinfrastructure.com/v1/chat/completions");
+    assert.equal(request.url, "https://carton.example/v1/chat/completions");
     return mechanicsResponse(call);
   },
 );
@@ -350,7 +350,7 @@ assert.equal(
 let drainedCalls = 0;
 let drainedHealthCalls = 0;
 const drained = await runGeneratedMechanics(
-  new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+  new URL("https://carton.example/v1"),
   {
     api_key: credential.api_key,
     cohort_id: "generated-mechanics-v1",
@@ -379,7 +379,7 @@ assert.equal(drained.succeeded, false);
 let rejectedChats = 0;
 await assert.rejects(
   runGeneratedMechanics(
-    new URL("https://api.dragontales.milkinfrastructure.com/v1"),
+    new URL("https://carton.example/v1"),
     {
       api_key: credential.api_key,
       cohort_id: "generated-mechanics-v1",

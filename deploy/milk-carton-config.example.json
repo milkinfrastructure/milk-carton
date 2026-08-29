@@ -33,15 +33,15 @@
   "stores": {
     "capture": {
       "type": "local",
-      "root": "/var/lib/dragontales/capture"
+      "root": "/var/lib/milk-carton/capture"
     },
     "control": {
       "type": "local",
-      "root": "/var/lib/dragontales/control"
+      "root": "/var/lib/milk-carton/control"
     },
     "routes": {
       "type": "local",
-      "root": "/var/lib/dragontales/routes"
+      "root": "/var/lib/milk-carton/routes"
     }
   },
   "baseline": {

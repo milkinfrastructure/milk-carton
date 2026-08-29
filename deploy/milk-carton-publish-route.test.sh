@@ -2,16 +2,16 @@
 set -euo pipefail
 
 readonly SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-readonly RUNNER=$SCRIPT_DIR/dragontales-publish-route.sh
+readonly RUNNER=$SCRIPT_DIR/milk-carton-publish-route.sh
 readonly TEST_DIR=$(mktemp -d)
 readonly REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
-readonly IN_REPO_KEY=$(mktemp "$REPO_ROOT/.dragontales-route-key.XXXXXX")
-readonly IN_REPO_GATEWAY=$(mktemp "$REPO_ROOT/.dragontales-route-gateway.XXXXXX")
-readonly IN_REPO_OPENSSL=$(mktemp "$REPO_ROOT/.dragontales-route-openssl.XXXXXX")
+readonly IN_REPO_KEY=$(mktemp "$REPO_ROOT/.milk-carton-route-key.XXXXXX")
+readonly IN_REPO_GATEWAY=$(mktemp "$REPO_ROOT/.milk-carton-route-gateway.XXXXXX")
+readonly IN_REPO_OPENSSL=$(mktemp "$REPO_ROOT/.milk-carton-route-openssl.XXXXXX")
 trap 'rm -rf -- "$TEST_DIR"; rm -f -- "$IN_REPO_KEY" "$IN_REPO_GATEWAY" "$IN_REPO_OPENSSL"' EXIT
 
 fail() {
-  printf 'dragontales-publish-route.test: %s\n' "$*" >&2
+  printf 'milk-carton-publish-route.test: %s\n' "$*" >&2
   exit 1
 }
 
@@ -36,7 +36,7 @@ if [[ $* == *"publish-route"* && $* == *"--signature"* ]]; then
     esac
   done
   "$FAKE_OPENSSL" pkeyutl -verify -rawin -pubin -inkey "$FAKE_PUBLIC_KEY" -in "$manifest" -sigfile "$signature" >/dev/null
-  printf '{"schema_version":"dragontales.route-publication-receipt.v2","state":"committed"}\n'
+  printf '{"schema_version":"milk.route-publication-receipt.v2","state":"committed"}\n'
 elif [[ $* == *"publish-route"* && $* == *"--check-only"* && ${MUTATE_MANIFEST:-0} == 1 ]]; then
   chmod 0600 "$FAKE_MANIFEST"
   printf 'x' >>"$FAKE_MANIFEST"
@@ -75,13 +75,13 @@ receipt=$(
     "$TEST_DIR/signing.pem"
 )
 [[ ! -e $POISON_MARKER ]] || fail "route signer used an operator-controlled PATH tool"
-[[ $receipt == '{"schema_version":"dragontales.route-publication-receipt.v2","state":"committed"}' ]] || fail "publication receipt changed"
+[[ $receipt == '{"schema_version":"milk.route-publication-receipt.v2","state":"committed"}' ]] || fail "publication receipt changed"
 [[ $(wc -c <"$TEST_DIR/route.sig" | tr -d ' ') == 64 ]] || fail "signature is not 64 raw bytes"
 "$TEST_DIR/openssl" pkeyutl -verify -rawin -pubin -inkey "$TEST_DIR/public.pem" -in "$TEST_DIR/route.json" -sigfile "$TEST_DIR/route.sig" >/dev/null || fail "signature does not cover exact manifest bytes"
 [[ $(wc -l <"$FAKE_LOG" | tr -d ' ') == 2 ]] || fail "unexpected Rust command count"
 expected_calls="--config $TEST_DIR/config.json publish-route --manifest $TEST_DIR/route.json --check-only
---config $TEST_DIR/config.json publish-route --manifest $TEST_DIR/route.json --signature $TEST_DIR/.dragontales-route-signature.TOKEN"
-actual_calls=$(sed -E '2s#(\.dragontales-route-signature\.)[^ ]+#\1TOKEN#' "$FAKE_LOG")
+--config $TEST_DIR/config.json publish-route --manifest $TEST_DIR/route.json --signature $TEST_DIR/.milk-carton-route-signature.TOKEN"
+actual_calls=$(sed -E '2s#(\.milk-carton-route-signature\.)[^ ]+#\1TOKEN#' "$FAKE_LOG")
 [[ $actual_calls == "$expected_calls" ]] || fail "publisher passed fields outside the signed manifest"
 expect_failure "$RUNNER" "$TEST_DIR/gateway" "$TEST_DIR/openssl" "$TEST_DIR/config.json" "$TEST_DIR/route.json" "$TEST_DIR/extra.sig" "$TEST_DIR/signing.pem" extra
 
@@ -117,4 +117,4 @@ expect_failure "$RUNNER" "$TEST_DIR/gateway" "$TEST_DIR/openssl" "$TEST_DIR/conf
 [[ ! -e $TEST_DIR/mutated.sig ]] || fail "mutation produced a signature"
 unset MUTATE_MANIFEST
 
-printf 'dragontales-publish-route.test: ok\n'
+printf 'milk-carton-publish-route.test: ok\n'

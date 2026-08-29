@@ -9,7 +9,7 @@ assert.equal(endpoint.hostname, "127.0.0.1");
 
 const client = new OpenAI({
   apiKey:
-    "dt_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001",
+    "milk_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001",
   baseURL: `${gatewayURL}/v1`,
   maxRetries: 0,
   timeout: 2_000,

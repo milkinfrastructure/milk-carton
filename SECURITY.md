@@ -1,6 +1,6 @@
 # Security
 
-Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/milkinfrastructure/milk-gateway/security/advisories/new), not a public issue.
+Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/milkinfrastructure/milk-carton/security/advisories/new), not a public issue.
 
 Include the affected revision, impact, and minimal reproduction. Do not include production credentials, customer traffic, or other private data.
 

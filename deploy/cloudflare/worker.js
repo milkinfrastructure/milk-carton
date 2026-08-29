@@ -5,18 +5,18 @@ const GATEWAY_INSTANCE = "gateway";
 const CANDIDATE_ADMIN_PATH = "/__milk/candidate-credential";
 const CANDIDATE_CHECK_PATH = "/healthz/candidate-credential";
 const CANDIDATE_SHA256_HEADER =
-  "x-dragontales-candidate-api-key-sha256";
+  "x-milk-candidate-api-key-sha256";
 const CANDIDATE_STATE_HEADER =
-  "x-dragontales-candidate-credential-state";
+  "x-milk-candidate-credential-state";
 const CANDIDATE_OPERATION_HEADER = "x-milk-candidate-operation";
-const ADMIN_KEY_ENV = "DRAGONTALES_CONTAINER_ADMIN_KEY";
+const ADMIN_KEY_ENV = "MILK_CARTON_CONTAINER_ADMIN_KEY";
 const MAX_ADMIN_KEY_BYTES = 512;
 const MAX_CANDIDATE_KEY_BYTES = 4096;
 
 function containerEnvVars(bindings) {
   return {
-    DRAGONTALES_CONFIG_JSON: bindings.DRAGONTALES_CONFIG_JSON,
-    DRAGONTALES_OPENAI_API_KEY: bindings.DRAGONTALES_OPENAI_API_KEY,
+    MILK_CARTON_CONFIG_JSON: bindings.MILK_CARTON_CONFIG_JSON,
+    MILK_CARTON_OPENAI_API_KEY: bindings.MILK_CARTON_OPENAI_API_KEY,
     MILK_CAPTURE_SAMPLING_KEY_HEX:
       bindings.MILK_CAPTURE_SAMPLING_KEY_HEX,
     MILK_CAPTURE_SAMPLING_KEY_VERSION:
@@ -40,17 +40,17 @@ function containerEnvVars(bindings) {
           MILK_ROUTE_STORE_SESSION_TOKEN:
             bindings.MILK_ROUTE_STORE_SESSION_TOKEN,
         }),
-    ...(bindings.DRAGONTALES_ROUTE_SECRET_HEX === undefined
+    ...(bindings.MILK_CARTON_ROUTE_SECRET_HEX === undefined
       ? {}
       : {
-          DRAGONTALES_ROUTE_SECRET_HEX:
-            bindings.DRAGONTALES_ROUTE_SECRET_HEX,
+          MILK_CARTON_ROUTE_SECRET_HEX:
+            bindings.MILK_CARTON_ROUTE_SECRET_HEX,
         }),
-    ...(bindings.DRAGONTALES_CANDIDATE_API_KEY === undefined
+    ...(bindings.MILK_CARTON_CANDIDATE_API_KEY === undefined
       ? {}
       : {
-          DRAGONTALES_CANDIDATE_API_KEY:
-            bindings.DRAGONTALES_CANDIDATE_API_KEY,
+          MILK_CARTON_CANDIDATE_API_KEY:
+            bindings.MILK_CARTON_CANDIDATE_API_KEY,
         }),
   };
 }
@@ -116,7 +116,7 @@ async function validAdminAuthorization(request, bindings) {
 }
 
 async function boundCandidateSha256(bindings) {
-  const candidate = bindings.DRAGONTALES_CANDIDATE_API_KEY;
+  const candidate = bindings.MILK_CARTON_CANDIDATE_API_KEY;
   if (candidate === undefined) {
     return null;
   }
@@ -130,7 +130,7 @@ async function boundCandidateSha256(bindings) {
   return sha256Hex(candidate);
 }
 
-export class DragontalesGateway extends Container {
+export class MilkCarton extends Container {
   defaultPort = 8080;
   sleepAfter = "1m";
   envVars = containerEnvVars(env);
@@ -293,7 +293,7 @@ export default {
       }
       try {
         const container = getContainer(
-          env.DRAGONTALES_GATEWAY,
+          env.MILK_CARTON,
           GATEWAY_INSTANCE,
         );
         const receipt = operation === "inspect"
@@ -313,7 +313,7 @@ export default {
         );
       }
     }
-    return getContainer(env.DRAGONTALES_GATEWAY, GATEWAY_INSTANCE).fetch(
+    return getContainer(env.MILK_CARTON, GATEWAY_INSTANCE).fetch(
       request,
     );
   },

@@ -5,7 +5,7 @@ readonly PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 die() {
-  printf 'dragontales-publish-route: %s\n' "$*" >&2
+  printf 'milk-carton-publish-route: %s\n' "$*" >&2
   exit 64
 }
 
@@ -88,7 +88,7 @@ main() {
   [[ $(sha256_file "$manifest") == "$manifest_sha" ]] || die "route manifest changed after publication preflight"
 
   umask 077
-  signature_tmp=$(mktemp "$(dirname "$signature_out")/.dragontales-route-signature.XXXXXX") || die "could not create signature temporary file"
+  signature_tmp=$(mktemp "$(dirname "$signature_out")/.milk-carton-route-signature.XXXXXX") || die "could not create signature temporary file"
   trap 'rm -f -- "$signature_tmp"' EXIT
   "$openssl" pkeyutl -sign -rawin -inkey "$signing_key" -in "$manifest" -out "$signature_tmp" || die "route signing failed"
   [[ $(file_size "$signature_tmp") == 64 ]] || die "Ed25519 signature must contain exactly 64 raw bytes"

@@ -1,13 +1,13 @@
-# Milk Gateway
+# Milk Carton
 
-Milk Gateway is a small, CPU-only OpenAI-compatible proxy. A hosted customer changes only the official OpenAI SDK base URL and API key. No SDK wrapper, custom authentication header, routing header, local model, or local GPU is required.
+Milk Carton is a small, CPU-only OpenAI-compatible proxy. A hosted customer changes only the official OpenAI SDK base URL and API key. No SDK wrapper, custom authentication header, routing header, local model, or local GPU is required.
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="https://api.example.com/v1",
-    api_key="dt_live_...",
+    api_key="milk_live_...",
 )
 
 response = client.chat.completions.create(
@@ -18,14 +18,14 @@ response = client.chat.completions.create(
 
 The public contract is deliberately narrow:
 
-- The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK uses Chat Completions or Responses through the standard `Authorization: Bearer` header and receives the normal response.
+- The customer supplies one OpenAI-compatible endpoint and one `milk_live_...` key. The official SDK uses Chat Completions or Responses through the standard `Authorization: Bearer` header and receives the normal response.
 - The hosted operator owns the gateway and eval configuration, one S3-compatible bucket with process-scoped logical roles, upstream and Baseten credentials, capture policy, and route policy. The hosted deployment uses Cloudflare R2; self-hosters may use another qualified S3-compatible service.
 
-During the single-tenant pilot, Milk issues, rotates, and revokes `dt_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `dragontales-gateway`, `DRAGONTALES_*`, and `dt_live_...` remain the stable binary, environment, and wire identifiers.
+During the single-tenant pilot, Milk issues, rotates, and revokes `milk_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `milk-carton`, `MILK_CARTON_*`, and `milk_live_...` remain the stable binary, environment, and wire identifiers.
 
 The gateway records only completed traffic admitted by the operator's capture policy. It loads one strict startup configuration, reports its SHA-256, and polls signed, revisioned route state while retaining the last verified route after a failed refresh.
 
-Milk Gateway is MIT-licensed. The hosted cloud proof has not run, so there is no production-qualified hosted release or live customer endpoint yet.
+Milk Carton is MIT-licensed. The hosted cloud proof has not run, so there is no production-qualified hosted release or live customer endpoint yet.
 
 ## Product boundary
 
@@ -38,7 +38,7 @@ The maintained system is this gateway, [`milk-harness`](https://github.com/milki
 
 ## Self-hosted configuration
 
-Hosted customers do not manage this configuration. Self-hosters supply one strict JSON document through `--config /path/to/config.json` or `DRAGONTALES_CONFIG_JSON`. Start from [`deploy/dragontales-config.example.json`](deploy/dragontales-config.example.json).
+Hosted customers do not manage this configuration. Self-hosters supply one strict JSON document through `--config /path/to/config.json` or `MILK_CARTON_CONFIG_JSON`. Start from [`deploy/milk-carton-config.example.json`](deploy/milk-carton-config.example.json).
 
 The important settings are:
 
@@ -75,24 +75,24 @@ Set `<ROLE>_ACCESS_KEY_ID`, `<ROLE>_SECRET_ACCESS_KEY`, and optionally `<ROLE>_S
 Build the CPU-only Rust binary:
 
 ```sh
-cargo +1.95.0 build --locked --release --package dragontales-gateway
+cargo +1.95.0 build --locked --release --package milk-carton
 ```
 
 Create a request key without printing it:
 
 ```sh
-install -d -m 0700 .dragontales-secrets
-deploy/dragontales-key.sh /usr/bin/openssl /usr/bin/uuidgen \
-  "$PWD/.dragontales-secrets/request.key"
+install -d -m 0700 .milk-carton-secrets
+deploy/milk-carton-key.sh /usr/bin/openssl /usr/bin/uuidgen \
+  "$PWD/.milk-carton-secrets/request.key"
 ```
 
 Add the key's SHA-256 to your config, set the upstream provider key, then run:
 
 ```sh
-export DRAGONTALES_OPENAI_API_KEY='...'
+export MILK_CARTON_OPENAI_API_KEY='...'
 export MILK_CAPTURE_SAMPLING_KEY_HEX="$(openssl rand -hex 32)"
 export MILK_CAPTURE_SAMPLING_KEY_VERSION='local-v1'
-target/release/dragontales-gateway --config "$PWD/dragontales.json" serve
+target/release/milk-carton --config "$PWD/milk-carton.json" serve
 ```
 
 Keep the sampling key stable for a version so session selection remains deterministic. The local path can use one or three owner-only directories. The hosted configuration uses one Cloudflare R2 bucket through the three S3-compatible logical access roles.
@@ -104,13 +104,13 @@ Keep the sampling key stable for a version so session selection remains determin
 The object store is authoritative. A scheduler, Exo, or a local shell may invoke the command, but none of them can manufacture a claim or authorize provider spend.
 
 ```sh
-target/release/dragontales-gateway --config "$PWD/dragontales.json" tick --once
-target/release/dragontales-gateway --config "$PWD/dragontales.json" status
+target/release/milk-carton --config "$PWD/milk-carton.json" tick --once
+target/release/milk-carton --config "$PWD/milk-carton.json" status
 ```
 
 ## Production deployment
 
-The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudflare Worker and Container. A non-bootstrap deployment uploads code and the reviewed `DRAGONTALES_CONFIG_JSON` in one atomic, versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update restores the prior Worker version and config binding together, then verifies that live health reports the exact pre-deploy config digest.
+The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudflare Worker and Container. A non-bootstrap deployment uploads code and the reviewed `MILK_CARTON_CONFIG_JSON` in one atomic, versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update restores the prior Worker version and config binding together, then verifies that live health reports the exact pre-deploy config digest.
 
 Build and verify one private image from a clean published checkout:
 
@@ -132,7 +132,8 @@ tools/deploy-private-gateway.sh \
   /absolute/gateway-release-evidence \
   /absolute/new/gateway-deploy-evidence \
   /absolute/gateway-credential.json \
-  /absolute/bootstrap-secrets.json
+  /absolute/bootstrap-secrets.json \
+  https://your-domain.example/v1
 
 tools/deploy-private-gateway.sh \
   --registry-token-file /absolute/owner-only/ghcr-token \
@@ -140,8 +141,11 @@ tools/deploy-private-gateway.sh \
   <cloudflare-application-id> \
   /absolute/new/gateway-deploy-evidence \
   /absolute/gateway-credential.json \
-  /absolute/gateway-config.json
+  /absolute/gateway-config.json \
+  https://your-domain.example/v1
 ```
+
+The final argument is the operator-owned public API base URL. It must be a lowercase HTTPS domain ending in `/v1`; the deploy tool writes only that hostname into the temporary Wrangler configuration. The repository does not claim or hard-code a production DNS name.
 
 The bootstrap secret document includes `MILK_CAPTURE_SAMPLING_KEY_HEX` as 64 lowercase hexadecimal characters and a bounded `MILK_CAPTURE_SAMPLING_KEY_VERSION`. Both are passed into the Container on every start.
 
@@ -151,7 +155,7 @@ The release contract keeps the gateway image CPU-only, with no shell, package ma
 
 Release evidence is digest-addressed and content-free. Prompts, model outputs, API keys, and raw build logs are not release artifacts.
 
-See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.md) for the full command and authority contract.
+See [`crates/milk-carton/README.md`](crates/milk-carton/README.md) for the full command and authority contract.
 
 ### Cloud-mechanics proof
 
@@ -163,7 +167,7 @@ Run the pinned official-SDK driver with an owner-only credential for the dedicat
 
 ```sh
 node tools/openai-production-smoke.mjs \
-  https://api.dragontales.milkinfrastructure.com/v1 \
+  "$MILK_CARTON_API_BASE_URL" \
   /absolute/path/to/mechanics-credential.json \
   <expected-gateway-config-sha256> \
   --generated-mechanics
