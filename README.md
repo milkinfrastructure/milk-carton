@@ -11,15 +11,15 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-5.4",
+    model="zai-org/GLM-5.3-Flash",
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
 
 The public contract is deliberately narrow:
 
-- The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK sends it through the standard `Authorization: Bearer` header and receives the normal response.
-- The hosted operator owns the gateway and eval configuration, separately credentialed R2 stores, upstream and Baseten credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
+- The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK uses Chat Completions or Responses through the standard `Authorization: Bearer` header and receives the normal response.
+- The hosted operator owns the gateway and eval configuration, one R2 bucket with process-scoped logical roles, upstream and Baseten credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
 
 During the single-tenant pilot, Milk issues, rotates, and revokes `dt_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `dragontales-gateway`, `DRAGONTALES_*`, and `dt_live_...` remain the stable binary, environment, and wire identifiers.
 
@@ -43,10 +43,10 @@ Hosted customers do not manage this configuration. Self-hosters supply one stric
 The important settings are:
 
 - the upstream OpenAI-compatible URL and model;
-- accepted request-key hashes and stable traffic cohorts;
+- accepted request-key hashes and capture authority;
 - `capture_allowed` for each request key;
-- capture, control, and route object stores;
-- one stable 64-character lowercase `eval_id`, its `dt/v3`-isolated object namespace, and its hard decision/call limits;
+- capture, control, and route object-store roles, which may share one physical bucket;
+- one operator-assigned `scope_id`, its `milk/v1/scopes/<scope_id>/` object namespace, and its hard decision/call limits;
 - immutable teacher, student, and image identities.
 
 Secrets stay in environment variables:
@@ -57,7 +57,7 @@ Secrets stay in environment variables:
 | `tick --once` | capture read/write, control read/write |
 | `status` | capture, control, and routes read-only |
 
-R2 credentials use `MILK_CAPTURE_STORE_*`, `MILK_CONTROL_STORE_*`, and `MILK_ROUTE_STORE_*`. Do not reuse one credential across those roles.
+All three store configs may name the same R2 bucket. The `MILK_CAPTURE_STORE_*`, `MILK_CONTROL_STORE_*`, and `MILK_ROUTE_STORE_*` bindings remain explicit, and each command opens only the logical roles in the table above.
 
 ## Run locally
 
@@ -79,14 +79,16 @@ Add the key's SHA-256 to your config, set the upstream provider key, then run:
 
 ```sh
 export DRAGONTALES_OPENAI_API_KEY='...'
+export MILK_CAPTURE_SAMPLING_KEY_HEX="$(openssl rand -hex 32)"
+export MILK_CAPTURE_SAMPLING_KEY_VERSION='local-v1'
 target/release/dragontales-gateway --config "$PWD/dragontales.json" serve
 ```
 
-The local path can use three owner-only directories. The hosted configuration uses three separately credentialed R2 buckets.
+Keep the sampling key stable for a version so session selection remains deterministic. The local path can use one or three owner-only directories. The hosted configuration uses one R2 bucket through the three logical access roles.
 
 ## Bounded evaluation loop
 
-`tick --once` reads captured traffic and the current eval configuration. Its required `eval_id` is a stable 64-character lowercase campaign identity. For a Milk-managed campaign, `gateway_config.eval_id` must equal `manifest.campaign_id`. The SHA-256 of the canonical outer `milk.eval.v1` document is separate and is the exact one-use paid-confirmation and pass-receipt value. Durable data is isolated under `dt/v3/<eval_id>/<tenant>/<project>/<environment>/<workload>/...`. The command acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached for that eval. Existing reconciliation and teardown continue even after the limit.
+`tick --once` reads captured traffic and the current eval configuration. Durable data is isolated under `milk/v1/scopes/<scope_id>/`; eval revisions do not create traffic namespaces. The command acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached for the scope. Existing reconciliation and teardown continue even after the limit.
 
 The object store is authoritative. A scheduler, Exo, or a local shell may invoke the command, but none of them can manufacture a claim or authorize provider spend.
 
@@ -130,6 +132,8 @@ tools/deploy-private-gateway.sh \
   /absolute/gateway-config.json
 ```
 
+The bootstrap secret document includes `MILK_CAPTURE_SAMPLING_KEY_HEX` as 64 lowercase hexadecimal characters and a bounded `MILK_CAPTURE_SAMPLING_KEY_VERSION`. Both are passed into the Container on every start.
+
 The [`milk-harness` production runbook](https://github.com/milkinfrastructure/milk-harness/blob/main/docs/reference/production-runbook.md) continues from this deployment through eval admission, five-minute reconciliation, one-use paid dispatches, signed zero, and verified zero compute.
 
 The release contract keeps the gateway image CPU-only, with no shell, package manager, Python, Node, GPU runtime, model weights, or local GPU dependency.
@@ -154,7 +158,7 @@ node tools/openai-production-smoke.mjs \
   --generated-mechanics
 ```
 
-The fixed proof model is `gpt-5.4`. The contract SHA-256 is `cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263`.
+The fixed proof model is `zai-org/GLM-5.3-Flash`. The contract SHA-256 is `086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf`.
 
 | Step | SDK calls | Baseline | Candidate | Completion-token cap |
 | --- | ---: | ---: | ---: | ---: |

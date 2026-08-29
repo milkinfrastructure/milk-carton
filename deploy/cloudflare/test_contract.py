@@ -21,14 +21,14 @@ assert "official-sdk-smoke" in deploy_script
 assert "automatic-rollback" in deploy_script
 assert "milk.private-gateway-current-deployment.v2" in deploy_script
 assert '"official_openai_sdk_baseline_receipt_sha256"' in deploy_script
-assert 'PRODUCTION_PROOF_SHA256 = "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263"' in deploy_script
+assert 'PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf"' in deploy_script
 assert "validate_deployment_baseline_binding" in deploy_script
 assert 'deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])' in deploy_script
 assert '"DRAGONTALES_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
 assert "expected_config_sha256" in deploy_script
 assert 'import OpenAI from "openai"' in production_smoke
 assert "maxRetries: 0" in production_smoke
-assert 'model: "gpt-5.4"' in production_smoke
+assert 'model: "zai-org/GLM-5.3-Flash"' in production_smoke
 assert "max_sdk_requests: 324" in production_smoke
 assert "baseline_requests: 322" in production_smoke
 assert "candidate_requests: 2" in production_smoke
@@ -75,6 +75,8 @@ assert config["secrets"]["required"] == [
     "DRAGONTALES_CONFIG_JSON",
     "DRAGONTALES_CONTAINER_ADMIN_KEY",
     "DRAGONTALES_OPENAI_API_KEY",
+    "MILK_CAPTURE_SAMPLING_KEY_HEX",
+    "MILK_CAPTURE_SAMPLING_KEY_VERSION",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID",
     "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY",
     "MILK_ROUTE_STORE_ACCESS_KEY_ID",
@@ -110,6 +112,8 @@ for buffered_or_mutated in (
     assert buffered_or_mutated not in worker
 assert 'sleepAfter = "1m"' in worker
 assert "ctx.storage" not in worker
+assert "MILK_CAPTURE_SAMPLING_KEY_HEX" in worker
+assert "MILK_CAPTURE_SAMPLING_KEY_VERSION" in worker
 assert "MILK_CAPTURE_STORE_ACCESS_KEY_ID" in worker
 assert "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY" in worker
 assert "MILK_CAPTURE_STORE_SESSION_TOKEN" in worker

@@ -131,7 +131,9 @@ const OBJECT_WRITE_CONCURRENCY: usize = 16;
 const LATENCY_BUCKET_UPPER_MS: [u64; 7] = [10, 50, 100, 250, 500, 1_000, 5_000];
 const REQUEST_SIZE_BUCKET_UPPER_BYTES: [u64; 7] =
     [1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304];
-pub(crate) const CAPTURE_SAMPLER_ID: &str = "sha256_uuidv7_u64_v1";
+pub(crate) const CAPTURE_SAMPLER_ID: &str = "hmac_sha256_session_root_v1";
+const TRACE_SCHEMA_VERSION: &str = "milk.trace.v1";
+const STATS_SHARD_SCHEMA_VERSION: &str = "milk.stats-shard.v1";
 pub(crate) const ANALYZER_OPERATION_TIMEOUT: Duration = Duration::from_secs(210);
 const STUDENT_MAX_MESSAGES: usize = 256;
 const STUDENT_CALIBRATION_ROWS: usize = 128;
@@ -143,11 +145,7 @@ static TRACE_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Scope {
-    pub(crate) tenant_id: Uuid,
-    pub(crate) project_id: Uuid,
-    pub(crate) environment_id: Uuid,
-    pub(crate) workload_id: Uuid,
-    pub(crate) eval_id: String,
+    pub(crate) scope_id: Uuid,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -170,8 +168,10 @@ pub(crate) enum RouteBlockReason {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum RouteFallbackReason {
     CandidateCapacity,
+    CandidateFailure,
     CandidateUnhealthy,
 }
 
@@ -222,11 +222,16 @@ impl TryFrom<BaselineReason> for RouteBlockReason {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TraceCatalog {
+    #[serde(flatten)]
     pub(crate) scope: Scope,
+    #[serde(rename = "request_id")]
     pub(crate) trace_id: Uuid,
     pub(crate) occurred_at: DateTime<Utc>,
     pub(crate) endpoint: String,
+    pub(crate) request_parse_success: bool,
+    pub(crate) streaming: bool,
     pub(crate) route_revision: String,
+    #[serde(rename = "route_observation")]
     pub(crate) route: RouteObservation,
     pub(crate) provider_status: Option<u16>,
     pub(crate) error_class: Option<String>,
@@ -234,13 +239,36 @@ pub(crate) struct TraceCatalog {
     pub(crate) completion_ms: Option<u64>,
     pub(crate) request_bytes: u64,
     pub(crate) response_bytes: u64,
+    #[serde(rename = "sampling_algorithm")]
     pub(crate) sampler_id: String,
+    pub(crate) sampling_unit_kind: SamplingUnitKind,
+    pub(crate) sampling_unit_hmac_sha256: String,
+    pub(crate) sampling_independence: SamplingIndependence,
+    pub(crate) sampling_key_version: String,
+    pub(crate) previous_response_hmac_sha256: Option<String>,
+    #[serde(rename = "inclusion_probability_basis_points")]
     pub(crate) capture_basis_points: u16,
     pub(crate) capture_eligible: bool,
     pub(crate) capture_selected: bool,
+    #[serde(rename = "sampling_policy_version")]
     pub(crate) capture_policy_version: Option<String>,
     pub(crate) rights_state: String,
     pub(crate) retention_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SamplingUnitKind {
+    ChatSessionHeader,
+    ResponsesConversation,
+    Request,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SamplingIndependence {
+    Independent,
+    Uncertain,
 }
 
 impl TraceCatalog {
@@ -249,6 +277,13 @@ impl TraceCatalog {
             .chain(std::iter::once(self.route_revision.capacity()))
             .chain(self.error_class.iter().map(String::capacity))
             .chain(std::iter::once(self.sampler_id.capacity()))
+            .chain(std::iter::once(self.sampling_unit_hmac_sha256.capacity()))
+            .chain(std::iter::once(self.sampling_key_version.capacity()))
+            .chain(
+                self.previous_response_hmac_sha256
+                    .iter()
+                    .map(String::capacity),
+            )
             .chain(self.capture_policy_version.iter().map(String::capacity))
             .chain(std::iter::once(self.rights_state.capacity()))
             .fold(0_usize, usize::saturating_add);
@@ -385,6 +420,8 @@ impl Default for StatsCounters {
 struct StatsRuntime {
     scope: Scope,
     capture_basis_points: u16,
+    capture_policy_version: Option<String>,
+    sampling_key_version: String,
     counters: StatsCounters,
 }
 
@@ -702,22 +739,22 @@ fn conditional_update_version(meta: &ObjectMeta, object: &str) -> Result<UpdateV
 
 fn classify_store_path(location: &ObjectPath) -> object_store::Result<StorePartition> {
     let parts = location.as_ref().split('/').collect::<Vec<_>>();
-    if parts.len() < 8
-        || parts[0] != "dt"
-        || parts[1] != "v3"
-        || !valid_lowercase_hex(parts[2], 64)
-        || parts[3..7].iter().any(|part| {
-            Uuid::parse_str(part).map_or(true, |value| value.is_nil() || value.to_string() != *part)
+    if parts.len() < 5
+        || parts[0] != "milk"
+        || parts[1] != "v1"
+        || parts[2] != "scopes"
+        || Uuid::parse_str(parts[3]).map_or(true, |value| {
+            value.is_nil() || value.to_string() != parts[3]
         })
     {
         return Err(store_permission_error(
             location,
-            "object key is outside a scoped dt/v3 eval authority",
+            "object key is outside a milk/v1 scope authority",
         ));
     }
-    Ok(match parts[7] {
-        "stats" | "traces" | "outcomes" | "tombstones" | "expiry-index" => StorePartition::Capture,
-        "frontier" if parts.get(8) == Some(&"snapshots") => StorePartition::Capture,
+    Ok(match parts[4] {
+        "stats" | "traffic" | "outcomes" | "tombstones" | "expiry-index" => StorePartition::Capture,
+        "frontier" if parts.get(5) == Some(&"snapshots") => StorePartition::Capture,
         "routes" => StorePartition::Routes,
         _ => StorePartition::Control,
     })
@@ -3399,6 +3436,11 @@ impl LatencyStats {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatsValues {
     observed: u64,
+    chat_completions: u64,
+    responses: u64,
+    streaming: u64,
+    request_parse_success: u64,
+    request_parse_failure: u64,
     eligible: u64,
     selected: u64,
     captured: u64,
@@ -3435,6 +3477,17 @@ pub(crate) struct StatsValues {
 impl StatsValues {
     fn observe(&mut self, catalog: &TraceCatalog, state: CaptureState, captured: bool) {
         self.observed = self.observed.saturating_add(1);
+        match catalog.endpoint.as_str() {
+            "chat_completions" => self.chat_completions = self.chat_completions.saturating_add(1),
+            "responses" => self.responses = self.responses.saturating_add(1),
+            _ => {}
+        }
+        self.streaming = self.streaming.saturating_add(u64::from(catalog.streaming));
+        if catalog.request_parse_success {
+            self.request_parse_success = self.request_parse_success.saturating_add(1);
+        } else {
+            self.request_parse_failure = self.request_parse_failure.saturating_add(1);
+        }
         self.queued = self.queued.saturating_add(1);
         self.eligible = self
             .eligible
@@ -3525,6 +3578,11 @@ impl StatsValues {
         }
         add!(
             observed,
+            chat_completions,
+            responses,
+            streaming,
+            request_parse_success,
+            request_parse_failure,
             eligible,
             selected,
             captured,
@@ -3579,12 +3637,18 @@ impl StatsValues {
 #[serde(deny_unknown_fields)]
 struct StatsShard {
     schema_version: String,
+    #[serde(flatten)]
     scope: Scope,
     writer_id: Uuid,
     flush_id: Uuid,
     hour: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
+    #[serde(rename = "sampling_algorithm")]
     sampler_id: String,
+    #[serde(rename = "sampling_policy_version")]
+    capture_policy_version: Option<String>,
+    sampling_key_version: String,
+    #[serde(rename = "inclusion_probability_basis_points")]
     capture_basis_points: u16,
     values: StatsValues,
 }
@@ -3647,12 +3711,14 @@ enum PutDisposition {
 }
 
 impl Records {
-    pub(crate) async fn start(
+    pub(crate) async fn start_with_sampling(
         objects: Arc<dyn ObjectStore>,
         queue_max_bytes: usize,
         max_trace_bytes: usize,
         scope: Scope,
         capture_basis_points: u16,
+        capture_policy_version: Option<String>,
+        sampling_key_version: String,
     ) -> Result<Self> {
         validate_scope(&scope)?;
         if queue_max_bytes == 0 || queue_max_bytes > u32::MAX as usize {
@@ -3663,6 +3729,14 @@ impl Records {
         }
         if capture_basis_points > 10_000 {
             bail!("capture_basis_points cannot exceed 10000");
+        }
+        if capture_policy_version
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256)
+            || sampling_key_version.is_empty()
+            || sampling_key_version.len() > 128
+        {
+            bail!("capture sampling identity is invalid");
         }
         let max_artifact_bytes = max_trace_bytes
             .checked_mul(MAX_STUDENT_TRAIN_ROWS)
@@ -3678,6 +3752,8 @@ impl Records {
         let stats = Arc::new(StatsRuntime {
             scope,
             capture_basis_points,
+            capture_policy_version,
+            sampling_key_version,
             counters: StatsCounters::default(),
         });
         let worker_store = Arc::clone(&store);
@@ -3696,6 +3772,26 @@ impl Records {
     }
 
     #[cfg(test)]
+    pub(crate) async fn start(
+        objects: Arc<dyn ObjectStore>,
+        queue_max_bytes: usize,
+        max_trace_bytes: usize,
+        scope: Scope,
+        capture_basis_points: u16,
+    ) -> Result<Self> {
+        Self::start_with_sampling(
+            objects,
+            queue_max_bytes,
+            max_trace_bytes,
+            scope,
+            capture_basis_points,
+            (capture_basis_points > 0).then(|| "test-policy-v1".to_owned()),
+            "test-key-v1".to_owned(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) fn stalled_for_test(queue_max_bytes: usize, max_trace_bytes: usize) -> Result<Self> {
         if queue_max_bytes == 0 || max_trace_bytes == 0 || max_trace_bytes > queue_max_bytes {
             bail!("invalid test capture queue limits");
@@ -3709,13 +3805,11 @@ impl Records {
         let (sender, receiver) = mpsc::channel(TRACE_QUEUE_RECORDS);
         let stats = Arc::new(StatsRuntime {
             scope: Scope {
-                tenant_id: Uuid::new_v4(),
-                project_id: Uuid::new_v4(),
-                environment_id: Uuid::new_v4(),
-                workload_id: Uuid::new_v4(),
-                eval_id: "11".repeat(32),
+                scope_id: Uuid::new_v4(),
             },
             capture_basis_points: 0,
+            capture_policy_version: None,
+            sampling_key_version: "test-v1".to_owned(),
             counters: StatsCounters::default(),
         });
         std::mem::drop(tokio::spawn(async move {
@@ -4406,13 +4500,15 @@ impl RecordStore {
             }
             let flush_id = Uuid::now_v7();
             let shard = StatsShard {
-                schema_version: "dragontales.stats-shard.v5".to_owned(),
+                schema_version: STATS_SHARD_SCHEMA_VERSION.to_owned(),
                 scope: runtime.scope.clone(),
                 writer_id: self.writer_id,
                 flush_id,
                 hour,
                 recorded_at,
                 sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+                capture_policy_version: runtime.capture_policy_version.clone(),
+                sampling_key_version: runtime.sampling_key_version.clone(),
                 capture_basis_points: runtime.capture_basis_points,
                 values,
             };
@@ -4824,7 +4920,7 @@ impl RecordStore {
             .await?;
         let key = trace_key(scope, trace_id)?;
         let trace: StoredTraceObject = self.load_compressed(&key, self.max_trace_bytes).await?;
-        if trace.schema_version != "dragontales.trace.v3"
+        if trace.schema_version != TRACE_SCHEMA_VERSION
             || trace.catalog.scope != *scope
             || trace.catalog.trace_id != trace_id
         {
@@ -5807,7 +5903,7 @@ impl RecordStore {
                 bail!("snapshot frontier trace digest differs from its marker");
             }
             let trace: StoredTraceObject = decode_compressed(&trace_payload, self.max_trace_bytes)?;
-            if trace.schema_version != "dragontales.trace.v3"
+            if trace.schema_version != TRACE_SCHEMA_VERSION
                 || trace.catalog.scope != *scope
                 || trace.catalog.trace_id != marker.trace_id
                 || trace.catalog.occurred_at != marker.occurred_at
@@ -6512,7 +6608,7 @@ impl RecordStore {
             .retention_until
             .context("sampled snapshot has no retention deadline")?;
         let occurred_at = trace.catalog.occurred_at;
-        if trace.schema_version != "dragontales.trace.v3"
+        if trace.schema_version != TRACE_SCHEMA_VERSION
             || trace.catalog.scope != *scope
             || trace_key(scope, trace.catalog.trace_id)? != key
             || occurred_at < from_hour
@@ -9935,6 +10031,16 @@ impl RecordStore {
             self.load_verified_route_commit(scope, &previous.revision)
                 .await?;
         }
+        if publication.is_operator_proposal() {
+            if publication.has_candidate != (publication.candidate_basis_points > 0) {
+                bail!("operator route candidate differs from its basis points");
+            }
+            return if publication.has_candidate {
+                self.verify_route_cohort_binding(scope, publication).await
+            } else {
+                Ok(())
+            };
+        }
         if publication.candidate_basis_points == 0 {
             let previous = previous
                 .context("zero-basis-point rollback requires a prior committed route revision")?;
@@ -9951,7 +10057,7 @@ impl RecordStore {
                 || publication.student_branch_runtime_image_reference
                     != previous.student_branch_runtime_image_reference
                 || publication.provider_terms_sha256 != previous.provider_terms_sha256
-                || publication.candidate_endpoint != previous.candidate_endpoint
+                || publication.candidate_api_base_url != previous.candidate_api_base_url
                 || publication.logical_model_alias != previous.logical_model_alias
                 || publication.reasoning_effort != previous.reasoning_effort
                 || publication.route_secret_sha256 != previous.route_secret_sha256
@@ -10888,7 +10994,9 @@ impl RecordStore {
         {
             bail!("stored route publication differs from the signed input");
         }
-        if let Some(previous) = previous.filter(|route| route.candidate_basis_points == 0) {
+        if !publication.is_operator_proposal()
+            && let Some(previous) = previous.filter(|route| route.candidate_basis_points == 0)
+        {
             let (current, _) = self
                 .load_live_pointer(scope)
                 .await?
@@ -10903,7 +11011,7 @@ impl RecordStore {
                 .await?;
         }
         self.activate_route(scope, publication).await?;
-        if publication.candidate_basis_points == 0 {
+        if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
             self.store_route_student_retirement(scope, publication)
                 .await?;
         }
@@ -10917,7 +11025,7 @@ impl RecordStore {
         {
             bail!("live route differs from the activated publication");
         }
-        if publication.candidate_basis_points == 0 {
+        if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
             self.verify_zero_route_retirement(scope, publication)
                 .await?;
             let canary = previous.context(
@@ -11827,6 +11935,10 @@ fn validate_stats_shard(
         .and_then(|value| value.checked_add(values.interrupted))
         .and_then(|value| value.checked_add(values.capture_failed));
     let route_total = values.route_eligible.checked_add(values.route_ineligible);
+    let endpoint_total = values.chat_completions.checked_add(values.responses);
+    let parse_total = values
+        .request_parse_success
+        .checked_add(values.request_parse_failure);
     let route_eligible_total = values.route_selected.checked_add(values.route_not_selected);
     let blocked_total = values
         .route_blocked_reason_counts
@@ -11866,7 +11978,7 @@ fn validate_stats_shard(
             && (latency.count > 0 || (latency.sum_ms == 0 && latency.max_ms == 0))
             && latency.sum_ms >= latency.max_ms
     };
-    if shard.schema_version != "dragontales.stats-shard.v5"
+    if shard.schema_version != STATS_SHARD_SCHEMA_VERSION
         || shard.scope != *scope
         || shard.hour != hour_start(shard.hour)
         || shard.hour < from_hour
@@ -11875,6 +11987,12 @@ fn validate_stats_shard(
         || shard.flush_id.get_timestamp().is_none()
         || shard.recorded_at < shard.hour
         || shard.sampler_id != CAPTURE_SAMPLER_ID
+        || shard.sampling_key_version.is_empty()
+        || shard.sampling_key_version.len() > 128
+        || shard
+            .capture_policy_version
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256)
         || shard.capture_basis_points > 10_000
         || key != stats_key(scope, shard.hour, shard.writer_id, shard.flush_id)
         || values.eligible > values.observed
@@ -11886,6 +12004,9 @@ fn validate_stats_shard(
         || values.traces_persisted != values.captured
         || values.trace_persist_failures != values.capture_failed
         || capture_total != Some(values.observed)
+        || endpoint_total != Some(values.observed)
+        || parse_total != Some(values.observed)
+        || values.streaming > values.observed
         || route_total != Some(values.observed)
         || route_eligible_total != Some(values.route_eligible)
         || blocked_total != Some(values.route_ineligible)
@@ -11981,7 +12102,7 @@ fn validate_expiry_source(
     match marker.kind {
         ExpiryKind::Trace => {
             let trace: StoredTraceObject = decode_compressed(payload, max_bytes)?;
-            if trace.schema_version != "dragontales.trace.v3"
+            if trace.schema_version != TRACE_SCHEMA_VERSION
                 || trace.catalog.scope != *scope
                 || trace.catalog.trace_id != marker.trace_id
                 || trace.catalog.retention_until != Some(marker.retention_until)
@@ -12770,27 +12891,12 @@ fn valid_lowercase_hex(value: &str, length: usize) -> bool {
 }
 
 fn scope_prefix(scope: &Scope) -> String {
-    format!(
-        "dt/v3/{}/{}/{}/{}/{}",
-        scope.eval_id, scope.tenant_id, scope.project_id, scope.environment_id, scope.workload_id
-    )
+    format!("milk/v1/scopes/{}", scope.scope_id)
 }
 
 fn validate_scope(scope: &Scope) -> Result<()> {
-    if scope.tenant_id.is_nil()
-        || scope.project_id.is_nil()
-        || scope.environment_id.is_nil()
-        || scope.workload_id.is_nil()
-        || validate_eval_id(&scope.eval_id).is_err()
-    {
-        bail!("scope UUIDs and eval ID are invalid");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_eval_id(eval_id: &str) -> Result<()> {
-    if !valid_lowercase_hex(eval_id, 64) {
-        bail!("eval_id must be exactly 64 lowercase hexadecimal characters");
+    if scope.scope_id.is_nil() {
+        bail!("scope_id must be a non-nil UUID");
     }
     Ok(())
 }
@@ -12822,7 +12928,7 @@ fn trace_time(trace_id: Uuid) -> Result<DateTime<Utc>> {
 
 fn trace_key(scope: &Scope, trace_id: Uuid) -> Result<String> {
     Ok(format!(
-        "{}/traces/{}/{}.json.zst",
+        "{}/traffic/{}/{}.json.zst",
         scope_prefix(scope),
         trace_time(trace_id)?.format("%Y/%m/%d/%H"),
         trace_id,
@@ -12940,7 +13046,7 @@ fn encode_trace(capture: &TraceCapture, max_record_bytes: usize) -> Result<Encod
         &capture.response,
     )?;
     let value = TraceObject {
-        schema_version: "dragontales.trace.v3",
+        schema_version: TRACE_SCHEMA_VERSION,
         catalog: &capture.catalog,
         request: &request,
         response: &response,
@@ -13170,7 +13276,7 @@ fn validate_snapshot_entry_trace(
     now: DateTime<Utc>,
 ) -> Result<()> {
     let expected_key = trace_key(scope, entry.trace_id)?;
-    if trace.schema_version != "dragontales.trace.v3"
+    if trace.schema_version != TRACE_SCHEMA_VERSION
         || trace.catalog.scope != *scope
         || trace.catalog.trace_id != entry.trace_id
         || trace.catalog.occurred_at != entry.occurred_at
@@ -15696,7 +15802,7 @@ fn route_publication_write(
         candidate_basis_points: publication.candidate_basis_points,
         manifest_object_key: commit.manifest_object_key.clone(),
         signature_object_key: commit.signature_object_key.clone(),
-        live_pointer_object_key: format!("{}/routes/live.json", scope_prefix(&commit.scope)),
+        live_pointer_object_key: route_live_key(&commit.scope),
         state: "active".to_owned(),
     }
 }
@@ -16680,7 +16786,7 @@ fn student_artifact_key(
 
 fn route_manifest_key(scope: &Scope, revision: &[u8; 32]) -> String {
     format!(
-        "{}/routes/manifests/{}.json",
+        "{}/routes/versions/{}.json",
         scope_prefix(scope),
         hex_digest(revision)
     )
@@ -16720,16 +16826,12 @@ fn route_student_retirement_key(scope: &Scope, student_job_id: &[u8; 32]) -> Str
 }
 
 fn route_live_key(scope: &Scope) -> String {
-    format!("{}/routes/live.json", scope_prefix(scope))
+    format!("{}/routes/current.json", scope_prefix(scope))
 }
 
 fn route_scope(scope: &Scope) -> RouteScope {
     RouteScope {
-        tenant_id: scope.tenant_id,
-        project_id: scope.project_id,
-        environment_id: scope.environment_id,
-        workload_id: scope.workload_id,
-        eval_id: scope.eval_id.clone(),
+        scope_id: scope.scope_id,
     }
 }
 
@@ -17005,11 +17107,7 @@ mod tests {
 
     fn qualification_scope() -> Scope {
         Scope {
-            tenant_id: Uuid::from_u128(1),
-            project_id: Uuid::from_u128(2),
-            environment_id: Uuid::from_u128(3),
-            workload_id: Uuid::from_u128(4),
-            eval_id: "11".repeat(32),
+            scope_id: Uuid::from_u128(1),
         }
     }
 
@@ -17018,10 +17116,28 @@ mod tests {
     }
 
     #[test]
+    fn route_keys_match_the_scope_first_version_contract() {
+        let scope = qualification_scope();
+        let revision = [0xab; 32];
+        assert_eq!(
+            route_manifest_key(&scope, &revision),
+            format!(
+                "{}/routes/versions/{}.json",
+                scope_prefix(&scope),
+                "ab".repeat(32)
+            )
+        );
+        assert_eq!(
+            route_live_key(&scope),
+            format!("{}/routes/current.json", scope_prefix(&scope))
+        );
+    }
+
+    #[test]
     fn store_partition_classification_is_exact_and_scoped() {
         for suffix in [
             "stats/2026/08/27/x.json",
-            "traces/2026/08/27/x.json.zst",
+            "traffic/2026/08/27/x.json.zst",
             "outcomes/x/1/claim.json.zst",
             "tombstones/traces/x.json",
             "expiry-index/x.json",
@@ -17033,7 +17149,7 @@ mod tests {
             );
         }
         assert_eq!(
-            classify_store_path(&partition_test_key("routes/live.json")).unwrap(),
+            classify_store_path(&partition_test_key("routes/current.json")).unwrap(),
             StorePartition::Routes
         );
         for suffix in [
@@ -17068,9 +17184,9 @@ mod tests {
         let capture = Arc::new(InMemory::new());
         let control = Arc::new(InMemory::new());
         let routes = Arc::new(InMemory::new());
-        let capture_key = partition_test_key("traces/2026/08/27/capture.json");
+        let capture_key = partition_test_key("traffic/2026/08/27/capture.json");
         let control_key = partition_test_key("students/private.json");
-        let route_key = partition_test_key("routes/live.json");
+        let route_key = partition_test_key("routes/current.json");
         control
             .put(&control_key, PutPayload::from_static(b"control"))
             .await
@@ -18088,8 +18204,8 @@ mod tests {
                 admission_program_sha256: claim.authority.admission_program_sha256.clone(),
                 execution_id: "winner-execution-1".to_owned(),
                 execution_name: "winner-deployment".to_owned(),
-                chat_completions_url:
-                    "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/chat/completions"
+                api_base_url:
+                    "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/"
                         .to_owned(),
                 models_response_sha256: hex_digest(&Sha256::digest(b"models").into()),
                 chat_request_sha256: hex_digest(&Sha256::digest(b"chat-request").into()),
@@ -19356,6 +19472,8 @@ mod tests {
                 trace_id,
                 occurred_at,
                 endpoint: "chat_completions".to_owned(),
+                request_parse_success: true,
+                streaming: false,
                 route_revision: "baseline-v1".to_owned(),
                 route: RouteObservation::Ineligible {
                     reason: RouteBlockReason::PolicyAbsent,
@@ -19367,6 +19485,11 @@ mod tests {
                 request_bytes: request.len() as u64,
                 response_bytes: response.len() as u64,
                 sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+                sampling_unit_kind: SamplingUnitKind::Request,
+                sampling_unit_hmac_sha256: "aa".repeat(32),
+                sampling_independence: SamplingIndependence::Uncertain,
+                sampling_key_version: "test-key-v1".to_owned(),
+                previous_response_hmac_sha256: None,
                 capture_basis_points: 10_000,
                 capture_eligible: true,
                 capture_selected: true,
@@ -19556,7 +19679,7 @@ mod tests {
         let second = gpu_launch_test_store(objects);
         let first_scope = qualification_scope();
         let mut second_scope = qualification_scope();
-        second_scope.workload_id = Uuid::from_u128(5);
+        second_scope.scope_id = Uuid::from_u128(5);
         let now = Utc::now().with_nanosecond(0).unwrap();
         let (first_lease, second_lease) = tokio::join!(
             first.acquire_tick_lease(&first_scope, now),
@@ -19599,7 +19722,7 @@ mod tests {
 
         let foreign_objects = Arc::new(InMemory::new());
         let mut foreign_scope = qualification_scope();
-        foreign_scope.workload_id = Uuid::from_u128(5);
+        foreign_scope.scope_id = Uuid::from_u128(5);
         let foreign = new_tick_lease(&foreign_scope, Uuid::now_v7(), now).unwrap();
         foreign_objects
             .put(
@@ -21508,7 +21631,7 @@ mod tests {
         let store = gpu_launch_test_store(objects);
         let first_scope = qualification_scope();
         let mut second_scope = first_scope.clone();
-        second_scope.eval_id = "22".repeat(32);
+        second_scope.scope_id = Uuid::from_u128(22);
         let now = Utc::now().with_nanosecond(0).unwrap();
         persist_gpu_test_traces(&store, &first_scope, now, 1).await;
         persist_gpu_test_traces(&store, &second_scope, now, 1).await;
@@ -21538,7 +21661,10 @@ mod tests {
         }
 
         assert_ne!(scope_prefix(&first_scope), scope_prefix(&second_scope));
-        assert!(scope_prefix(&first_scope).starts_with(&format!("dt/v3/{}/", first_scope.eval_id)));
+        assert_eq!(
+            scope_prefix(&first_scope),
+            format!("milk/v1/scopes/{}", first_scope.scope_id)
+        );
     }
 
     #[actix_web::test]
@@ -23357,11 +23483,7 @@ mod tests {
         );
 
         let scope = Scope {
-            tenant_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment_id: Uuid::new_v4(),
-            workload_id: Uuid::new_v4(),
-            eval_id: "33".repeat(32),
+            scope_id: Uuid::new_v4(),
         };
         let occurred_at = Utc::now().with_nanosecond(0).unwrap();
         let mut trace = test_capture(
@@ -23376,9 +23498,9 @@ mod tests {
         let trace_object = encode_trace(&trace, 64 * 1_024).unwrap();
         let trace_fixture: serde_json::Value =
             decode_compressed(&trace_object.payload, 64 * 1_024).unwrap();
-        assert_eq!(trace_fixture["schema_version"], "dragontales.trace.v3");
+        assert_eq!(trace_fixture["schema_version"], TRACE_SCHEMA_VERSION);
         assert_eq!(
-            trace_fixture["catalog"]["route"],
+            trace_fixture["catalog"]["route_observation"],
             serde_json::json!({"state": "ineligible", "reason": "unsupported_request"})
         );
         assert!(trace_fixture["catalog"].get("eligibility").is_none());
@@ -23427,13 +23549,15 @@ mod tests {
         let writer_id = Uuid::now_v7();
         let flush_id = Uuid::now_v7();
         let shard = StatsShard {
-            schema_version: "dragontales.stats-shard.v5".to_owned(),
+            schema_version: STATS_SHARD_SCHEMA_VERSION.to_owned(),
             scope: scope.clone(),
             writer_id,
             flush_id,
             hour,
             recorded_at: occurred_at,
             sampler_id: CAPTURE_SAMPLER_ID.to_owned(),
+            capture_policy_version: Some("test-v1".to_owned()),
+            sampling_key_version: "test-key-v1".to_owned(),
             capture_basis_points: 0,
             values,
         };
@@ -23444,7 +23568,7 @@ mod tests {
         let decoded: StatsShard = serde_json::from_slice(&canonical).unwrap();
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), canonical);
         let fixture: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
-        assert_eq!(fixture["schema_version"], "dragontales.stats-shard.v5");
+        assert_eq!(fixture["schema_version"], STATS_SHARD_SCHEMA_VERSION);
         assert_eq!(
             fixture["values"]["route_blocked_reason_counts"],
             serde_json::json!({"unsupported_request": 1})
@@ -23617,11 +23741,7 @@ mod tests {
     async fn corrupt_capture_does_not_poison_the_next_record() {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let scope = Scope {
-            tenant_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment_id: Uuid::new_v4(),
-            workload_id: Uuid::new_v4(),
-            eval_id: "44".repeat(32),
+            scope_id: Uuid::new_v4(),
         };
         let records = Records::start(objects, 128 * 1_024, 64 * 1_024, scope.clone(), 10_000)
             .await
@@ -23671,11 +23791,7 @@ mod tests {
     async fn queue_drop_is_visible_in_health() {
         let records = Records::stalled_for_test(1, 1).unwrap();
         let scope = Scope {
-            tenant_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            environment_id: Uuid::new_v4(),
-            workload_id: Uuid::new_v4(),
-            eval_id: "55".repeat(32),
+            scope_id: Uuid::new_v4(),
         };
         let now = Utc::now();
         let catalog = test_capture(

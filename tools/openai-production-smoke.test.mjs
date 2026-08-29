@@ -15,7 +15,7 @@ const digest = (byte) => byte.repeat(64);
 const credential = {
   api_key: "dt_live_00000000-0000-4000-8000-000000000001_test_secret_123456789",
   cohort_id: "paid-proof-selected-cohort-v1",
-  model: "gpt-5.4",
+  model: "zai-org/GLM-5.3-Flash",
   reasoning_effort: "high",
 };
 
@@ -26,12 +26,12 @@ assert.deepEqual(PRODUCTION_PROOF, {
   generated_mechanics_requests: 320,
   generated_request_timeout_ms: 30_000,
   max_sdk_requests: 324,
-  model: "gpt-5.4",
+  model: "zai-org/GLM-5.3-Flash",
   saturation_max_completion_tokens: 3_840,
   short_max_completion_tokens: 128,
 });
 const productionProofSha256 =
-  "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263";
+  "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf";
 const revision = digest("1");
 const data = {
   choices: [{ finish_reason: "stop", message: { content: "OK", role: "assistant" } }],

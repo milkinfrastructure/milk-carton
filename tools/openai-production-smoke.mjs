@@ -33,7 +33,7 @@ export const PRODUCTION_PROOF = Object.freeze({
   generated_mechanics_requests: 320,
   generated_request_timeout_ms: 30_000,
   max_sdk_requests: 324,
-  model: "gpt-5.4",
+  model: "zai-org/GLM-5.3-Flash",
   saturation_max_completion_tokens: 3_840,
   short_max_completion_tokens: 128,
 });

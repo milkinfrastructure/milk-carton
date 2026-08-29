@@ -49,11 +49,11 @@ PRODUCTION_PROOF = {
     "generated_mechanics_requests": 320,
     "generated_request_timeout_ms": 30000,
     "max_sdk_requests": 324,
-    "model": "gpt-5.4",
+    "model": "zai-org/GLM-5.3-Flash",
     "saturation_max_completion_tokens": 3840,
     "short_max_completion_tokens": 128,
 }
-PRODUCTION_PROOF_SHA256 = "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263"
+PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf"
 if hashlib.sha256(json.dumps(
     PRODUCTION_PROOF, sort_keys=True, separators=(",", ":"),
 ).encode()).hexdigest() != PRODUCTION_PROOF_SHA256:
@@ -75,15 +75,21 @@ CURRENT_DEPLOYMENT_FIELDS = {
 POLL_ATTEMPTS = 20
 POLL_INTERVAL_SECONDS = 15
 MAX_JSON = 1024 * 1024
-BOOTSTRAP_SECRET_NAMES = {
+BOOTSTRAP_REQUIRED_SECRET_NAMES = {
     "DRAGONTALES_CONFIG_JSON",
     "DRAGONTALES_CONTAINER_ADMIN_KEY",
     "DRAGONTALES_OPENAI_API_KEY",
     "DRAGONTALES_ROUTE_SECRET_HEX",
+    "MILK_CAPTURE_SAMPLING_KEY_HEX",
+    "MILK_CAPTURE_SAMPLING_KEY_VERSION",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID",
     "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY",
     "MILK_ROUTE_STORE_ACCESS_KEY_ID",
     "MILK_ROUTE_STORE_SECRET_ACCESS_KEY",
+}
+BOOTSTRAP_OPTIONAL_SECRET_NAMES = {
+    "MILK_CAPTURE_STORE_SESSION_TOKEN",
+    "MILK_ROUTE_STORE_SESSION_TOKEN",
 }
 BOOTSTRAP_CLEANUP_ATTEMPTS = 6
 BOOTSTRAP_CLEANUP_ABSENCE_PROOFS = 3
@@ -638,12 +644,10 @@ def parse_gateway_config(raw):
     for traffic_key in traffic_keys:
         if (
             not isinstance(traffic_key, dict)
-            or set(traffic_key) != {"api_key_sha256", "capture_allowed", "cohort_id"}
+            or set(traffic_key) != {"api_key_sha256", "capture_allowed"}
             or not isinstance(traffic_key["api_key_sha256"], str)
             or SHA256.fullmatch(traffic_key["api_key_sha256"]) is None
             or not isinstance(traffic_key["capture_allowed"], bool)
-            or not isinstance(traffic_key["cohort_id"], str)
-            or COHORT_ID.fullmatch(traffic_key["cohort_id"]) is None
             or traffic_key["api_key_sha256"] in hashes
         ):
             raise DeployFailure("gateway traffic keys are invalid")
@@ -686,7 +690,10 @@ def validate_bootstrap_secrets(path, repository):
     if (
         value["schema_version"] != "milk.gateway-bootstrap-secrets.v1"
         or not isinstance(secrets_value, dict)
-        or set(secrets_value) != BOOTSTRAP_SECRET_NAMES
+        or not BOOTSTRAP_REQUIRED_SECRET_NAMES.issubset(secrets_value)
+        or not set(secrets_value).issubset(
+            BOOTSTRAP_REQUIRED_SECRET_NAMES | BOOTSTRAP_OPTIONAL_SECRET_NAMES
+        )
         or any(
             not isinstance(secret, str) or not 1 <= len(secret.encode("utf-8")) <= 262144
             for secret in secrets_value.values()
@@ -696,7 +703,7 @@ def validate_bootstrap_secrets(path, repository):
         raise DeployFailure("bootstrap secrets file is invalid")
     gateway_config_raw = secrets_value["DRAGONTALES_CONFIG_JSON"].encode("utf-8")
     gateway_config = parse_gateway_config(gateway_config_raw)
-    return canonical_json(secrets_value), gateway_config_raw, gateway_config
+    return canonical_json(secrets_value), set(secrets_value), gateway_config_raw, gateway_config
 
 
 def validate_smoke_credential(path, gateway_config):
@@ -728,7 +735,6 @@ def validate_smoke_credential(path, gateway_config):
         if traffic_key == {
             "api_key_sha256": api_key_sha256,
             "capture_allowed": False,
-            "cohort_id": credential["cohort_id"],
         }
     ]
     if len(matches) != 1:
@@ -824,9 +830,12 @@ def main():
         application_id = None
         requested_evidence = Path(arguments[2])
         credential_file = Path(arguments[3])
-        bootstrap_secret_input, gateway_config_raw, gateway_config = validate_bootstrap_secrets(
-            Path(arguments[4]), repository,
-        )
+        (
+            bootstrap_secret_input,
+            expected_bootstrap_secret_names,
+            gateway_config_raw,
+            gateway_config,
+        ) = validate_bootstrap_secrets(Path(arguments[4]), repository)
     else:
         release_directory = Path(arguments[0]).resolve(strict=True)
         application_id = arguments[1]
@@ -836,6 +845,7 @@ def main():
             Path(arguments[4]), repository,
         )
         bootstrap_secret_input = None
+        expected_bootstrap_secret_names = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
         raise DeployFailure("deploy evidence directory must be a new absolute path")
     evidence_parent = requested_evidence.parent.resolve(strict=True)
@@ -1519,7 +1529,7 @@ def main():
                 "bootstrap-secret-list", "secret", "list", "--name", WORKER,
                 "--format", "json", sensitive=True,
             ).stdout)
-            if installed_secrets != BOOTSTRAP_SECRET_NAMES:
+            if installed_secrets != expected_bootstrap_secret_names:
                 raise ContractFailure("bootstrap Worker secrets are incomplete")
             evidence.write("bootstrap-created.json", {
                 "schema_version": "milk.private-gateway-bootstrap-created.v1",

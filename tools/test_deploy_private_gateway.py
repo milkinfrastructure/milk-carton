@@ -40,13 +40,14 @@ SMOKE_GATEWAY_CONFIG = json.loads(
 SMOKE_GATEWAY_CONFIG["traffic_keys"] = [{
     "api_key_sha256": sha256(SMOKE_API_KEY.encode()),
     "capture_allowed": False,
-    "cohort_id": SMOKE_COHORT,
 }]
 BOOTSTRAP_SECRETS = {
     "DRAGONTALES_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
     "DRAGONTALES_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
     "DRAGONTALES_OPENAI_API_KEY": "bootstrap-openai-private",
     "DRAGONTALES_ROUTE_SECRET_HEX": "0" * 64,
+    "MILK_CAPTURE_SAMPLING_KEY_HEX": "1" * 64,
+    "MILK_CAPTURE_SAMPLING_KEY_VERSION": "pilot-v1",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID": "bootstrap-capture-access-private",
     "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY": "bootstrap-capture-secret-private",
     "MILK_ROUTE_STORE_ACCESS_KEY_ID": "bootstrap-route-access-private",
@@ -252,7 +253,7 @@ if name == "node":
         "generated_mechanics_requests": 320,
         "generated_request_timeout_ms": 30000,
         "max_sdk_requests": 324,
-        "model": "gpt-5.4",
+        "model": "zai-org/GLM-5.3-Flash",
         "saturation_max_completion_tokens": 3840,
         "short_max_completion_tokens": 128,
     }
@@ -266,7 +267,7 @@ if name == "node":
         "finish_reason": "stop",
         "http_status": 200,
         "max_completion_tokens": 128,
-        "model": "gpt-5.4",
+        "model": "zai-org/GLM-5.3-Flash",
         "proof_contract_sha256": hashlib.sha256(json.dumps(
             proof_contract, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest(),
@@ -500,7 +501,7 @@ class Fixture:
         self.credential.write_bytes(canonical({
             "api_key": SMOKE_API_KEY,
             "cohort_id": SMOKE_COHORT,
-            "model": "gpt-5.4",
+            "model": "zai-org/GLM-5.3-Flash",
         }))
         self.credential.chmod(0o600)
         self.gateway_config = self.root / "gateway-config.json"
@@ -561,6 +562,25 @@ class Fixture:
 
 
 class DeployPrivateGatewayTests(unittest.TestCase):
+    def test_bootstrap_with_optional_r2_session_tokens_installs_exact_submitted_set(self):
+        fixture = Fixture(bootstrap=True)
+        self.addCleanup(fixture.close)
+        value = json.loads(fixture.bootstrap_secrets.read_text())
+        value["secrets"]["MILK_CAPTURE_STORE_SESSION_TOKEN"] = "capture-session-private"
+        value["secrets"]["MILK_ROUTE_STORE_SESSION_TOKEN"] = "route-session-private"
+        self.assertEqual(
+            set(value["secrets"]),
+            DEPLOY_CONTRACT.BOOTSTRAP_REQUIRED_SECRET_NAMES
+            | DEPLOY_CONTRACT.BOOTSTRAP_OPTIONAL_SECRET_NAMES,
+        )
+        fixture.bootstrap_secrets.write_bytes(canonical(value))
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(
+            fixture.state["installed_secret_names"],
+            sorted(value["secrets"]),
+        )
+
     def test_registry_credential_can_be_streamed_without_evidence(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
@@ -584,15 +604,13 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(fixture.state["commands"], [])
 
     def test_smoke_key_must_be_exactly_non_capturable_in_canonical_gateway_config(self):
-        for defect in ("capture", "cohort", "key"):
+        for defect in ("capture", "key"):
             with self.subTest(defect=defect):
                 fixture = Fixture()
                 self.addCleanup(fixture.close)
                 config = json.loads(fixture.gateway_config.read_text())
                 if defect == "capture":
                     config["traffic_keys"][0]["capture_allowed"] = True
-                elif defect == "cohort":
-                    config["traffic_keys"][0]["cohort_id"] = "different-cohort"
                 else:
                     config["traffic_keys"][0]["api_key_sha256"] = "0" * 64
                 fixture.gateway_config.write_bytes(canonical(config))
@@ -688,7 +706,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertIs(sdk_smoke["content_retained"], False)
         self.assertEqual(
             sdk_smoke["proof_contract_sha256"],
-            "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263",
+            "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf",
         )
         current = json.loads((fixture.evidence / "current.json").read_text())
         self.assertEqual(
@@ -848,9 +866,13 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         ))
         self.assertEqual(fixture.terminal()["outcome"], "predeploy_failed")
 
-    def test_empty_account_bootstrap_installs_exact_secrets_before_acceptance(self):
+    def test_required_only_empty_account_bootstrap_installs_exact_submitted_set(self):
         fixture = Fixture(bootstrap=True)
         self.addCleanup(fixture.close)
+        self.assertEqual(
+            set(BOOTSTRAP_SECRETS),
+            DEPLOY_CONTRACT.BOOTSTRAP_REQUIRED_SECRET_NAMES,
+        )
         result = fixture.run()
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         state = fixture.state

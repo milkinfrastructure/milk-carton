@@ -11,6 +11,8 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 pub(crate) const ROUTE_SCHEMA_VERSION: &str = "dragontales.route.v4";
+pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v1";
+pub(crate) const OPERATOR_ROUTE_SCHEMA_VERSION: &str = "milk.route.v1";
 pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "dragontales.winner-admission-receipt.v2";
 const ROUTE_LIVE_SCHEMA_VERSION: &str = "dragontales.route-live.v1";
 const BASELINE_ROUTE_REVISION: &str = "openai-baseline-v1";
@@ -25,7 +27,6 @@ const MAX_PROVIDER_BYTES: usize = 64;
 const MAX_EXECUTION_ID_BYTES: usize = 256;
 const MAX_IMAGE_REFERENCE_BYTES: usize = 2_048;
 const MAX_CAPABILITIES: usize = 8;
-const MAX_ELIGIBILITY_MESSAGES_BYTES: usize = 64 * 1_024;
 pub(crate) const CANDIDATE_CONTEXT_WINDOW_TOKENS: u32 = 4_096;
 pub(crate) const CANDIDATE_MAX_INPUT_UTF8_BYTES: usize = 2_048;
 pub(crate) const CANDIDATE_MAX_INPUT_MESSAGES: usize = 16;
@@ -55,18 +56,40 @@ pub(crate) struct RouteStartupConfig {
     pub(crate) signing_public_key_hex: String,
     pub(crate) signing_key_id: String,
     pub(crate) allow_private_candidate_http: bool,
-    pub(crate) authorized_provider_terms_sha256: String,
-    pub(crate) authorized_student_branch_runtime_image_reference: String,
-    pub(crate) authorized_admission_program_sha256: String,
-    pub(crate) winner_authorization_not_after: DateTime<Utc>,
-    pub(crate) winner_max_wall_seconds: u64,
-    pub(crate) winner_max_cost_microusd: u64,
+    pub(crate) authorized_provider_terms_sha256: Option<String>,
+    pub(crate) authorized_student_branch_runtime_image_reference: Option<String>,
+    pub(crate) authorized_admission_program_sha256: Option<String>,
+    pub(crate) winner_authorization_not_after: Option<DateTime<Utc>>,
+    pub(crate) winner_max_wall_seconds: Option<u64>,
+    pub(crate) winner_max_cost_microusd: Option<u64>,
     pub(crate) candidate_max_in_flight: usize,
 }
 
 impl RouteStartupConfig {
     pub(crate) fn validate(&self, gateway_max_in_flight: usize) -> Result<()> {
         self.winner_deployment_authority()?.validate()?;
+        self.validate_common(gateway_max_in_flight)
+    }
+
+    pub(crate) fn validate_common(&self, gateway_max_in_flight: usize) -> Result<()> {
+        decode_lowercase_hex_32(&self.signing_public_key_hex, "route signing public key")?;
+        if self.signing_key_id.is_empty() || self.signing_key_id.len() > MAX_KEY_ID_BYTES {
+            bail!("route signing key ID is invalid");
+        }
+        let winner_fields = [
+            self.authorized_provider_terms_sha256.is_some(),
+            self.authorized_student_branch_runtime_image_reference
+                .is_some(),
+            self.authorized_admission_program_sha256.is_some(),
+            self.winner_authorization_not_after.is_some(),
+            self.winner_max_wall_seconds.is_some(),
+            self.winner_max_cost_microusd.is_some(),
+        ];
+        if winner_fields.iter().any(|configured| *configured)
+            && !winner_fields.iter().all(|configured| *configured)
+        {
+            bail!("legacy winner route authorization must be complete or omitted");
+        }
         if gateway_max_in_flight < 2
             || self.candidate_max_in_flight == 0
             || self.candidate_max_in_flight >= gateway_max_in_flight
@@ -82,14 +105,27 @@ impl RouteStartupConfig {
             provider_policy: WinnerProviderPolicy {
                 only: WINNER_PROVIDER.to_owned(),
             },
-            provider_terms_sha256: self.authorized_provider_terms_sha256.clone(),
+            provider_terms_sha256: self
+                .authorized_provider_terms_sha256
+                .clone()
+                .context("legacy winner route authorization is not configured")?,
             student_branch_runtime_image_reference: self
                 .authorized_student_branch_runtime_image_reference
-                .clone(),
-            admission_program_sha256: self.authorized_admission_program_sha256.clone(),
-            authorization_not_after: self.winner_authorization_not_after,
-            max_wall_seconds: self.winner_max_wall_seconds,
-            max_cost_microusd: self.winner_max_cost_microusd,
+                .clone()
+                .context("legacy winner route authorization is not configured")?,
+            admission_program_sha256: self
+                .authorized_admission_program_sha256
+                .clone()
+                .context("legacy winner route authorization is not configured")?,
+            authorization_not_after: self
+                .winner_authorization_not_after
+                .context("legacy winner route authorization is not configured")?,
+            max_wall_seconds: self
+                .winner_max_wall_seconds
+                .context("legacy winner route authorization is not configured")?,
+            max_cost_microusd: self
+                .winner_max_cost_microusd
+                .context("legacy winner route authorization is not configured")?,
             allow_private_candidate_http: self.allow_private_candidate_http,
             signing_public_key_hex: self.signing_public_key_hex.clone(),
             signing_key_id: self.signing_key_id.clone(),
@@ -104,6 +140,10 @@ impl RouteStartupConfig {
         };
         authority.validate()?;
         Ok(authority)
+    }
+
+    pub(crate) fn has_winner_deployment_authority(&self) -> bool {
+        self.authorized_provider_terms_sha256.is_some()
     }
 }
 
@@ -183,11 +223,7 @@ impl WinnerDeploymentAuthority {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct RouteScope {
-    pub(crate) tenant_id: Uuid,
-    pub(crate) project_id: Uuid,
-    pub(crate) environment_id: Uuid,
-    pub(crate) workload_id: Uuid,
-    pub(crate) eval_id: String,
+    pub(crate) scope_id: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -261,6 +297,7 @@ impl RouteLivePointer {
 #[serde(rename_all = "snake_case")]
 enum RouteCapability {
     Stream,
+    Responses,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -286,7 +323,7 @@ pub(crate) struct WinnerAdmissionReceipt {
     pub(crate) admission_program_sha256: String,
     pub(crate) execution_id: String,
     pub(crate) execution_name: String,
-    pub(crate) chat_completions_url: String,
+    pub(crate) api_base_url: String,
     pub(crate) models_response_sha256: String,
     pub(crate) chat_request_sha256: String,
     pub(crate) chat_response_sha256: String,
@@ -400,10 +437,7 @@ impl WinnerAdmissionReceipt {
         {
             bail!("winner admission service interval is invalid");
         }
-        validate_candidate_endpoint(
-            &self.chat_completions_url,
-            authority.allow_private_candidate_http,
-        )
+        validate_candidate_api_base_url(&self.api_base_url, authority.allow_private_candidate_http)
     }
 
     pub(crate) fn deployment_sha256(&self) -> Result<[u8; 32]> {
@@ -440,6 +474,76 @@ struct RouteManifest {
     signing_key_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorRouteCandidate {
+    eval_sha256: String,
+    candidate_id: String,
+    api_base_url: String,
+    model: String,
+    candidate_api_key_sha256: String,
+    supported_capabilities: Vec<RouteCapability>,
+    reasoning_effort: Option<CandidateReasoningEffort>,
+    max_input_utf8_bytes: usize,
+    max_input_messages: usize,
+    max_input_request_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorRouteProposal {
+    api_base_url: String,
+    candidate_basis_points: u16,
+    candidate_id: String,
+    eval_sha256: String,
+    model: String,
+    schema_version: String,
+    scope_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorRouteManifest {
+    schema_version: String,
+    scope: RouteScope,
+    proposal_sha256: String,
+    candidate: Option<OperatorRouteCandidate>,
+    candidate_basis_points: u16,
+    previous_route_revision: Option<String>,
+    route_secret_sha256: Option<String>,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    signing_key_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeRouteCandidate {
+    model: String,
+    candidate_api_key_sha256: String,
+    supported_capabilities: Vec<RouteCapability>,
+    reasoning_effort: Option<CandidateReasoningEffort>,
+    max_input_utf8_bytes: usize,
+    max_input_messages: usize,
+    max_input_request_bytes: usize,
+    candidate_sha256: String,
+    artifact_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeRouteManifest {
+    candidate: Option<RuntimeRouteCandidate>,
+    candidate_basis_points: u16,
+    route_secret_sha256: Option<String>,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoutePublicationSource {
+    StudentWinner,
+    OperatorProposal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VerifiedRouteWinner {
     pub(crate) student_job_id: [u8; 32],
@@ -452,15 +556,18 @@ pub(crate) struct VerifiedRouteWinner {
 }
 
 struct ParsedRouteManifest {
-    manifest: RouteManifest,
-    endpoint: Url,
+    manifest: RuntimeRouteManifest,
+    endpoint: Option<Url>,
     cohort_sha256: [u8; 32],
     deployment_sha256: [u8; 32],
     revision: [u8; 32],
+    publication: RoutePublication,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RoutePublication {
+    pub(crate) source: RoutePublicationSource,
+    pub(crate) has_candidate: bool,
     pub(crate) revision: [u8; 32],
     pub(crate) cohort_sha256: [u8; 32],
     pub(crate) student_job_id: [u8; 32],
@@ -472,7 +579,7 @@ pub(crate) struct RoutePublication {
     pub(crate) student_variant: WinnerVariant,
     pub(crate) student_branch_runtime_image_reference: String,
     pub(crate) provider_terms_sha256: [u8; 32],
-    pub(crate) candidate_endpoint: String,
+    pub(crate) candidate_api_base_url: String,
     pub(crate) logical_model_alias: String,
     pub(crate) candidate_basis_points: u16,
     pub(crate) reasoning_effort: Option<CandidateReasoningEffort>,
@@ -529,8 +636,7 @@ impl RoutePublication {
         }
         let ParsedRouteManifest {
             manifest,
-            deployment_sha256,
-            revision,
+            publication,
             ..
         } = parse_manifest(config, expected_scope, manifest_bytes)?;
         if let Some(now) = now
@@ -543,57 +649,15 @@ impl RoutePublication {
                 "route publication validity must start within five minutes and end within 24 hours"
             );
         }
-        Ok(Self {
-            revision,
-            cohort_sha256: decode_lowercase_hex_32(&manifest.cohort_sha256, "cohort SHA-256")?,
-            student_job_id: decode_lowercase_hex_32(&manifest.student_job_id, "student job ID")?,
-            student_result_sha256: decode_lowercase_hex_32(
-                &manifest.student_result_sha256,
-                "student result SHA-256",
-            )?,
-            model_manifest_sha256: decode_lowercase_hex_32(
-                &manifest.model_manifest_sha256,
-                "model manifest SHA-256",
-            )?,
-            dev_receipt_sha256: decode_lowercase_hex_32(
-                &manifest.dev_receipt_sha256,
-                "DEV receipt SHA-256",
-            )?,
-            deployment_sha256,
-            winner_provider_binding_sha256: decode_lowercase_hex_32(
-                &manifest.winner_provider_binding_sha256,
-                "winner provider binding SHA-256",
-            )?,
-            student_variant: manifest.winner_admission.student_variant,
-            student_branch_runtime_image_reference: manifest
-                .winner_admission
-                .student_branch_runtime_image_reference,
-            provider_terms_sha256: decode_lowercase_hex_32(
-                &manifest.provider_terms_sha256,
-                "provider terms SHA-256",
-            )?,
-            candidate_endpoint: manifest.winner_admission.chat_completions_url,
-            logical_model_alias: manifest.winner_admission.model_alias,
-            candidate_basis_points: manifest.candidate_basis_points,
-            reasoning_effort: manifest.reasoning_effort,
-            previous_route_revision: manifest
-                .previous_route_revision
-                .as_deref()
-                .map(|revision| decode_lowercase_hex_32(revision, "previous route revision"))
-                .transpose()?,
-            route_secret_sha256: decode_lowercase_hex_32(
-                &manifest.route_secret_sha256,
-                "route secret SHA-256",
-            )?,
-            max_input_utf8_bytes: manifest.max_input_utf8_bytes,
-            max_input_messages: manifest.max_input_messages,
-            max_input_request_bytes: manifest.max_input_request_bytes,
-            not_after: manifest.not_after,
-        })
+        Ok(publication)
     }
 
     pub(crate) fn revision_hex(&self) -> String {
         hex_digest(&self.revision)
+    }
+
+    pub(crate) const fn is_operator_proposal(&self) -> bool {
+        matches!(self.source, RoutePublicationSource::OperatorProposal)
     }
 }
 
@@ -634,6 +698,7 @@ pub(crate) fn prepare_route_manifest(
     if not_after > winner_admission.service_not_after {
         bail!("requested route validity exceeds the admitted winner service interval");
     }
+    let winner_authority = config.winner_deployment_authority()?;
     let manifest = serde_json::to_vec(&RouteManifest {
         schema_version: ROUTE_SCHEMA_VERSION.to_owned(),
         scope: scope.clone(),
@@ -643,12 +708,8 @@ pub(crate) fn prepare_route_manifest(
         model_manifest_sha256: hex_digest(&winner.model_manifest_sha256),
         dev_receipt_sha256: hex_digest(&winner.dev_receipt_sha256),
         winner_admission,
-        winner_provider_binding_sha256: hex_digest(
-            &config
-                .winner_deployment_authority()?
-                .provider_binding_sha256()?,
-        ),
-        provider_terms_sha256: config.authorized_provider_terms_sha256.clone(),
+        winner_provider_binding_sha256: hex_digest(&winner_authority.provider_binding_sha256()?),
+        provider_terms_sha256: winner_authority.provider_terms_sha256,
         candidate_basis_points,
         previous_route_revision: previous.map(RoutePublication::revision_hex),
         route_secret_sha256: hex_digest(&route_secret_sha256),
@@ -657,6 +718,99 @@ pub(crate) fn prepare_route_manifest(
         max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
         max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
         max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
+        not_before,
+        not_after,
+        signing_key_id: config.signing_key_id.clone(),
+    })?;
+    let publication = RoutePublication::parse_for_publication(config, scope, &manifest, None, now)?;
+    Ok((manifest, publication))
+}
+
+pub(crate) fn prepare_operator_route_manifest(
+    config: &RouteStartupConfig,
+    scope: &RouteScope,
+    proposal_bytes: &[u8],
+    route_secret_hex: Option<&str>,
+    candidate_api_key: Option<&str>,
+    previous: Option<&RoutePublication>,
+    now: DateTime<Utc>,
+) -> Result<(Vec<u8>, RoutePublication)> {
+    if proposal_bytes.len() > MAX_ROUTE_MANIFEST_BYTES {
+        bail!("route proposal exceeds {MAX_ROUTE_MANIFEST_BYTES} bytes");
+    }
+    let proposal: OperatorRouteProposal = serde_json::from_slice(proposal_bytes)
+        .context("route proposal is not strict typed JSON")?;
+    let mut canonical_proposal = serde_json::to_vec(&serde_json::to_value(&proposal)?)?;
+    canonical_proposal.push(b'\n');
+    if canonical_proposal != proposal_bytes {
+        bail!("route proposal must be canonical key-sorted compact JSON plus one LF");
+    }
+    if proposal.schema_version != OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION {
+        bail!("route proposal has an unsupported schema version");
+    }
+    if proposal.scope_id != scope.scope_id {
+        bail!("route proposal scope does not match startup configuration");
+    }
+    if proposal.candidate_basis_points > 10_000 {
+        bail!("candidate_basis_points cannot exceed 10000");
+    }
+    decode_lowercase_hex_32(&proposal.eval_sha256, "route proposal eval SHA-256")?;
+    if !valid_bounded_ascii(&proposal.candidate_id, MAX_EXECUTION_ID_BYTES)
+        || !valid_model_alias(&proposal.model)
+    {
+        bail!("route proposal candidate identity is invalid");
+    }
+    validate_candidate_api_base_url(&proposal.api_base_url, config.allow_private_candidate_http)?;
+    let candidate = if proposal.candidate_basis_points == 0 {
+        None
+    } else {
+        let candidate_api_key =
+            candidate_api_key.context("candidate route requires its API key")?;
+        if candidate_api_key.is_empty() {
+            bail!("candidate API key cannot be empty");
+        }
+        Some(OperatorRouteCandidate {
+            eval_sha256: proposal.eval_sha256.clone(),
+            candidate_id: proposal.candidate_id.clone(),
+            api_base_url: proposal.api_base_url.clone(),
+            model: proposal.model.clone(),
+            candidate_api_key_sha256: hex_digest(
+                &Sha256::digest(candidate_api_key.as_bytes()).into(),
+            ),
+            supported_capabilities: vec![RouteCapability::Stream],
+            reasoning_effort: None,
+            max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
+            max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
+            max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
+        })
+    };
+    let route_secret_sha256 = if candidate.is_some() {
+        let value =
+            route_secret_hex.context("candidate route requires the operator route secret")?;
+        let secret = decode_lowercase_hex_32(value, "route secret")?;
+        Some(hex_digest(&Sha256::digest(secret).into()))
+    } else {
+        None
+    };
+    let valid_for_seconds = if candidate.is_some() {
+        WINNER_CANARY_VALID_FOR_SECONDS
+    } else {
+        WINNER_ZERO_VALID_FOR_SECONDS
+    };
+    let not_before = now
+        .with_nanosecond(0)
+        .context("route preparation time is outside the supported range")?;
+    let not_after = not_before
+        .checked_add_signed(TimeDelta::seconds(i64::from(valid_for_seconds)))
+        .context("route validity overflow")?;
+    let manifest = serde_json::to_vec(&OperatorRouteManifest {
+        schema_version: OPERATOR_ROUTE_SCHEMA_VERSION.to_owned(),
+        scope: scope.clone(),
+        proposal_sha256: hex_digest(&Sha256::digest(proposal_bytes).into()),
+        candidate,
+        candidate_basis_points: proposal.candidate_basis_points,
+        previous_route_revision: previous.map(RoutePublication::revision_hex),
+        route_secret_sha256,
         not_before,
         not_after,
         signing_key_id: config.signing_key_id.clone(),
@@ -852,7 +1006,7 @@ enum RouteState {
 }
 
 struct ActiveRoute {
-    manifest: RouteManifest,
+    manifest: RuntimeRouteManifest,
     endpoint: Url,
     cohort_sha256: [u8; 32],
     deployment_sha256: String,
@@ -907,6 +1061,7 @@ impl BaselineReason {
 }
 
 pub(crate) struct RouteRequest<'a> {
+    pub(crate) endpoint: RouteEndpoint,
     pub(crate) body: &'a [u8],
     pub(crate) content_type: Option<&'a [u8]>,
     pub(crate) has_multiple_content_types: bool,
@@ -914,6 +1069,21 @@ pub(crate) struct RouteRequest<'a> {
     pub(crate) has_openai_beta: bool,
     pub(crate) query: &'a str,
     pub(crate) routing_cohort: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteEndpoint {
+    ChatCompletions,
+    Responses,
+}
+
+impl RouteEndpoint {
+    pub(crate) const fn relative_path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -935,7 +1105,6 @@ pub(crate) struct RouteDecision<'a> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CandidateChat<'a> {
     model: &'a str,
     #[serde(borrow)]
@@ -946,19 +1115,18 @@ struct CandidateChat<'a> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CandidateMessage<'a> {
-    role: CandidateMessageRole,
-    content: &'a str,
+struct CandidateResponses<'a> {
+    model: &'a str,
+    #[serde(borrow)]
+    input: Option<&'a RawValue>,
+    #[serde(borrow)]
+    stream: Option<&'a RawValue>,
+    reasoning: Option<CandidateResponsesReasoning>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CandidateMessageRole {
-    System,
-    Developer,
-    User,
-    Assistant,
+struct CandidateResponsesReasoning {
+    effort: Option<CandidateReasoningEffort>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -971,15 +1139,11 @@ pub(crate) enum CandidateReasoningEffort {
     Max,
 }
 
-impl CandidateMessage<'_> {
-    fn input_utf8_bytes(&self) -> usize {
-        match self.role {
-            CandidateMessageRole::System
-            | CandidateMessageRole::Developer
-            | CandidateMessageRole::User
-            | CandidateMessageRole::Assistant => self.content.len(),
-        }
-    }
+struct CandidateRequestMetadata<'a> {
+    model: &'a str,
+    input: Option<&'a RawValue>,
+    stream: Option<&'a RawValue>,
+    reasoning_effort: Option<CandidateReasoningEffort>,
 }
 
 impl RoutePolicy {
@@ -1002,7 +1166,6 @@ impl RoutePolicy {
         manifest_bytes: &[u8],
         signature_bytes: &[u8],
     ) -> Result<Self> {
-        config.validate(gateway_max_in_flight)?;
         verify_signature(config, manifest_bytes, signature_bytes)?;
         let ParsedRouteManifest {
             manifest,
@@ -1010,14 +1173,22 @@ impl RoutePolicy {
             cohort_sha256,
             deployment_sha256,
             revision,
+            publication,
         } = parse_manifest(config, expected_scope, manifest_bytes)?;
+        if publication.is_operator_proposal() {
+            config.validate_common(gateway_max_in_flight)?;
+        } else {
+            config.validate(gateway_max_in_flight)?;
+        }
 
         let route_secret = route_secret_hex
             .map(|value| decode_lowercase_hex_32(value, "route secret"))
             .transpose()?;
-        if let Some(route_secret) = route_secret {
+        if let (Some(route_secret), Some(expected)) =
+            (route_secret, manifest.route_secret_sha256.as_deref())
+        {
             let expected_route_secret_sha256 =
-                decode_lowercase_hex_32(&manifest.route_secret_sha256, "route secret SHA-256")?;
+                decode_lowercase_hex_32(expected, "route secret SHA-256")?;
             let actual_route_secret_sha256: [u8; 32] = Sha256::digest(route_secret).into();
             if actual_route_secret_sha256 != expected_route_secret_sha256 {
                 bail!("route secret does not match the signed manifest");
@@ -1046,8 +1217,12 @@ impl RoutePolicy {
 
         let route_secret = route_secret.context("active route secret is missing")?;
         let candidate_api_key = candidate_api_key.context("active candidate API key is missing")?;
+        let candidate = manifest
+            .candidate
+            .as_ref()
+            .context("active route is missing its candidate")?;
         let expected_candidate_api_key_sha256 = decode_lowercase_hex_32(
-            &manifest.winner_admission.candidate_api_key_sha256,
+            &candidate.candidate_api_key_sha256,
             "winner admission candidate API key SHA-256",
         )?;
         let observed_candidate_api_key_sha256: [u8; 32] =
@@ -1066,7 +1241,7 @@ impl RoutePolicy {
             revision: hex_digest(&revision),
             state: RouteState::Active(Box::new(ActiveRoute {
                 manifest,
-                endpoint,
+                endpoint: endpoint.context("active route is missing its candidate endpoint")?,
                 cohort_sha256,
                 deployment_sha256: hex_digest(&deployment_sha256),
                 expires_at,
@@ -1108,60 +1283,27 @@ impl RoutePolicy {
         Self {
             revision: "test-route-v1".to_owned(),
             state: RouteState::Active(Box::new(ActiveRoute {
-                manifest: RouteManifest {
-                    schema_version: ROUTE_SCHEMA_VERSION.to_owned(),
-                    scope: RouteScope {
-                        tenant_id: Uuid::nil(),
-                        project_id: Uuid::nil(),
-                        environment_id: Uuid::nil(),
-                        workload_id: Uuid::nil(),
-                        eval_id: "00".repeat(32),
-                    },
-                    cohort_sha256: "22".repeat(32),
-                    student_job_id: "33".repeat(32),
-                    student_result_sha256: "88".repeat(32),
-                    model_manifest_sha256: "44".repeat(32),
-                    dev_receipt_sha256: "77".repeat(32),
-                    winner_admission: WinnerAdmissionReceipt {
-                        schema_version: WINNER_ADMISSION_SCHEMA_VERSION.to_owned(),
-                        provider: "local".to_owned(),
-                        student_job_id: "33".repeat(32),
-                        student_variant: WinnerVariant::StaticFp8,
-                        model_manifest_sha256: "44".repeat(32),
-                        model_alias: "customer-model".to_owned(),
-                        model_alias_sha256: hex_digest(&Sha256::digest(b"customer-model").into()),
+                manifest: RuntimeRouteManifest {
+                    candidate: Some(RuntimeRouteCandidate {
+                        model: "customer-model".to_owned(),
                         candidate_api_key_sha256: hex_digest(
                             &Sha256::digest(candidate_api_key.as_bytes()).into(),
                         ),
-                        student_branch_runtime_image_reference: format!(
-                            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
-                            "91".repeat(32)
-                        ),
-                        admission_program_sha256: "92".repeat(32),
-                        execution_id: "local-test-execution".to_owned(),
-                        execution_name: "local-test-winner".to_owned(),
-                        chat_completions_url: endpoint.as_str().to_owned(),
-                        models_response_sha256: "93".repeat(32),
-                        chat_request_sha256: "94".repeat(32),
-                        chat_response_sha256: "95".repeat(32),
-                        launch_started_at: now - chrono::TimeDelta::hours(1),
-                        ready_at: now - chrono::TimeDelta::minutes(59),
-                        admitted_at: now - chrono::TimeDelta::minutes(58),
-                        service_not_after: now + chrono::TimeDelta::hours(1),
-                    },
-                    winner_provider_binding_sha256: "55".repeat(32),
-                    provider_terms_sha256: "66".repeat(32),
+                        supported_capabilities: vec![
+                            RouteCapability::Stream,
+                            RouteCapability::Responses,
+                        ],
+                        reasoning_effort,
+                        max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
+                        max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
+                        max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
+                        candidate_sha256: "33".repeat(32),
+                        artifact_sha256: "44".repeat(32),
+                    }),
                     candidate_basis_points: 10_000,
-                    previous_route_revision: None,
-                    route_secret_sha256: hex_digest(&Sha256::digest(route_secret).into()),
-                    supported_capabilities: vec![RouteCapability::Stream],
-                    reasoning_effort,
-                    max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
-                    max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
-                    max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
+                    route_secret_sha256: Some(hex_digest(&Sha256::digest(route_secret).into())),
                     not_before: now - chrono::TimeDelta::hours(1),
                     not_after: now + chrono::TimeDelta::hours(1),
-                    signing_key_id: "test-route-key".to_owned(),
                 },
                 endpoint,
                 cohort_sha256: [0x22; 32],
@@ -1185,6 +1327,9 @@ impl RoutePolicy {
         if monotonic_now >= active.expires_at {
             return self.baseline_decision(BaselineReason::PolicyExpired);
         }
+        let Some(candidate) = active.manifest.candidate.as_ref() else {
+            return self.baseline_decision(BaselineReason::PolicyZero);
+        };
         if request.has_multiple_content_types || !is_json_content_type(request.content_type) {
             return self.baseline_decision(BaselineReason::UnsupportedContentType);
         }
@@ -1197,46 +1342,35 @@ impl RoutePolicy {
         if !request.query.is_empty() {
             return self.baseline_decision(BaselineReason::QueryString);
         }
-        if request.body.len() > active.manifest.max_input_request_bytes {
+        if request.body.len() > candidate.max_input_request_bytes {
             return self.baseline_decision(BaselineReason::UnsupportedCapability);
         }
 
-        let Ok(parsed) = serde_json::from_slice::<CandidateChat<'_>>(request.body) else {
-            return self.baseline_decision(BaselineReason::UnsupportedRequest);
-        };
-        if parsed.model != active.manifest.winner_admission.model_alias {
-            return self.baseline_decision(BaselineReason::ModelMismatch);
-        }
-        let raw_messages = parsed.messages.get();
-        if raw_messages.len() > MAX_ELIGIBILITY_MESSAGES_BYTES
-            || !raw_messages.trim_start().starts_with('[')
-        {
-            return self.baseline_decision(BaselineReason::UnsupportedRequest);
-        }
-        let Ok(messages) = serde_json::from_str::<Vec<CandidateMessage<'_>>>(raw_messages) else {
-            return self.baseline_decision(BaselineReason::UnsupportedRequest);
-        };
-        if !crate::records::text_chat_training_eligible(
-            parsed.model,
-            messages.iter().map(|message| {
-                (
-                    matches!(message.role, CandidateMessageRole::User),
-                    message.content,
-                )
-            }),
-        ) {
-            return self.baseline_decision(BaselineReason::UnsupportedRequest);
-        }
-        if parsed.reasoning_effort != active.manifest.reasoning_effort {
-            return self.baseline_decision(BaselineReason::ReasoningEffortMismatch);
-        }
-        let input_utf8_bytes = messages.iter().try_fold(0_usize, |total, message| {
-            total.checked_add(message.input_utf8_bytes())
-        });
-        if messages.len() > active.manifest.max_input_messages
-            || input_utf8_bytes.is_none_or(|bytes| bytes > active.manifest.max_input_utf8_bytes)
+        if request.endpoint == RouteEndpoint::Responses
+            && !candidate
+                .supported_capabilities
+                .contains(&RouteCapability::Responses)
         {
             return self.baseline_decision(BaselineReason::UnsupportedCapability);
+        }
+        let Some(parsed) = parse_candidate_request(request.endpoint, request.body) else {
+            return self.baseline_decision(BaselineReason::UnsupportedRequest);
+        };
+        if parsed.model != candidate.model {
+            return self.baseline_decision(BaselineReason::ModelMismatch);
+        }
+        if parsed.reasoning_effort != candidate.reasoning_effort {
+            return self.baseline_decision(BaselineReason::ReasoningEffortMismatch);
+        }
+        if let Some(input) = parsed.input {
+            let Some(items) = candidate_input_items(input) else {
+                return self.baseline_decision(BaselineReason::UnsupportedRequest);
+            };
+            if items > candidate.max_input_messages
+                || input.get().len() > candidate.max_input_utf8_bytes
+            {
+                return self.baseline_decision(BaselineReason::UnsupportedCapability);
+            }
         }
         let streaming = match parsed.stream.map(|value| value.get().trim()) {
             None | Some("false") => false,
@@ -1244,8 +1378,7 @@ impl RoutePolicy {
             Some(_) => return self.baseline_decision(BaselineReason::UnsupportedRequest),
         };
         if streaming
-            && !active
-                .manifest
+            && !candidate
                 .supported_capabilities
                 .contains(&RouteCapability::Stream)
         {
@@ -1278,14 +1411,58 @@ impl RoutePolicy {
     }
 }
 
+fn parse_candidate_request(
+    endpoint: RouteEndpoint,
+    body: &[u8],
+) -> Option<CandidateRequestMetadata<'_>> {
+    match endpoint {
+        RouteEndpoint::ChatCompletions => {
+            let parsed = serde_json::from_slice::<CandidateChat<'_>>(body).ok()?;
+            Some(CandidateRequestMetadata {
+                model: parsed.model,
+                input: Some(parsed.messages),
+                stream: parsed.stream,
+                reasoning_effort: parsed.reasoning_effort,
+            })
+        }
+        RouteEndpoint::Responses => {
+            let parsed = serde_json::from_slice::<CandidateResponses<'_>>(body).ok()?;
+            Some(CandidateRequestMetadata {
+                model: parsed.model,
+                input: parsed.input,
+                stream: parsed.stream,
+                reasoning_effort: parsed.reasoning.and_then(|reasoning| reasoning.effort),
+            })
+        }
+    }
+}
+
+fn candidate_input_items(input: &RawValue) -> Option<usize> {
+    let raw = input.get().trim_start();
+    if raw.starts_with('[') {
+        serde_json::from_str::<Vec<&RawValue>>(raw)
+            .ok()
+            .map(|items| items.len())
+    } else if raw.starts_with('"') || raw.starts_with('{') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 impl ActiveRoute {
     fn candidate(&self) -> CandidateRoute<'_> {
+        let candidate = self
+            .manifest
+            .candidate
+            .as_ref()
+            .expect("active route has a candidate");
         CandidateRoute {
             endpoint: &self.endpoint,
-            candidate_sha256: &self.manifest.student_job_id,
-            artifact_sha256: &self.manifest.model_manifest_sha256,
+            candidate_sha256: &candidate.candidate_sha256,
+            artifact_sha256: &candidate.artifact_sha256,
             deployment_sha256: &self.deployment_sha256,
-            candidate_api_key_sha256: &self.manifest.winner_admission.candidate_api_key_sha256,
+            candidate_api_key_sha256: &candidate.candidate_api_key_sha256,
             max_in_flight: self.max_in_flight,
         }
     }
@@ -1317,20 +1494,317 @@ fn parse_manifest(
     if manifest_bytes.len() > MAX_ROUTE_MANIFEST_BYTES {
         bail!("route manifest exceeds {MAX_ROUTE_MANIFEST_BYTES} bytes");
     }
-    let manifest: RouteManifest = serde_json::from_slice(manifest_bytes)
+    #[derive(Deserialize)]
+    struct ManifestSchema<'a> {
+        schema_version: &'a str,
+    }
+    let schema: ManifestSchema<'_> = serde_json::from_slice(manifest_bytes)
         .context("route manifest is not strict typed JSON")?;
+    match schema.schema_version {
+        ROUTE_SCHEMA_VERSION => parse_student_manifest(config, expected_scope, manifest_bytes),
+        OPERATOR_ROUTE_SCHEMA_VERSION => {
+            parse_operator_manifest(config, expected_scope, manifest_bytes)
+        }
+        _ => bail!("route manifest has an unsupported schema version"),
+    }
+}
+
+fn parse_student_manifest(
+    config: &RouteStartupConfig,
+    expected_scope: &RouteScope,
+    manifest_bytes: &[u8],
+) -> Result<ParsedRouteManifest> {
+    let manifest: RouteManifest = serde_json::from_slice(manifest_bytes)
+        .context("student route manifest is not strict typed JSON")?;
     if serde_json::to_vec(&manifest)? != manifest_bytes {
         bail!("route manifest is not canonical JSON");
     }
     let (endpoint, cohort_sha256, deployment_sha256) =
         validate_manifest(config, expected_scope, &manifest)?;
+    let revision = Sha256::digest(manifest_bytes).into();
+    let candidate_sha256 = decode_lowercase_hex_32(&manifest.student_job_id, "student job ID")?;
+    let artifact_sha256 =
+        decode_lowercase_hex_32(&manifest.model_manifest_sha256, "model manifest SHA-256")?;
+    let publication = RoutePublication {
+        source: RoutePublicationSource::StudentWinner,
+        has_candidate: true,
+        revision,
+        cohort_sha256,
+        student_job_id: candidate_sha256,
+        student_result_sha256: decode_lowercase_hex_32(
+            &manifest.student_result_sha256,
+            "student result SHA-256",
+        )?,
+        model_manifest_sha256: artifact_sha256,
+        dev_receipt_sha256: decode_lowercase_hex_32(
+            &manifest.dev_receipt_sha256,
+            "DEV receipt SHA-256",
+        )?,
+        deployment_sha256,
+        winner_provider_binding_sha256: decode_lowercase_hex_32(
+            &manifest.winner_provider_binding_sha256,
+            "winner provider binding SHA-256",
+        )?,
+        student_variant: manifest.winner_admission.student_variant,
+        student_branch_runtime_image_reference: manifest
+            .winner_admission
+            .student_branch_runtime_image_reference
+            .clone(),
+        provider_terms_sha256: decode_lowercase_hex_32(
+            &manifest.provider_terms_sha256,
+            "provider terms SHA-256",
+        )?,
+        candidate_api_base_url: manifest.winner_admission.api_base_url.clone(),
+        logical_model_alias: manifest.winner_admission.model_alias.clone(),
+        candidate_basis_points: manifest.candidate_basis_points,
+        reasoning_effort: manifest.reasoning_effort,
+        previous_route_revision: manifest
+            .previous_route_revision
+            .as_deref()
+            .map(|value| decode_lowercase_hex_32(value, "previous route revision"))
+            .transpose()?,
+        route_secret_sha256: decode_lowercase_hex_32(
+            &manifest.route_secret_sha256,
+            "route secret SHA-256",
+        )?,
+        max_input_utf8_bytes: manifest.max_input_utf8_bytes,
+        max_input_messages: manifest.max_input_messages,
+        max_input_request_bytes: manifest.max_input_request_bytes,
+        not_after: manifest.not_after,
+    };
+    let runtime = RuntimeRouteManifest {
+        candidate: Some(RuntimeRouteCandidate {
+            model: manifest.winner_admission.model_alias.clone(),
+            candidate_api_key_sha256: manifest.winner_admission.candidate_api_key_sha256.clone(),
+            supported_capabilities: manifest.supported_capabilities.clone(),
+            reasoning_effort: manifest.reasoning_effort,
+            max_input_utf8_bytes: manifest.max_input_utf8_bytes,
+            max_input_messages: manifest.max_input_messages,
+            max_input_request_bytes: manifest.max_input_request_bytes,
+            candidate_sha256: hex_digest(&candidate_sha256),
+            artifact_sha256: hex_digest(&artifact_sha256),
+        }),
+        candidate_basis_points: manifest.candidate_basis_points,
+        route_secret_sha256: Some(manifest.route_secret_sha256),
+        not_before: manifest.not_before,
+        not_after: manifest.not_after,
+    };
     Ok(ParsedRouteManifest {
-        manifest,
+        manifest: runtime,
+        endpoint: Some(endpoint),
+        cohort_sha256,
+        deployment_sha256,
+        revision,
+        publication,
+    })
+}
+
+fn parse_operator_manifest(
+    config: &RouteStartupConfig,
+    expected_scope: &RouteScope,
+    manifest_bytes: &[u8],
+) -> Result<ParsedRouteManifest> {
+    let manifest: OperatorRouteManifest = serde_json::from_slice(manifest_bytes)
+        .context("operator route manifest is not strict typed JSON")?;
+    if serde_json::to_vec(&manifest)? != manifest_bytes {
+        bail!("route manifest is not canonical JSON");
+    }
+    let endpoint = validate_operator_manifest(config, expected_scope, &manifest)?;
+    let revision = Sha256::digest(manifest_bytes).into();
+    let proposal_sha256 =
+        decode_lowercase_hex_32(&manifest.proposal_sha256, "route proposal SHA-256")?;
+    let previous_route_revision = manifest
+        .previous_route_revision
+        .as_deref()
+        .map(|value| decode_lowercase_hex_32(value, "previous route revision"))
+        .transpose()?;
+    let route_secret_sha256 = manifest
+        .route_secret_sha256
+        .as_deref()
+        .map(|value| decode_lowercase_hex_32(value, "route secret SHA-256"))
+        .transpose()?;
+    let (candidate, candidate_sha256, artifact_sha256, deployment_sha256) =
+        if let Some(candidate) = &manifest.candidate {
+            let candidate_bytes = serde_json::to_vec(candidate)?;
+            let candidate_sha256: [u8; 32] = Sha256::digest(&candidate_bytes).into();
+            let artifact_sha256: [u8; 32] = Sha256::digest(
+                [
+                    b"milk.route-model.v1\0".as_slice(),
+                    candidate.model.as_bytes(),
+                ]
+                .concat(),
+            )
+            .into();
+            let deployment_sha256: [u8; 32] = Sha256::digest(
+                [
+                    b"milk.route-deployment.v1\0".as_slice(),
+                    candidate.api_base_url.as_bytes(),
+                ]
+                .concat(),
+            )
+            .into();
+            (
+                Some(RuntimeRouteCandidate {
+                    model: candidate.model.clone(),
+                    candidate_api_key_sha256: candidate.candidate_api_key_sha256.clone(),
+                    supported_capabilities: candidate.supported_capabilities.clone(),
+                    reasoning_effort: candidate.reasoning_effort,
+                    max_input_utf8_bytes: candidate.max_input_utf8_bytes,
+                    max_input_messages: candidate.max_input_messages,
+                    max_input_request_bytes: candidate.max_input_request_bytes,
+                    candidate_sha256: hex_digest(&candidate_sha256),
+                    artifact_sha256: hex_digest(&artifact_sha256),
+                }),
+                candidate_sha256,
+                artifact_sha256,
+                deployment_sha256,
+            )
+        } else {
+            (None, [0; 32], [0; 32], [0; 32])
+        };
+    let cohort_sha256 = if candidate.is_some() {
+        candidate_sha256
+    } else {
+        proposal_sha256
+    };
+    let publication = RoutePublication {
+        source: RoutePublicationSource::OperatorProposal,
+        has_candidate: candidate.is_some(),
+        revision,
+        cohort_sha256,
+        student_job_id: candidate_sha256,
+        student_result_sha256: proposal_sha256,
+        model_manifest_sha256: artifact_sha256,
+        dev_receipt_sha256: [0; 32],
+        deployment_sha256,
+        winner_provider_binding_sha256: [0; 32],
+        student_variant: WinnerVariant::Bf16,
+        student_branch_runtime_image_reference: String::new(),
+        provider_terms_sha256: [0; 32],
+        candidate_api_base_url: manifest
+            .candidate
+            .as_ref()
+            .map(|value| value.api_base_url.clone())
+            .unwrap_or_default(),
+        logical_model_alias: manifest
+            .candidate
+            .as_ref()
+            .map(|value| value.model.clone())
+            .unwrap_or_default(),
+        candidate_basis_points: manifest.candidate_basis_points,
+        reasoning_effort: manifest
+            .candidate
+            .as_ref()
+            .and_then(|value| value.reasoning_effort),
+        previous_route_revision,
+        route_secret_sha256: route_secret_sha256.unwrap_or([0; 32]),
+        max_input_utf8_bytes: manifest
+            .candidate
+            .as_ref()
+            .map_or(0, |value| value.max_input_utf8_bytes),
+        max_input_messages: manifest
+            .candidate
+            .as_ref()
+            .map_or(0, |value| value.max_input_messages),
+        max_input_request_bytes: manifest
+            .candidate
+            .as_ref()
+            .map_or(0, |value| value.max_input_request_bytes),
+        not_after: manifest.not_after,
+    };
+    Ok(ParsedRouteManifest {
+        manifest: RuntimeRouteManifest {
+            candidate,
+            candidate_basis_points: manifest.candidate_basis_points,
+            route_secret_sha256: manifest.route_secret_sha256,
+            not_before: manifest.not_before,
+            not_after: manifest.not_after,
+        },
         endpoint,
         cohort_sha256,
         deployment_sha256,
-        revision: Sha256::digest(manifest_bytes).into(),
+        revision,
+        publication,
     })
+}
+
+fn validate_operator_manifest(
+    config: &RouteStartupConfig,
+    expected_scope: &RouteScope,
+    manifest: &OperatorRouteManifest,
+) -> Result<Option<Url>> {
+    if manifest.schema_version != OPERATOR_ROUTE_SCHEMA_VERSION {
+        bail!("operator route manifest has an unsupported schema version");
+    }
+    if &manifest.scope != expected_scope {
+        bail!("operator route manifest scope does not match startup configuration");
+    }
+    if config.signing_key_id.is_empty()
+        || config.signing_key_id.len() > MAX_KEY_ID_BYTES
+        || manifest.signing_key_id != config.signing_key_id
+    {
+        bail!("operator route manifest signing key ID does not match startup configuration");
+    }
+    if manifest.not_before >= manifest.not_after
+        || manifest.not_after - manifest.not_before > TimeDelta::hours(MAX_ROUTE_VALIDITY_HOURS)
+    {
+        bail!("operator route validity must be positive and no longer than 24 hours");
+    }
+    decode_lowercase_hex_32(&manifest.proposal_sha256, "route proposal SHA-256")?;
+    if let Some(revision) = &manifest.previous_route_revision {
+        decode_lowercase_hex_32(revision, "previous route revision")?;
+    }
+    match (&manifest.candidate, manifest.candidate_basis_points) {
+        (None, 0) => {
+            if manifest.route_secret_sha256.is_some() {
+                bail!("baseline-only route cannot contain a route secret digest");
+            }
+            Ok(None)
+        }
+        (Some(candidate), 1..=10_000) => {
+            let route_secret = manifest
+                .route_secret_sha256
+                .as_deref()
+                .context("candidate route requires a route secret digest")?;
+            decode_lowercase_hex_32(route_secret, "route secret SHA-256")?;
+            validate_operator_candidate(config, candidate).map(Some)
+        }
+        (None, _) => bail!("baseline-only route must use zero candidate basis points"),
+        (Some(_), 0) => bail!("zero-basis-point route must not contain a candidate"),
+        (Some(_), _) => bail!("candidate_basis_points cannot exceed 10000"),
+    }
+}
+
+fn validate_operator_candidate(
+    config: &RouteStartupConfig,
+    candidate: &OperatorRouteCandidate,
+) -> Result<Url> {
+    decode_lowercase_hex_32(&candidate.eval_sha256, "route proposal eval SHA-256")?;
+    if !valid_bounded_ascii(&candidate.candidate_id, MAX_EXECUTION_ID_BYTES) {
+        bail!("operator route candidate ID is invalid");
+    }
+    if !valid_model_alias(&candidate.model) {
+        bail!("operator route candidate model is invalid");
+    }
+    decode_lowercase_hex_32(
+        &candidate.candidate_api_key_sha256,
+        "candidate API key SHA-256",
+    )?;
+    if candidate.supported_capabilities.len() > MAX_CAPABILITIES {
+        bail!("operator route candidate has too many supported capabilities");
+    }
+    for (index, capability) in candidate.supported_capabilities.iter().enumerate() {
+        if candidate.supported_capabilities[..index].contains(capability) {
+            bail!("operator route candidate contains a duplicate capability");
+        }
+    }
+    if candidate.max_input_utf8_bytes != CANDIDATE_MAX_INPUT_UTF8_BYTES
+        || candidate.max_input_messages != CANDIDATE_MAX_INPUT_MESSAGES
+        || candidate.max_input_request_bytes != CANDIDATE_MAX_INPUT_REQUEST_BYTES
+    {
+        bail!("operator route candidate input bounds are unsupported");
+    }
+    validate_candidate_api_base_url(&candidate.api_base_url, config.allow_private_candidate_http)
 }
 
 fn validate_manifest(
@@ -1395,8 +1869,9 @@ fn validate_manifest(
     if let Some(revision) = &manifest.previous_route_revision {
         decode_lowercase_hex_32(revision, "previous route revision")?;
     }
+    let winner_authority = config.winner_deployment_authority()?;
     let authorized_terms = decode_lowercase_hex_32(
-        &config.authorized_provider_terms_sha256,
+        &winner_authority.provider_terms_sha256,
         "authorized provider terms SHA-256",
     )?;
     let manifest_terms =
@@ -1404,9 +1879,7 @@ fn validate_manifest(
     if authorized_terms != manifest_terms {
         bail!("route manifest provider terms do not match startup authorization");
     }
-    let authorized_winner_binding = config
-        .winner_deployment_authority()?
-        .provider_binding_sha256()?;
+    let authorized_winner_binding = winner_authority.provider_binding_sha256()?;
     if manifest.winner_provider_binding_sha256 != hex_digest(&authorized_winner_binding) {
         bail!("route manifest winner provider binding does not match startup authorization");
     }
@@ -1488,17 +1961,17 @@ fn valid_bounded_ascii(value: &str, maximum: usize) -> bool {
     (1..=maximum).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-pub(crate) fn validate_candidate_endpoint(
+pub(crate) fn validate_candidate_api_base_url(
     value: &str,
     allow_private_candidate_http: bool,
 ) -> Result<Url> {
     if value.is_empty() || value.len() > MAX_ENDPOINT_BYTES {
-        bail!("candidate endpoint must contain 1..={MAX_ENDPOINT_BYTES} bytes");
+        bail!("candidate API base URL must contain 1..={MAX_ENDPOINT_BYTES} bytes");
     }
-    let endpoint = Url::parse(value).context("candidate endpoint is not a valid URL")?;
+    let endpoint = Url::parse(value).context("candidate API base URL is not a valid URL")?;
     let local_http = endpoint.scheme() == "http"
         && endpoint.as_str() == value
-        && endpoint.path() == "/v1/chat/completions"
+        && endpoint.path() == "/v1/"
         && match endpoint.host() {
             Some(Host::Ipv4(address)) => {
                 address.is_loopback() || (allow_private_candidate_http && address.is_private())
@@ -1508,7 +1981,7 @@ pub(crate) fn validate_candidate_endpoint(
         };
     let standard_endpoint = endpoint.scheme() == "https"
         && endpoint.as_str() == value
-        && endpoint.path().ends_with("/v1/chat/completions");
+        && endpoint.path().ends_with("/v1/");
     if (!standard_endpoint && !local_http)
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
@@ -1517,7 +1990,7 @@ pub(crate) fn validate_candidate_endpoint(
         || endpoint.fragment().is_some()
     {
         bail!(
-            "candidate endpoint must be credential-free HTTPS ending in /v1/chat/completions, or authorized literal-IP HTTP at the exact root path"
+            "candidate API base URL must be credential-free HTTPS ending in /v1/, or authorized literal-IP HTTP at the exact root path"
         );
     }
     Ok(endpoint)
@@ -1620,11 +2093,7 @@ mod tests {
             previous_revision: Option<&str>,
         ) -> Self {
             let scope = RouteScope {
-                tenant_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
-                project_id: "22222222-2222-4222-8222-222222222222".parse().unwrap(),
-                environment_id: "33333333-3333-4333-8333-333333333333".parse().unwrap(),
-                workload_id: "44444444-4444-4444-8444-444444444444".parse().unwrap(),
-                eval_id: "55".repeat(32),
+                scope_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
             };
             let secret_hex = hex_bytes(&ROUTE_SECRET);
             let route_secret_sha256: [u8; 32] = Sha256::digest(ROUTE_SECRET).into();
@@ -1640,13 +2109,14 @@ mod tests {
                 signing_public_key_hex: hex_bytes(key_pair.public_key().as_ref()),
                 signing_key_id: "route-key-v1".to_owned(),
                 allow_private_candidate_http: false,
-                authorized_provider_terms_sha256: repeated_digest(0x66),
-                authorized_student_branch_runtime_image_reference:
+                authorized_provider_terms_sha256: Some(repeated_digest(0x66)),
+                authorized_student_branch_runtime_image_reference: Some(
                     student_branch_runtime_image_reference.clone(),
-                authorized_admission_program_sha256: admission_program_sha256.clone(),
-                winner_authorization_not_after: not_after,
-                winner_max_wall_seconds: MAX_WINNER_DEPLOYMENT_WALL_SECONDS,
-                winner_max_cost_microusd: MAX_WINNER_DEPLOYMENT_COST_MICROUSD,
+                ),
+                authorized_admission_program_sha256: Some(admission_program_sha256.clone()),
+                winner_authorization_not_after: Some(not_after),
+                winner_max_wall_seconds: Some(MAX_WINNER_DEPLOYMENT_WALL_SECONDS),
+                winner_max_cost_microusd: Some(MAX_WINNER_DEPLOYMENT_COST_MICROUSD),
                 candidate_max_in_flight: 2,
             };
             let manifest = serde_json::to_vec(&RouteManifest {
@@ -1673,8 +2143,7 @@ mod tests {
                     admission_program_sha256: admission_program_sha256.clone(),
                     execution_id: "sb-0123456789".to_owned(),
                     execution_name: "winner-test".to_owned(),
-                    chat_completions_url: "https://candidate.example/v1/chat/completions"
-                        .to_owned(),
+                    api_base_url: "https://candidate.example/v1/".to_owned(),
                     models_response_sha256: repeated_digest(0x93),
                     chat_request_sha256: repeated_digest(0x94),
                     chat_response_sha256: repeated_digest(0x95),
@@ -1879,6 +2348,175 @@ mod tests {
                 900,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unsigned_harness_proposal_routes_chat_and_keeps_responses_on_baseline() {
+        let fixture = Fixture::active(10_000, r#"["stream"]"#);
+        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
+        let generic_config: RouteStartupConfig = serde_json::from_value(serde_json::json!({
+            "allow_private_candidate_http": fixture.config.allow_private_candidate_http,
+            "candidate_max_in_flight": fixture.config.candidate_max_in_flight,
+            "signing_key_id": fixture.config.signing_key_id.clone(),
+            "signing_public_key_hex": fixture.config.signing_public_key_hex.clone(),
+        }))
+        .unwrap();
+        generic_config.validate_common(8).unwrap();
+        assert!(generic_config.winner_deployment_authority().is_err());
+        let proposal = format!(
+            concat!(
+                "{{\"api_base_url\":\"https://candidate.example/v1/\",",
+                "\"candidate_basis_points\":10000,",
+                "\"candidate_id\":\"candidate-2026-08-29\",",
+                "\"eval_sha256\":\"{}\",",
+                "\"model\":\"customer-model\",",
+                "\"schema_version\":\"milk.unsigned-route-proposal.v1\",",
+                "\"scope_id\":\"{}\"}}\n"
+            ),
+            repeated_digest(0xa1),
+            fixture.scope.scope_id,
+        )
+        .into_bytes();
+        let (manifest_bytes, publication) = prepare_operator_route_manifest(
+            &generic_config,
+            &fixture.scope,
+            &proposal,
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            None,
+            now,
+        )
+        .unwrap();
+        assert!(publication.is_operator_proposal());
+        assert!(publication.has_candidate);
+
+        let mut missing_lf = proposal.clone();
+        assert_eq!(missing_lf.pop(), Some(b'\n'));
+        assert!(
+            prepare_operator_route_manifest(
+                &generic_config,
+                &fixture.scope,
+                &missing_lf,
+                Some(&fixture.secret_hex),
+                Some(CANDIDATE_API_KEY),
+                None,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("canonical key-sorted compact JSON plus one LF")
+        );
+        let unknown_field = String::from_utf8(proposal.clone())
+            .unwrap()
+            .replace("}\n", ",\"signature\":null}\n")
+            .into_bytes();
+        assert!(
+            prepare_operator_route_manifest(
+                &generic_config,
+                &fixture.scope,
+                &unknown_field,
+                Some(&fixture.secret_hex),
+                Some(CANDIDATE_API_KEY),
+                None,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("strict typed JSON")
+        );
+        let manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest.schema_version, OPERATOR_ROUTE_SCHEMA_VERSION);
+        assert_eq!(manifest.previous_route_revision, None);
+        assert_eq!(
+            manifest.candidate.unwrap().supported_capabilities,
+            [RouteCapability::Stream]
+        );
+
+        let signature = signing_key().sign(&manifest_bytes);
+        let policy = RoutePolicy::from_signed_bytes(
+            &generic_config,
+            &fixture.scope,
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            8,
+            now,
+            Instant::now(),
+            &manifest_bytes,
+            signature.as_ref(),
+        )
+        .unwrap();
+        let chat = br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(
+            policy
+                .decide(&request(chat, b"session"), Instant::now())
+                .target,
+            RouteTarget::Candidate
+        );
+        let responses = br#"{"model":"customer-model","input":"hi"}"#;
+        assert_eq!(
+            policy
+                .decide(&responses_request(responses, b"session"), Instant::now())
+                .target,
+            RouteTarget::Baseline
+        );
+    }
+
+    #[test]
+    fn unsigned_harness_zero_proposal_emits_signed_baseline_without_candidate() {
+        let fixture = Fixture::active(10_000, r#"["stream"]"#);
+        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
+        let proposal = format!(
+            concat!(
+                "{{\"api_base_url\":\"https://candidate.example/v1/\",",
+                "\"candidate_basis_points\":0,",
+                "\"candidate_id\":\"candidate-2026-08-29\",",
+                "\"eval_sha256\":\"{}\",",
+                "\"model\":\"customer-model\",",
+                "\"schema_version\":\"milk.unsigned-route-proposal.v1\",",
+                "\"scope_id\":\"{}\"}}\n"
+            ),
+            repeated_digest(0xa2),
+            fixture.scope.scope_id,
+        )
+        .into_bytes();
+        let (manifest_bytes, publication) = prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        assert!(publication.is_operator_proposal());
+        assert!(!publication.has_candidate);
+        assert_eq!(publication.candidate_basis_points, 0);
+        let manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(manifest.candidate.is_none());
+        assert!(manifest.route_secret_sha256.is_none());
+        assert!(manifest.previous_route_revision.is_none());
+
+        let signature = signing_key().sign(&manifest_bytes);
+        let policy = RoutePolicy::from_signed_bytes(
+            &fixture.config,
+            &fixture.scope,
+            None,
+            None,
+            8,
+            now,
+            Instant::now(),
+            &manifest_bytes,
+            signature.as_ref(),
+        )
+        .unwrap();
+        assert_baseline(
+            policy.decide(
+                &request(br#"{"model":"customer-model","messages":[]}"#, b"session"),
+                Instant::now(),
+            ),
+            BaselineReason::PolicyZero,
         );
     }
 
@@ -2132,13 +2770,13 @@ mod tests {
         assert!(RouteLivePointer::parse(&fixture.scope, &noncanonical).is_err());
 
         let mut wrong_scope = fixture.scope.clone();
-        wrong_scope.workload_id = Uuid::new_v4();
+        wrong_scope.scope_id = Uuid::new_v4();
         assert!(RouteLivePointer::parse(&wrong_scope, &bytes).is_err());
         assert!(RouteLivePointer::new(fixture.scope, [0xaa; 32], Some([0xaa; 32])).is_err());
     }
 
     #[test]
-    fn signed_policy_routes_only_the_strict_qualified_subset() {
+    fn signed_policy_routes_known_endpoints_without_rejecting_optional_fields() {
         let fixture = Fixture::active(10_000, r#"["stream"]"#);
         let policy = fixture.policy();
         let monotonic_now = Instant::now();
@@ -2149,10 +2787,7 @@ mod tests {
         assert_eq!(decision.route_revision, policy.revision());
         assert_eq!(decision.baseline_reason, None);
         let candidate = decision.candidate.unwrap();
-        assert_eq!(
-            candidate.endpoint.as_str(),
-            "https://candidate.example/v1/chat/completions"
-        );
+        assert_eq!(candidate.endpoint.as_str(), "https://candidate.example/v1/");
         assert_eq!(candidate.candidate_sha256, repeated_digest(0x33));
         assert_eq!(candidate.artifact_sha256, repeated_digest(0x44));
         let manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
@@ -2163,18 +2798,15 @@ mod tests {
         assert_eq!(candidate.max_in_flight, 2);
         assert_eq!(policy.candidate().unwrap().max_in_flight, 2);
 
-        let unsupported = request(
+        let with_tools = request(
             br#"{"model":"customer-model","messages":[],"tools":[]}"#,
             b"tenant-42",
         );
-        assert_baseline(
-            policy.decide(&unsupported, monotonic_now),
-            BaselineReason::UnsupportedRequest,
+        assert_eq!(
+            policy.decide(&with_tools, monotonic_now).target,
+            RouteTarget::Candidate
         );
-        for unsupported_body in [
-            br#"{"model":"customer-model","messages":[]}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[{"role":"system","content":"rules"}]}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[{"role":"user","content":"  "}]}"#.as_slice(),
+        for supported_body in [
             br#"{"model":"customer-model","messages":[],"response_format":{"type":"json_object"}}"#.as_slice(),
             br#"{"model":"customer-model","messages":[],"modalities":["text"]}"#.as_slice(),
             br#"{"model":"customer-model","messages":[],"tool_choice":"none"}"#.as_slice(),
@@ -2183,18 +2815,20 @@ mod tests {
             br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}"#.as_slice(),
             br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-1"}}]}]}"#.as_slice(),
         ] {
-            assert_baseline(
-                policy.decide(&request(unsupported_body, b"tenant-42"), monotonic_now),
-                BaselineReason::UnsupportedRequest,
+            assert_eq!(
+                policy
+                    .decide(&request(supported_body, b"tenant-42"), monotonic_now)
+                    .target,
+                RouteTarget::Candidate
             );
         }
         let text_parts = request(
             br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
             b"tenant-42",
         );
-        assert_baseline(
-            policy.decide(&text_parts, monotonic_now),
-            BaselineReason::UnsupportedRequest,
+        assert_eq!(
+            policy.decide(&text_parts, monotonic_now).target,
+            RouteTarget::Candidate
         );
         let wrong_model = request(br#"{"model":"another-model","messages":[]}"#, b"tenant-42");
         assert_baseline(
@@ -2206,7 +2840,7 @@ mod tests {
     #[test]
     fn reasoning_effort_routes_only_when_it_matches_signed_policy() {
         let policy = RoutePolicy::active_with_reasoning_for_test(
-            Url::parse("https://candidate.example/v1/chat/completions").unwrap(),
+            Url::parse("https://candidate.example/v1/").unwrap(),
             2,
             CANDIDATE_API_KEY,
             Some(CandidateReasoningEffort::High),
@@ -2241,7 +2875,34 @@ mod tests {
     }
 
     #[test]
-    fn candidate_input_bounds_count_decoded_utf8_bytes_and_messages_exactly() {
+    fn responses_routing_is_endpoint_aware_and_preserves_optional_fields() {
+        let policy = RoutePolicy::active_for_test(
+            Url::parse("https://candidate.example/v1/").unwrap(),
+            2,
+            CANDIDATE_API_KEY,
+        );
+        let body = br#"{"model":"customer-model","input":[{"role":"user","content":"hi"}],"conversation":"conv_123","stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"unknown_extension":{"enabled":true}}"#;
+        let request = responses_request(body, b"session-hmac");
+        assert_eq!(
+            policy.decide(&request, Instant::now()).target,
+            RouteTarget::Candidate
+        );
+
+        let mut fixture = Fixture::active(10_000, r#"["stream"]"#);
+        let mut manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
+        manifest
+            .supported_capabilities
+            .retain(|capability| *capability != RouteCapability::Responses);
+        fixture.manifest = serde_json::to_vec(&manifest).unwrap();
+        fixture.signature = signing_key().sign(&fixture.manifest).as_ref().to_vec();
+        assert_baseline(
+            fixture.policy().decide(&request, Instant::now()),
+            BaselineReason::UnsupportedCapability,
+        );
+    }
+
+    #[test]
+    fn candidate_input_bounds_count_items_and_raw_bytes() {
         let fixture = Fixture::active(10_000, "[]");
         let policy = fixture.policy();
         let monotonic_now = Instant::now();
@@ -2283,39 +2944,9 @@ mod tests {
             BaselineReason::UnsupportedCapability,
         );
 
-        let two_byte_scalars = CANDIDATE_MAX_INPUT_UTF8_BYTES / 2;
-        let exactly_2_048_bytes = body(vec!["\u{e9}".repeat(two_byte_scalars)]);
-        assert_eq!(
-            policy
-                .decide(&request(&exactly_2_048_bytes, b"tenant-42"), monotonic_now,)
-                .target,
-            RouteTarget::Candidate
-        );
-        let bytes_2_049 = body(vec![format!("{}x", "\u{e9}".repeat(two_byte_scalars))]);
+        let oversized_input = body(vec!["x".repeat(CANDIDATE_MAX_INPUT_UTF8_BYTES + 1)]);
         assert_baseline(
-            policy.decide(&request(&bytes_2_049, b"tenant-42"), monotonic_now),
-            BaselineReason::UnsupportedCapability,
-        );
-
-        let four_byte_scalar = char::MAX.to_string();
-        let four_byte_scalars = CANDIDATE_MAX_INPUT_UTF8_BYTES / four_byte_scalar.len();
-        let five_hundred_twelve_scalars = body(vec![four_byte_scalar.repeat(four_byte_scalars)]);
-        assert_eq!(
-            policy
-                .decide(
-                    &request(&five_hundred_twelve_scalars, b"tenant-42"),
-                    monotonic_now,
-                )
-                .target,
-            RouteTarget::Candidate
-        );
-        let five_hundred_thirteen_scalars =
-            body(vec![four_byte_scalar.repeat(four_byte_scalars + 1)]);
-        assert_baseline(
-            policy.decide(
-                &request(&five_hundred_thirteen_scalars, b"tenant-42"),
-                monotonic_now,
-            ),
+            policy.decide(&request(&oversized_input, b"tenant-42"), monotonic_now),
             BaselineReason::UnsupportedCapability,
         );
     }
@@ -2367,14 +2998,14 @@ mod tests {
         );
 
         let mut wrong_scope = fixture.scope.clone();
-        wrong_scope.workload_id = Uuid::new_v4();
+        wrong_scope.scope_id = Uuid::new_v4();
         assert!(load_bytes(&fixture, &fixture.config, &wrong_scope, &fixture.secret_hex).is_err());
         let mut wrong_eval = fixture.scope.clone();
-        wrong_eval.eval_id = "66".repeat(32);
+        wrong_eval.scope_id = Uuid::new_v4();
         assert!(load_bytes(&fixture, &fixture.config, &wrong_eval, &fixture.secret_hex).is_err());
 
         let mut wrong_terms = fixture.config.clone();
-        wrong_terms.authorized_provider_terms_sha256 = repeated_digest(0xaa);
+        wrong_terms.authorized_provider_terms_sha256 = Some(repeated_digest(0xaa));
         assert!(load_bytes(&fixture, &wrong_terms, &fixture.scope, &fixture.secret_hex).is_err());
 
         let wrong_secret = hex_bytes(&[1; 32]);
@@ -2451,8 +3082,8 @@ mod tests {
         let manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
         assert_eq!(publication.student_variant, WinnerVariant::StaticFp8);
         assert_eq!(
-            publication.candidate_endpoint,
-            manifest.winner_admission.chat_completions_url
+            publication.candidate_api_base_url,
+            manifest.winner_admission.api_base_url
         );
         assert_eq!(
             publication.logical_model_alias,
@@ -2481,7 +3112,7 @@ mod tests {
         );
 
         let mut wrong_authority = fixture.config.clone();
-        wrong_authority.winner_max_cost_microusd -= 1;
+        *wrong_authority.winner_max_cost_microusd.as_mut().unwrap() -= 1;
         assert!(
             RoutePublication::parse_for_publication(
                 &wrong_authority,
@@ -2494,10 +3125,10 @@ mod tests {
         );
 
         let mut wrong_image = fixture.config.clone();
-        wrong_image.authorized_student_branch_runtime_image_reference = format!(
+        wrong_image.authorized_student_branch_runtime_image_reference = Some(format!(
             "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
             repeated_digest(0xaa)
-        );
+        ));
         assert!(
             RoutePublication::parse_for_publication(
                 &wrong_image,
@@ -2510,7 +3141,7 @@ mod tests {
         );
 
         let mut wrong_program = fixture.config.clone();
-        wrong_program.authorized_admission_program_sha256 = repeated_digest(0xaa);
+        wrong_program.authorized_admission_program_sha256 = Some(repeated_digest(0xaa));
         assert!(
             RoutePublication::parse_for_publication(
                 &wrong_program,
@@ -2732,61 +3363,54 @@ mod tests {
     }
 
     #[test]
-    fn candidate_endpoint_requires_explicit_private_http_authorization() {
+    fn candidate_api_base_requires_explicit_private_http_authorization() {
+        assert!(validate_candidate_api_base_url("https://candidate.example/v1/", false).is_ok());
+        assert!(validate_candidate_api_base_url("http://127.0.0.1:8081/v1/", false).is_ok());
+        assert!(validate_candidate_api_base_url("http://[::1]:8081/v1/", false).is_ok());
         assert!(
-            validate_candidate_endpoint("https://candidate.example/v1/chat/completions", false)
-                .is_ok()
-        );
-        assert!(
-            validate_candidate_endpoint("http://127.0.0.1:8081/v1/chat/completions", false).is_ok()
-        );
-        assert!(
-            validate_candidate_endpoint("http://[::1]:8081/v1/chat/completions", false).is_ok()
-        );
-        assert!(
-            validate_candidate_endpoint(
-                "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/chat/completions",
+            validate_candidate_api_base_url(
+                "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/",
                 false,
             )
             .is_ok()
         );
         for private in [
-            "http://10.0.0.1:8080/v1/chat/completions",
-            "http://10.255.255.254:8080/v1/chat/completions",
-            "http://172.16.0.1:8080/v1/chat/completions",
-            "http://172.31.255.254:8080/v1/chat/completions",
-            "http://192.168.0.1:8080/v1/chat/completions",
-            "http://192.168.255.254:8080/v1/chat/completions",
+            "http://10.0.0.1:8080/v1/",
+            "http://10.255.255.254:8080/v1/",
+            "http://172.16.0.1:8080/v1/",
+            "http://172.31.255.254:8080/v1/",
+            "http://192.168.0.1:8080/v1/",
+            "http://192.168.255.254:8080/v1/",
         ] {
             assert!(
-                validate_candidate_endpoint(private, false).is_err(),
+                validate_candidate_api_base_url(private, false).is_err(),
                 "{private}"
             );
             assert!(
-                validate_candidate_endpoint(private, true).is_ok(),
+                validate_candidate_api_base_url(private, true).is_ok(),
                 "{private}"
             );
         }
         for invalid in [
-            "http://candidate.example/v1/chat/completions",
-            "http://localhost:8081/v1/chat/completions",
-            "http://172.15.255.255:8080/v1/chat/completions",
-            "http://172.32.0.1:8080/v1/chat/completions",
-            "http://192.167.255.255:8080/v1/chat/completions",
-            "http://192.169.0.1:8080/v1/chat/completions",
-            "http://169.254.169.254/v1/chat/completions",
-            "http://100.64.0.1/v1/chat/completions",
-            "http://8.8.8.8/v1/chat/completions",
-            "http://[fd00::1]/v1/chat/completions",
-            "http://0x0a000001/v1/chat/completions",
-            "http://user:pass@10.0.0.1/v1/chat/completions",
+            "http://candidate.example/v1/",
+            "http://localhost:8081/v1/",
+            "http://172.15.255.255:8080/v1/",
+            "http://172.32.0.1:8080/v1/",
+            "http://192.167.255.255:8080/v1/",
+            "http://192.169.0.1:8080/v1/",
+            "http://169.254.169.254/v1/",
+            "http://100.64.0.1/v1/",
+            "http://8.8.8.8/v1/",
+            "http://[fd00::1]/v1/",
+            "http://0x0a000001/v1/",
+            "http://user:pass@10.0.0.1/v1/",
             "http://127.0.0.1:8081/v1/models",
-            "http://127.0.0.1:8081/v1/chat/completions?debug=1",
-            "http://10.0.0.1/v1/chat/completions#fragment",
-            "https://candidate.example/v1/chat/completions-extra",
+            "http://127.0.0.1:8081/v1/?debug=1",
+            "http://10.0.0.1/v1/#fragment",
+            "https://candidate.example/v1-extra/",
         ] {
             assert!(
-                validate_candidate_endpoint(invalid, true).is_err(),
+                validate_candidate_api_base_url(invalid, true).is_err(),
                 "{invalid}"
             );
         }
@@ -2795,10 +3419,10 @@ mod tests {
     #[test]
     fn signed_route_requires_startup_opt_in_for_private_http() {
         let mut fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let private = "http://10.0.0.8:8080/v1/chat/completions";
+        let private = "http://10.0.0.8:8080/v1/";
         fixture.manifest = String::from_utf8(fixture.manifest)
             .unwrap()
-            .replace("https://candidate.example/v1/chat/completions", private)
+            .replace("https://candidate.example/v1/", private)
             .into_bytes();
         fixture.signature = signing_key().sign(&fixture.manifest).as_ref().to_vec();
         assert!(
@@ -2830,6 +3454,7 @@ mod tests {
 
     fn request<'a>(body: &'a [u8], routing_cohort: &'a [u8]) -> RouteRequest<'a> {
         RouteRequest {
+            endpoint: RouteEndpoint::ChatCompletions,
             body,
             content_type: Some(b"Application/JSON; charset=utf-8"),
             has_multiple_content_types: false,
@@ -2837,6 +3462,13 @@ mod tests {
             has_openai_beta: false,
             query: "",
             routing_cohort,
+        }
+    }
+
+    fn responses_request<'a>(body: &'a [u8], routing_cohort: &'a [u8]) -> RouteRequest<'a> {
+        RouteRequest {
+            endpoint: RouteEndpoint::Responses,
+            ..request(body, routing_cohort)
         }
     }
 

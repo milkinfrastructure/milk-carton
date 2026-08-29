@@ -76,7 +76,7 @@ def route_receipt(revision, basis_points, previous_revision=None):
         "candidate_basis_points": basis_points,
         "manifest_object_key": "routes/manifest.json",
         "signature_object_key": "routes/signature.json",
-        "live_pointer_object_key": "routes/live.json",
+        "live_pointer_object_key": "routes/current.json",
         "state": "published",
     }
 
