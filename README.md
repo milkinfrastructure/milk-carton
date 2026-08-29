@@ -23,7 +23,7 @@ The public contract is deliberately narrow:
 
 The gateway records only completed traffic admitted by the operator's capture policy. It loads one strict startup configuration, reports its SHA-256, and polls signed, revisioned route state while retaining the last verified route after a failed refresh.
 
-Milk Gateway is MIT-licensed. Source publication does not imply a live hosted endpoint or a production-qualified release; those require the cloud proof below.
+Milk Gateway is MIT-licensed. The hosted cloud proof has not run, so there is no production-qualified hosted release or live customer endpoint yet.
 
 ## Product boundary
 
@@ -105,7 +105,7 @@ See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.m
 
 ### Cloud-mechanics proof
 
-The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=20`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. The first Baseten-selected 20-call job must pass the exact admitted teacher profile before another provider create is authorized. Milk stops scheduling new paid work at $850 of cumulative spend, and $1,000 is the hard ceiling.
+The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=20`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. The first Baseten-selected 20-call job must pass the exact admitted teacher profile before another provider create is authorized. Its separately confirmed all-in envelope is `$175`: `$160` of GPU reservations plus `$15` for the external services used by the proof. The provider ledger's `$1,000` ceiling and `$850` launch cutoff remain additional GPU controls.
 
 This check proves the deployment, capture, provider, training, short canary, fallback, signed-zero, teardown, and zero-compute mechanics. Because its traffic is generated, it cannot production-qualify the release or admit the resulting candidate for real application traffic.
 
@@ -119,7 +119,23 @@ node tools/openai-production-smoke.mjs \
   --generated-mechanics
 ```
 
-The driver caps each response at 128 tokens, verifies the deployed config digest and capture health before and after the run, and verifies the exact SDK body bytes, assigned partition, and baseline route revision for every request. Its canonical receipt retains only aggregate hashes, counts, timing, and success state; durable R2 readback remains a separate required gate.
+The fixed proof model is `gpt-5.4`. The contract SHA-256 is `cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263`.
+
+| Step | SDK calls | Baseline | Candidate | Completion-token cap |
+| --- | ---: | ---: | ---: | ---: |
+| Deployment baseline | 1 | 1 | 0 | 128 |
+| Generated mechanics | 320 | 320 | 0 | 128 |
+| Candidate | 1 | 0 | 1 | 128 |
+| Saturation fallback | 2 | 1 | 1 | 3,840 |
+| **Total** | **324** | **322** | **2** |  |
+
+Every v2 receipt carries that contract hash plus its exact step, model, request count, route split, and token cap. The stateless SDK driver enforces each invocation. The harness owns the durable one-use mechanics intent and content-free receipt, so an ambiguous run is not replayed.
+
+The verified deployment's `current.json` is v2 and binds the canonical deployment-baseline receipt SHA-256 and the fixed proof-contract SHA-256. Deployment finalization re-reads both records before sealing the evidence manifest.
+
+The generated mechanics driver contributes exactly 320 of those baseline requests with four-way concurrency, a 30-second timeout per request, and no SDK retries. Its preflight and postflight health checks also have 30-second timeouts, keeping the network wait within 41 minutes for a 60-minute cloud job. It verifies the deployed config digest and capture health before and after the run, plus the exact SDK body bytes, assigned partition, and baseline route revision for every request. Its canonical receipt retains only aggregate hashes, counts, timing, and success state; durable R2 readback remains a separate required gate.
+
+After this mechanics proof reaches the production gate, hosted GLM is the next explicit typed teacher profile. It uses the same eval, capture, and route contracts; it does not add a generic provider layer.
 
 ## Production qualification
 

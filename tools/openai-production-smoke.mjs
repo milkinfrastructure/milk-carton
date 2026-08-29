@@ -23,9 +23,24 @@ const MECHANICS_PHASES = [
   { train: 13, dev: 18, calibration: 38 },
 ];
 const MECHANICS_CONCURRENCY = 4;
-const MECHANICS_HEALTH_TIMEOUT_MS = 30_000;
 const MECHANICS_MAX_CANDIDATES = 10_000;
 const MECHANICS_ROUTE_REVISION = "openai-baseline-v1";
+const SATURATION_LINE_COUNT = 4_096;
+export const PRODUCTION_PROOF = Object.freeze({
+  baseline_requests: 322,
+  candidate_requests: 2,
+  generated_health_timeout_ms: 30_000,
+  generated_mechanics_requests: 320,
+  generated_request_timeout_ms: 30_000,
+  max_sdk_requests: 324,
+  model: "gpt-5.4",
+  saturation_max_completion_tokens: 3_840,
+  short_max_completion_tokens: 128,
+});
+
+function assertProofModel(model) {
+  assert.equal(model, PRODUCTION_PROOF.model);
+}
 
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -41,6 +56,8 @@ function canonical(value) {
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
+
+const PRODUCTION_PROOF_SHA256 = sha256(canonical(PRODUCTION_PROOF));
 
 function mechanicsPartition(raw) {
   const requestSha256 = sha256(raw);
@@ -62,7 +79,7 @@ function partitionCounts(rows) {
 }
 
 export function generatedMechanicsPlan(model) {
-  assert.match(model, /^[A-Za-z0-9][A-Za-z0-9._/:~-]{0,255}$/);
+  assertProofModel(model);
   const plan = [];
   let nonce = 0;
   for (const target of MECHANICS_PHASES) {
@@ -72,7 +89,7 @@ export function generatedMechanicsPlan(model) {
       assert.ok(nonce < MECHANICS_MAX_CANDIDATES);
       const request = {
         model,
-        max_completion_tokens: 128,
+        max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
         messages: [
           {
             role: "user",
@@ -90,7 +107,7 @@ export function generatedMechanicsPlan(model) {
     }
     assert.deepEqual(counts, target);
   }
-  assert.equal(plan.length, 320);
+  assert.equal(plan.length, PRODUCTION_PROOF.generated_mechanics_requests);
   assert.equal(new Set(plan.map((row) => row.requestSha256)).size, plan.length);
   assert.deepEqual(partitionCounts(plan.slice(0, 251)), MECHANICS_PHASES[0]);
   assert.deepEqual(partitionCounts(plan.slice(251)), MECHANICS_PHASES[1]);
@@ -103,7 +120,7 @@ async function generatedMechanicsHealth(endpoint, expectedConfigSha256, transpor
     const response = await transport(
       new Request(new URL("/healthz", endpoint), {
         headers: { accept: "application/json" },
-        signal: AbortSignal.timeout(MECHANICS_HEALTH_TIMEOUT_MS),
+        signal: AbortSignal.timeout(PRODUCTION_PROOF.generated_health_timeout_ms),
       }),
     );
     const raw = Buffer.from(await response.arrayBuffer());
@@ -156,7 +173,7 @@ async function privateCredential(path, route) {
     value.api_key,
     /^dt_live_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[A-Za-z0-9._~-]{16,256}$/,
   );
-  assert.match(value.model, /^[A-Za-z0-9][A-Za-z0-9._/:~-]{0,255}$/);
+  assertProofModel(value.model);
   assert.match(value.cohort_id, /^[A-Za-z0-9._~-]{1,128}$/);
   if (route) {
     assert.ok(
@@ -168,7 +185,9 @@ async function privateCredential(path, route) {
 }
 
 export function candidateRequest(credential) {
+  assertProofModel(credential.model);
   const request = {
+    max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
     messages: [{ role: "user", content: "Reply with only OK." }],
     model: credential.model,
   };
@@ -179,11 +198,13 @@ export function candidateRequest(credential) {
 }
 
 export function saturationRequest(credential) {
+  assertProofModel(credential.model);
   const request = {
+    max_completion_tokens: PRODUCTION_PROOF.saturation_max_completion_tokens,
     messages: [
       {
         role: "user",
-        content: "Write OK on 4096 separate lines. Do not summarize or stop early.",
+        content: `Write OK on ${SATURATION_LINE_COUNT} separate lines. Do not summarize or stop early.`,
       },
     ],
     model: credential.model,
@@ -196,7 +217,9 @@ export function saturationRequest(credential) {
 }
 
 export async function runBaselineSmoke(client, endpoint, credential) {
+  assertProofModel(credential.model);
   const request = {
+    max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
     messages: [{ role: "user", content: "Reply with only OK." }],
     model: credential.model,
   };
@@ -209,16 +232,23 @@ export async function runBaselineSmoke(client, endpoint, credential) {
   assert.ok(data.choices[0].message.content.length > 0);
   return {
     authenticated: true,
+    baseline_request_count: 1,
+    candidate_request_count: 0,
     choice_count: data.choices.length,
     content_retained: false,
     endpoint_sha256: sha256(endpoint.href),
     finish_reason: data.choices[0].finish_reason,
     http_status: response.status,
+    max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
+    model: PRODUCTION_PROOF.model,
+    proof_contract_sha256: PRODUCTION_PROOF_SHA256,
+    proof_step: "deployment_baseline",
     request_sha256: sha256(canonical(request)),
     response_bytes: Buffer.byteLength(responseRaw),
     response_sha256: sha256(responseRaw),
-    schema_version: "milk.official-openai-sdk-smoke.v1",
+    schema_version: "milk.official-openai-sdk-smoke.v2",
     sdk: "openai-node",
+    sdk_request_count: 1,
     sdk_version: SDK_VERSION,
     succeeded: true,
     traffic_cohort_sha256: sha256(credential.cohort_id),
@@ -247,6 +277,8 @@ export async function runCandidateSmoke(client, endpoint, credential, expectedRo
   return {
     artifact_sha256: artifactSha256,
     authenticated: true,
+    baseline_request_count: 0,
+    candidate_request_count: 1,
     candidate_sha256: candidateSha256,
     choice_count: data.choices.length,
     content_retained: false,
@@ -254,13 +286,18 @@ export async function runCandidateSmoke(client, endpoint, credential, expectedRo
     endpoint_sha256: sha256(endpoint.href),
     finish_reason: data.choices[0].finish_reason,
     http_status: response.status,
+    max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
+    model: PRODUCTION_PROOF.model,
+    proof_contract_sha256: PRODUCTION_PROOF_SHA256,
+    proof_step: "candidate",
     request_sha256: sha256(canonical(request)),
     response_bytes: Buffer.byteLength(responseRaw),
     response_sha256: sha256(responseRaw),
     route_revision: expectedRouteRevision,
     route_target: "candidate",
-    schema_version: "milk.official-openai-sdk-route-smoke.v1",
+    schema_version: "milk.official-openai-sdk-route-smoke.v2",
     sdk: "openai-node",
+    sdk_request_count: 1,
     sdk_version: SDK_VERSION,
     succeeded: true,
     traffic_cohort_sha256: sha256(credential.cohort_id),
@@ -312,7 +349,9 @@ export async function runSaturationFallbackSmoke(
     return {
       artifact_sha256: artifactSha256,
       authenticated: true,
+      baseline_request_count: 1,
       candidate_http_status: candidate.response.status,
+      candidate_request_count: 1,
       candidate_route_target: "candidate",
       candidate_sha256: candidateSha256,
       content_retained: false,
@@ -320,10 +359,15 @@ export async function runSaturationFallbackSmoke(
       endpoint_sha256: sha256(endpoint.href),
       fallback_http_status: fallback.response.status,
       fallback_route_target: "openai",
+      max_completion_tokens: PRODUCTION_PROOF.saturation_max_completion_tokens,
+      model: PRODUCTION_PROOF.model,
+      proof_contract_sha256: PRODUCTION_PROOF_SHA256,
+      proof_step: "saturation_fallback",
       request_sha256: sha256(canonical(request)),
       route_revision: expectedRouteRevision,
-      schema_version: "milk.official-openai-sdk-saturation-fallback-smoke.v1",
+      schema_version: "milk.official-openai-sdk-saturation-fallback-smoke.v2",
       sdk: "openai-node",
+      sdk_request_count: 2,
       sdk_version: SDK_VERSION,
       succeeded: true,
       traffic_cohort_sha256: sha256(credential.cohort_id),
@@ -342,6 +386,7 @@ export async function runGeneratedMechanics(
   transport = globalThis.fetch,
 ) {
   assert.match(expectedConfigSha256, SHA256);
+  assertProofModel(credential.model);
   const toolSha256 = sha256(await readFile(new URL(import.meta.url)));
   const preflightHealth = await generatedMechanicsHealth(
     endpoint,
@@ -356,7 +401,7 @@ export async function runGeneratedMechanics(
     apiKey: credential.api_key,
     baseURL: endpoint.href,
     maxRetries: 0,
-    timeout: 120_000,
+    timeout: PRODUCTION_PROOF.generated_request_timeout_ms,
     fetch: async (input, init) => {
       const outgoing = new Request(input, init);
       const raw = Buffer.from(await outgoing.clone().arrayBuffer());
@@ -448,19 +493,27 @@ export async function runGeneratedMechanics(
     uniqueTraceCount === plan.length &&
     postflightHealth.succeeded;
   return {
-    schema_version: "milk.official-openai-sdk-generated-mechanics.v1",
+    schema_version: "milk.official-openai-sdk-generated-mechanics.v2",
     eval_id: MECHANICS_EVAL_ID,
     gateway_config_sha256: expectedConfigSha256,
     tool_sha256: toolSha256,
     sdk: "openai-node",
     sdk_version: SDK_VERSION,
     endpoint_sha256: sha256(endpoint.href),
+    model: PRODUCTION_PROOF.model,
     model_sha256: sha256(credential.model),
+    proof_contract_sha256: PRODUCTION_PROOF_SHA256,
+    proof_step: "generated_mechanics",
+    request_timeout_ms: PRODUCTION_PROOF.generated_request_timeout_ms,
     traffic_cohort_sha256: sha256(credential.cohort_id),
     concurrency: MECHANICS_CONCURRENCY,
     candidates_scanned: plan.at(-1).nonce + 1,
     planned: plan.length,
     attempted: observations.length,
+    sdk_request_count: observations.length,
+    baseline_request_count: observations.length,
+    candidate_request_count: 0,
+    max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
     successful: successful.length,
     failed: observations.length - successful.length,
     transported: transported.size,

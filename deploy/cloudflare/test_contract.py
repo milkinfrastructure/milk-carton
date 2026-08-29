@@ -19,11 +19,25 @@ assert not (root / "prepare-context.sh").exists()
 assert package["scripts"]["deploy"] == "../../tools/deploy-private-gateway.sh"
 assert "official-sdk-smoke" in deploy_script
 assert "automatic-rollback" in deploy_script
+assert "milk.private-gateway-current-deployment.v2" in deploy_script
+assert '"official_openai_sdk_baseline_receipt_sha256"' in deploy_script
+assert 'PRODUCTION_PROOF_SHA256 = "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263"' in deploy_script
+assert "validate_deployment_baseline_binding" in deploy_script
 assert 'deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])' in deploy_script
 assert '"DRAGONTALES_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
 assert "expected_config_sha256" in deploy_script
 assert 'import OpenAI from "openai"' in production_smoke
 assert "maxRetries: 0" in production_smoke
+assert 'model: "gpt-5.4"' in production_smoke
+assert "max_sdk_requests: 324" in production_smoke
+assert "baseline_requests: 322" in production_smoke
+assert "candidate_requests: 2" in production_smoke
+assert "generated_request_timeout_ms: 30_000" in production_smoke
+assert "timeout: PRODUCTION_PROOF.generated_request_timeout_ms" in production_smoke
+assert "AbortSignal.timeout(PRODUCTION_PROOF.generated_health_timeout_ms)" in production_smoke
+assert "short_max_completion_tokens: 128" in production_smoke
+assert "saturation_max_completion_tokens: 3_840" in production_smoke
+assert "proof_contract_sha256" in production_smoke
 assert "99.5% monthly" in operator_notes
 assert "staging run forces that one instance to restart" in operator_notes
 assert "versioned Worker deploy" in operator_notes

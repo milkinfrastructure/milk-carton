@@ -41,7 +41,36 @@ RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 TAG = re.compile(r"[a-z0-9_][a-z0-9._-]{0,127}")
 REPOSITORY = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")
 COHORT_ID = re.compile(r"[A-Za-z0-9._~-]{1,128}")
-MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:~-]{0,255}")
+PRODUCTION_PROOF = {
+    "baseline_requests": 322,
+    "candidate_requests": 2,
+    "generated_health_timeout_ms": 30000,
+    "generated_mechanics_requests": 320,
+    "generated_request_timeout_ms": 30000,
+    "max_sdk_requests": 324,
+    "model": "gpt-5.4",
+    "saturation_max_completion_tokens": 3840,
+    "short_max_completion_tokens": 128,
+}
+PRODUCTION_PROOF_SHA256 = "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263"
+if hashlib.sha256(json.dumps(
+    PRODUCTION_PROOF, sort_keys=True, separators=(",", ":"),
+).encode()).hexdigest() != PRODUCTION_PROOF_SHA256:
+    raise RuntimeError("production proof contract SHA-256 is stale")
+OFFICIAL_OPENAI_SDK_BASELINE_FIELDS = {
+    "authenticated", "baseline_request_count", "candidate_request_count",
+    "choice_count", "content_retained", "endpoint_sha256", "finish_reason",
+    "http_status", "max_completion_tokens", "model", "proof_contract_sha256",
+    "proof_step", "request_sha256", "response_bytes", "response_sha256",
+    "schema_version", "sdk", "sdk_request_count", "sdk_version", "succeeded",
+    "traffic_cohort_sha256", "traffic_key_sha256",
+}
+CURRENT_DEPLOYMENT_FIELDS = {
+    "schema_version", "operation_id", "worker_version_id", "application_name",
+    "application_id", "application_version", "image", "gateway_config_sha256",
+    "official_openai_sdk_baseline_receipt_sha256", "proof_contract_sha256",
+    "rollout", "accepted",
+}
 POLL_ATTEMPTS = 20
 POLL_INTERVAL_SECONDS = 15
 MAX_JSON = 1024 * 1024
@@ -128,6 +157,30 @@ def read_regular(path, label, maximum=MAX_JSON):
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def validate_deployment_baseline_binding(current_raw, baseline_raw, expected_sha256):
+    current = parse_json(current_raw, "current deployment", 65536)
+    baseline = parse_json(baseline_raw, "official OpenAI SDK baseline", 65536)
+    require_keys(current, CURRENT_DEPLOYMENT_FIELDS, "current deployment")
+    require_keys(
+        baseline,
+        OFFICIAL_OPENAI_SDK_BASELINE_FIELDS,
+        "official OpenAI SDK baseline",
+    )
+    if (
+        current_raw != canonical_json(current)
+        or baseline_raw != canonical_json(baseline)
+        or SHA256.fullmatch(expected_sha256 or "") is None
+        or current["schema_version"] != "milk.private-gateway-current-deployment.v2"
+        or baseline["schema_version"] != "milk.official-openai-sdk-smoke.v2"
+        or baseline["proof_step"] != "deployment_baseline"
+        or digest(baseline_raw) != expected_sha256
+        or current["official_openai_sdk_baseline_receipt_sha256"] != expected_sha256
+        or current["proof_contract_sha256"] != PRODUCTION_PROOF_SHA256
+        or baseline["proof_contract_sha256"] != current["proof_contract_sha256"]
+    ):
+        raise ContractFailure("current deployment baseline binding is invalid")
 
 
 def validate_release(directory):
@@ -336,7 +389,17 @@ class Evidence:
             raise
         return digest(raw)
 
-    def finalize(self, outcome, stage, started_at):
+    def finalize(self, outcome, stage, started_at, baseline_receipt_sha256=None):
+        if outcome == "succeeded":
+            validate_deployment_baseline_binding(
+                read_regular(self.root / "current.json", "current deployment", 65536),
+                read_regular(
+                    self.root / "official-openai-sdk-smoke.json",
+                    "official OpenAI SDK baseline",
+                    65536,
+                ),
+                baseline_receipt_sha256,
+            )
         logs = []
         for path in sorted(self.logs.glob("*.json")):
             raw = path.read_bytes()
@@ -654,8 +717,7 @@ def validate_smoke_credential(path, gateway_config):
         )
         or not isinstance(credential["cohort_id"], str)
         or COHORT_ID.fullmatch(credential["cohort_id"]) is None
-        or not isinstance(credential["model"], str)
-        or MODEL.fullmatch(credential["model"]) is None
+        or credential["model"] != PRODUCTION_PROOF["model"]
     ):
         raise DeployFailure("gateway credential is invalid")
     api_key_sha256 = digest(api_key.encode())
@@ -1474,17 +1536,23 @@ def main():
             timeout=150,
         )
         sdk_smoke = parse_json(sdk_result.stdout, "official OpenAI SDK smoke", 65536)
-        require_keys(sdk_smoke, {
-            "authenticated", "choice_count", "content_retained", "endpoint_sha256",
-            "finish_reason", "http_status", "request_sha256", "response_bytes",
-            "response_sha256", "schema_version", "sdk", "sdk_version", "succeeded",
-            "traffic_cohort_sha256", "traffic_key_sha256",
-        }, "official OpenAI SDK smoke")
+        require_keys(
+            sdk_smoke,
+            OFFICIAL_OPENAI_SDK_BASELINE_FIELDS,
+            "official OpenAI SDK smoke",
+        )
         if (
             sdk_result.stdout != canonical_json(sdk_smoke)
-            or sdk_smoke["schema_version"] != "milk.official-openai-sdk-smoke.v1"
+            or sdk_smoke["schema_version"] != "milk.official-openai-sdk-smoke.v2"
             or sdk_smoke["sdk"] != "openai-node"
             or sdk_smoke["sdk_version"] != "6.33.0"
+            or sdk_smoke["proof_contract_sha256"] != PRODUCTION_PROOF_SHA256
+            or sdk_smoke["proof_step"] != "deployment_baseline"
+            or sdk_smoke["model"] != PRODUCTION_PROOF["model"]
+            or sdk_smoke["sdk_request_count"] != 1
+            or sdk_smoke["baseline_request_count"] != 1
+            or sdk_smoke["candidate_request_count"] != 0
+            or sdk_smoke["max_completion_tokens"] != PRODUCTION_PROOF["short_max_completion_tokens"]
             or sdk_smoke["authenticated"] is not True
             or sdk_smoke["succeeded"] is not True
             or sdk_smoke["content_retained"] is not False
@@ -1502,9 +1570,11 @@ def main():
             or not isinstance(sdk_smoke["finish_reason"], (str, type(None)))
         ):
             raise ContractFailure("official OpenAI SDK smoke receipt is invalid")
-        evidence.write("official-openai-sdk-smoke.json", sdk_smoke)
+        baseline_receipt_sha256 = evidence.write(
+            "official-openai-sdk-smoke.json", sdk_smoke,
+        )
         evidence.write("current.json", {
-            "schema_version": "milk.private-gateway-current-deployment.v1",
+            "schema_version": "milk.private-gateway-current-deployment.v2",
             "operation_id": operation_id,
             "worker_version_id": current_worker,
             "application_name": APPLICATION_NAME,
@@ -1512,6 +1582,8 @@ def main():
             "application_version": current_app_version,
             "image": current_image,
             "gateway_config_sha256": gateway_config_sha256,
+            "official_openai_sdk_baseline_receipt_sha256": baseline_receipt_sha256,
+            "proof_contract_sha256": PRODUCTION_PROOF_SHA256,
             "rollout": "immediate",
             "accepted": True,
         })
@@ -1519,7 +1591,9 @@ def main():
         temporary_config = None
         shutil.rmtree(scratch)
         scratch = None
-        evidence.finalize("succeeded", None, started_at)
+        evidence.finalize(
+            "succeeded", None, started_at, baseline_receipt_sha256,
+        )
         cloudflare_environment.pop("CLOUDFLARE_API_TOKEN", None)
         print(f"private gateway deployment verified at {evidence_directory}")
         return 0

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from pathlib import Path
 
@@ -50,6 +51,24 @@ BOOTSTRAP_SECRETS = {
     "MILK_ROUTE_STORE_ACCESS_KEY_ID": "bootstrap-route-access-private",
     "MILK_ROUTE_STORE_SECRET_ACCESS_KEY": "bootstrap-route-secret-private",
 }
+
+
+def load_deploy_contract():
+    source = SCRIPT.read_text(encoding="utf-8")
+    payload = source.split("<<'PY'\n", 1)[1].rsplit(
+        "\ntry:\n    raise SystemExit(main())", 1,
+    )[0]
+    name = "_milk_deploy_private_gateway_contract"
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(SCRIPT), "exec"), module.__dict__)
+    finally:
+        sys.modules.pop(name, None)
+    return module
+
+
+DEPLOY_CONTRACT = load_deploy_contract()
 
 
 def make_release(directory):
@@ -230,18 +249,38 @@ if name == "node":
     if state["mode"] in {"sdk_fail", "bootstrap_sdk_fail", "bootstrap_cleanup_fail"}:
         done(70)
     credential = json.loads(Path(args[-1]).read_text())
+    proof_contract = {
+        "baseline_requests": 322,
+        "candidate_requests": 2,
+        "generated_health_timeout_ms": 30000,
+        "generated_mechanics_requests": 320,
+        "generated_request_timeout_ms": 30000,
+        "max_sdk_requests": 324,
+        "model": "gpt-5.4",
+        "saturation_max_completion_tokens": 3840,
+        "short_max_completion_tokens": 128,
+    }
     print(json.dumps({
         "authenticated": True,
+        "baseline_request_count": 1,
+        "candidate_request_count": 0,
         "choice_count": 1,
         "content_retained": False,
         "endpoint_sha256": "6" * 64,
         "finish_reason": "stop",
         "http_status": 200,
+        "max_completion_tokens": 128,
+        "model": "gpt-5.4",
+        "proof_contract_sha256": hashlib.sha256(json.dumps(
+            proof_contract, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+        "proof_step": "deployment_baseline",
         "request_sha256": "7" * 64,
         "response_bytes": 123,
         "response_sha256": "8" * 64,
-        "schema_version": "milk.official-openai-sdk-smoke.v1",
+        "schema_version": "milk.official-openai-sdk-smoke.v2",
         "sdk": "openai-node",
+        "sdk_request_count": 1,
         "sdk_version": "6.33.0",
         "succeeded": True,
         "traffic_cohort_sha256": hashlib.sha256(credential["cohort_id"].encode()).hexdigest(),
@@ -452,7 +491,7 @@ class Fixture:
         self.credential.write_bytes(canonical({
             "api_key": SMOKE_API_KEY,
             "cohort_id": SMOKE_COHORT,
-            "model": "test-model",
+            "model": "gpt-5.4",
         }))
         self.credential.chmod(0o600)
         self.gateway_config = self.root / "gateway-config.json"
@@ -507,6 +546,18 @@ class Fixture:
 
 
 class DeployPrivateGatewayTests(unittest.TestCase):
+    def test_smoke_model_is_fixed_before_cloud_mutation(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        credential = json.loads(fixture.credential.read_text())
+        credential["model"] = "another-model"
+        fixture.credential.write_bytes(canonical(credential))
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"gateway credential is invalid", result.stderr)
+        self.assertFalse(fixture.evidence.exists())
+        self.assertEqual(fixture.state["commands"], [])
+
     def test_smoke_key_must_be_exactly_non_capturable_in_canonical_gateway_config(self):
         for defect in ("capture", "cohort", "key"):
             with self.subTest(defect=defect):
@@ -591,10 +642,29 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         sdk_smoke = json.loads(
             (fixture.evidence / "official-openai-sdk-smoke.json").read_text()
         )
+        sdk_smoke_raw = (
+            fixture.evidence / "official-openai-sdk-smoke.json"
+        ).read_bytes()
         self.assertIs(sdk_smoke["authenticated"], True)
         self.assertIs(sdk_smoke["content_retained"], False)
+        self.assertEqual(
+            sdk_smoke["proof_contract_sha256"],
+            "cf9e41c3220544bc163a6dfb82721154a8e078c9db3c9fa86a148a84ea275263",
+        )
         current = json.loads((fixture.evidence / "current.json").read_text())
+        self.assertEqual(
+            current["schema_version"],
+            "milk.private-gateway-current-deployment.v2",
+        )
         self.assertEqual(current["gateway_config_sha256"], gateway_config_sha256)
+        self.assertEqual(
+            current["official_openai_sdk_baseline_receipt_sha256"],
+            sha256(sdk_smoke_raw),
+        )
+        self.assertEqual(
+            current["proof_contract_sha256"],
+            sdk_smoke["proof_contract_sha256"],
+        )
         live_smoke = json.loads((fixture.evidence / "smoke-deploy.json").read_text())
         self.assertEqual(live_smoke["config_sha256"], gateway_config_sha256)
         self.assertEqual(live_smoke["health_contract"], "status-ok-config-sha256")
@@ -603,6 +673,39 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             raw = (fixture.evidence / item["path"]).read_bytes()
             self.assertEqual(item["bytes"], len(raw))
             self.assertEqual(item["sha256"], sha256(raw))
+
+    def test_current_deployment_baseline_binding_rejects_missing_mismatch_and_tamper(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        current_raw = (fixture.evidence / "current.json").read_bytes()
+        baseline_raw = (
+            fixture.evidence / "official-openai-sdk-smoke.json"
+        ).read_bytes()
+        expected_sha256 = sha256(baseline_raw)
+        validate = DEPLOY_CONTRACT.validate_deployment_baseline_binding
+        validate(current_raw, baseline_raw, expected_sha256)
+
+        missing = json.loads(current_raw)
+        missing.pop("official_openai_sdk_baseline_receipt_sha256")
+        with self.assertRaises(DEPLOY_CONTRACT.ContractFailure):
+            validate(canonical(missing), baseline_raw, expected_sha256)
+
+        mismatch = json.loads(current_raw)
+        mismatch["proof_contract_sha256"] = "0" * 64
+        with self.assertRaises(DEPLOY_CONTRACT.ContractFailure):
+            validate(canonical(mismatch), baseline_raw, expected_sha256)
+
+        tampered_baseline = json.loads(baseline_raw)
+        tampered_baseline["response_sha256"] = "9" * 64
+        tampered_baseline_raw = canonical(tampered_baseline)
+        tampered_current = json.loads(current_raw)
+        tampered_current["official_openai_sdk_baseline_receipt_sha256"] = sha256(
+            tampered_baseline_raw
+        )
+        with self.assertRaises(DEPLOY_CONTRACT.ContractFailure):
+            validate(canonical(tampered_current), tampered_baseline_raw, expected_sha256)
 
     def test_published_release_ancestor_remains_deployable(self):
         fixture = Fixture("published_ancestor")
