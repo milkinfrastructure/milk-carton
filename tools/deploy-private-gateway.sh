@@ -2,7 +2,8 @@
 set -eu
 umask 077
 
-exec python3 - "$0" "$@" <<'PY'
+exec 3<&0
+exec python3 - "$0" "$@" 3<&3 <<'PY'
 import copy
 import hashlib
 import json
@@ -793,29 +794,46 @@ def make_deploy_config(base, path, image, entrypoint):
 
 
 def main():
-    bootstrap = len(sys.argv) == 7 and sys.argv[2] == "--bootstrap"
-    if not bootstrap and len(sys.argv) != 7:
+    arguments = sys.argv[2:]
+    registry_token_file = None
+    registry_token_stdin = False
+    while arguments and arguments[0].startswith("--registry-token-"):
+        option = arguments.pop(0)
+        if option == "--registry-token-file" and arguments and registry_token_file is None and not registry_token_stdin:
+            registry_token_file = Path(arguments.pop(0))
+        elif option == "--registry-token-stdin" and registry_token_file is None and not registry_token_stdin:
+            registry_token_stdin = True
+        else:
+            raise DeployFailure("registry credential input must be selected exactly once")
+    if registry_token_file is None and not registry_token_stdin:
+        raise DeployFailure("registry credential input must be selected exactly once")
+    bootstrap = len(arguments) == 5 and arguments[0] == "--bootstrap"
+    if not bootstrap and len(arguments) != 5:
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE\n"
-            "       deploy-private-gateway.sh --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE"
+            "usage: deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE\n"
+            "       deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE"
         )
     script = Path(sys.argv[1]).resolve(strict=True)
     repository = script.parent.parent.resolve(strict=True)
+    sys.path.insert(0, str(repository / "tools"))
+    from github_registry import read_token
+    registry_stream = os.fdopen(3, "rb", closefd=False) if registry_token_stdin else None
+    github_token = bytearray(read_token(registry_token_file, repository, registry_stream))
     if bootstrap:
-        release_directory = Path(sys.argv[3]).resolve(strict=True)
+        release_directory = Path(arguments[1]).resolve(strict=True)
         application_id = None
-        requested_evidence = Path(sys.argv[4])
-        credential_file = Path(sys.argv[5])
+        requested_evidence = Path(arguments[2])
+        credential_file = Path(arguments[3])
         bootstrap_secret_input, gateway_config_raw, gateway_config = validate_bootstrap_secrets(
-            Path(sys.argv[6]), repository,
+            Path(arguments[4]), repository,
         )
     else:
-        release_directory = Path(sys.argv[2]).resolve(strict=True)
-        application_id = sys.argv[3]
-        requested_evidence = Path(sys.argv[4])
-        credential_file = Path(sys.argv[5])
+        release_directory = Path(arguments[0]).resolve(strict=True)
+        application_id = arguments[1]
+        requested_evidence = Path(arguments[2])
+        credential_file = Path(arguments[3])
         gateway_config_raw, gateway_config = validate_gateway_config_file(
-            Path(sys.argv[6]), repository,
+            Path(arguments[4]), repository,
         )
         bootstrap_secret_input = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
@@ -867,7 +885,7 @@ def main():
     cloudflare_environment["CLOUDFLARE_API_TOKEN"] = cloudflare_token
 
     commands = {}
-    for command in ("curl", "docker", "gh", "git", "node", "sleep", "wrangler"):
+    for command in ("curl", "docker", "git", "node", "sleep", "wrangler"):
         resolved = shutil.which(command, path=base_environment.get("PATH"))
         if resolved is None:
             raise DeployFailure(f"{command} is unavailable")
@@ -1335,17 +1353,14 @@ def main():
             })
 
         stage = "ghcr-pull"
-        github_token = runner.run(
-            "github-registry-credential", [commands["gh"], "auth", "token", "--hostname", "github.com"],
-            sensitive_output=True,
-        ).stdout.strip()
-        if not 1 <= len(github_token) <= 8192:
-            raise ContractFailure("GitHub registry credential is invalid")
-        docker(
-            "github-registry-login", "login", "ghcr.io", "--username", "ShantanuJoshi", "--password-stdin",
-            input_bytes=github_token + b"\n",
-        )
-        del github_token
+        try:
+            docker(
+                "github-registry-login", "login", "ghcr.io", "--username", "ShantanuJoshi", "--password-stdin",
+                input_bytes=bytes(github_token) + b"\n",
+            )
+        finally:
+            for index in range(len(github_token)):
+                github_token[index] = 0
         docker(
             "pull-admitted-amd64-child", "pull", "--platform", "linux/amd64", admitted["child_reference"],
             timeout=900,

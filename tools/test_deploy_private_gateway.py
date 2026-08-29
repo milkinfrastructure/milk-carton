@@ -239,12 +239,6 @@ if name == "git":
         done(2)
     done()
 
-if name == "gh":
-    if args == ["auth", "token", "--hostname", "github.com"]:
-        print("github-test-token")
-        done()
-    done(2)
-
 if name == "node":
     if state["mode"] in {"sdk_fail", "bootstrap_sdk_fail", "bootstrap_cleanup_fail"}:
         done(70)
@@ -485,8 +479,11 @@ class Fixture:
         command = self.bin / "command"
         command.write_text(textwrap.dedent(FAKE_COMMAND))
         command.chmod(0o755)
-        for name in ("curl", "docker", "gh", "git", "node", "sleep", "wrangler"):
+        for name in ("curl", "docker", "git", "node", "sleep", "wrangler"):
             os.link(command, self.bin / name)
+        self.registry_token = self.root / "registry-token"
+        self.registry_token.write_text("github-test-token\n", encoding="ascii")
+        self.registry_token.chmod(0o600)
         self.credential = self.root / "gateway-credential.json"
         self.credential.write_bytes(canonical({
             "api_key": SMOKE_API_KEY,
@@ -515,14 +512,19 @@ class Fixture:
             "FAKE_EVIDENCE": str(self.evidence),
         }
 
-    def run(self, script=SCRIPT):
+    def run(self, script=SCRIPT, token_stdin=False):
+        registry_arguments = ["--registry-token-stdin"] if token_stdin else [
+            "--registry-token-file", str(self.registry_token),
+        ]
         arguments = [
-            str(script), str(self.release), APPLICATION, str(self.evidence),
+            str(script), *registry_arguments,
+            str(self.release), APPLICATION, str(self.evidence),
             str(self.credential), str(self.gateway_config),
         ]
         if self.bootstrap:
             arguments = [
-                str(script), "--bootstrap", str(self.release), str(self.evidence),
+                str(script), *registry_arguments,
+                "--bootstrap", str(self.release), str(self.evidence),
                 str(self.credential), str(self.bootstrap_secrets),
             ]
         return subprocess.run(
@@ -531,6 +533,7 @@ class Fixture:
             env=self.environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            input=b"github-test-token\n" if token_stdin else None,
             check=False,
         )
 
@@ -546,6 +549,16 @@ class Fixture:
 
 
 class DeployPrivateGatewayTests(unittest.TestCase):
+    def test_registry_credential_can_be_streamed_without_evidence(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        result = fixture.run(token_stdin=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        evidence_raw = b"".join(
+            path.read_bytes() for path in fixture.evidence.rglob("*") if path.is_file()
+        )
+        self.assertNotIn(b"github-test-token", evidence_raw)
+
     def test_smoke_model_is_fixed_before_cloud_mutation(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
@@ -950,6 +963,9 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         script = isolated_tools / SCRIPT.name
         script.write_text(source, encoding="utf-8")
         script.chmod(0o700)
+        isolated_tools.joinpath("github_registry.py").write_bytes(
+            ROOT.joinpath("tools/github_registry.py").read_bytes()
+        )
         result = fixture.run(script)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"buildx plugin is unavailable", result.stderr)
@@ -967,6 +983,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         script_raw = SCRIPT.read_text()
         self.assertNotIn("containers images delete", script_raw)
         self.assertIn('"containers", "delete", matches[0]', script_raw)
+        self.assertNotRegex(script_raw, r"\bgh\b")
 
 
 if __name__ == "__main__":

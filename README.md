@@ -102,21 +102,27 @@ The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudfl
 Build and verify one private image from a clean published checkout:
 
 ```sh
-tools/build-private-gateway.sh /absolute/new/gateway-release-evidence
+tools/build-private-gateway.sh \
+  --registry-token-file /absolute/owner-only/ghcr-token \
+  --cache-dir /absolute/owner-only/gateway-buildkit-cache \
+  /absolute/new/gateway-release-evidence
 ```
 
-The private image build and deploy scripts are Milk-operator release tools with fixed Milk registry and Cloudflare contracts. Forks can build the Rust binary locally, but custom hosted deployment is not turnkey.
+The cache is optional and affects build speed only; the image remains fixed to `linux/amd64`, and evidence records the cache method without its path or content. Use `--registry-token-stdin` instead of `--registry-token-file` to stream the credential. The scripts do not require GitHub CLI and never place the credential in arguments, logs, or evidence. The private image build and deploy scripts are Milk-operator release tools with fixed Milk registry and Cloudflare contracts. Forks can build the Rust binary locally, but custom hosted deployment is not turnkey.
 
 Bootstrap the first application, or update an existing application, with the same guarded deploy command:
 
 ```sh
-tools/deploy-private-gateway.sh --bootstrap \
+tools/deploy-private-gateway.sh \
+  --registry-token-file /absolute/owner-only/ghcr-token \
+  --bootstrap \
   /absolute/gateway-release-evidence \
   /absolute/new/gateway-deploy-evidence \
   /absolute/gateway-credential.json \
   /absolute/bootstrap-secrets.json
 
 tools/deploy-private-gateway.sh \
+  --registry-token-file /absolute/owner-only/ghcr-token \
   /absolute/gateway-release-evidence \
   <cloudflare-application-id> \
   /absolute/new/gateway-deploy-evidence \

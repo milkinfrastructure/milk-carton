@@ -14,6 +14,8 @@ import unittest
 import urllib.request
 from unittest import mock
 
+import github_registry as GITHUB_REGISTRY
+
 
 ROOT = Path(__file__).resolve().parents[1]
 VERIFY_PATH = ROOT / "tools/verify-private-gateway.py"
@@ -28,6 +30,39 @@ def _json(value):
 
 def _digest(raw):
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+class GitHubRegistryHelperTests(unittest.TestCase):
+    def test_visibility_is_fixed_to_the_milk_organization(self):
+        with mock.patch.object(GITHUB_REGISTRY, "_get_json", return_value=[{
+            "name": "milk-gateway", "visibility": "private",
+        }]) as request:
+            self.assertEqual(
+                GITHUB_REGISTRY.package_visibility(
+                    b"bounded-token", "milkinfrastructure", "milk-gateway"
+                ),
+                "private",
+            )
+        self.assertIn("package_type=container", request.call_args.args[0])
+        with self.assertRaisesRegex(ValueError, "identity"):
+            GITHUB_REGISTRY.package_visibility(
+                b"bounded-token", "another-organization", "milk-gateway"
+            )
+
+    def test_token_file_must_be_owner_only_and_outside_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            repository.mkdir()
+            token = root / "registry-token"
+            token.write_text("bounded-token\n", encoding="ascii")
+            token.chmod(0o600)
+            self.assertEqual(
+                GITHUB_REGISTRY.read_token(token, repository), b"bounded-token"
+            )
+            token.chmod(0o640)
+            with self.assertRaisesRegex(ValueError, "not private"):
+                GITHUB_REGISTRY.read_token(token, repository)
 
 
 class VerifierFixture:
@@ -303,8 +338,6 @@ class VerifierFixture:
         }
 
         def command(*arguments):
-            if arguments[0] == "gh":
-                return (visibility + "\n").encode()
             return references[arguments[-1]]
 
         def blob(_bearer, digest):
@@ -316,7 +349,8 @@ class VerifierFixture:
         with mock.patch.object(VERIFY, "_run", side_effect=command), mock.patch.object(
             VERIFY, "_registry_bearer", return_value="bounded-bearer"
         ), mock.patch.object(VERIFY, "_registry_blob", side_effect=blob):
-            return VERIFY.verify(self.args, "bounded-github-token")
+            with mock.patch.object(VERIFY, "package_visibility", return_value=visibility):
+                return VERIFY.verify(self.args, "bounded-github-token")
 
 
 class PrivateImageVerifierTests(unittest.TestCase):
@@ -459,6 +493,9 @@ class PrivateBuildScriptTests(unittest.TestCase):
         self.buildx_plugin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.buildx_plugin.chmod(0o700)
         self.command_log = self.test_root / "commands.log"
+        self.registry_token = self.test_root / "registry-token"
+        self.registry_token.write_text("ephemeral-test-password\n", encoding="ascii")
+        self.registry_token.chmod(0o600)
         self.revision = "4" * 40
         self.source_context = self.test_root / "source-context.tar"
         with tarfile.open(self.source_context, "w", format=tarfile.USTAR_FORMAT) as archive:
@@ -571,20 +608,17 @@ class PrivateBuildScriptTests(unittest.TestCase):
             ),
         )
         self._write_executable(
-            "gh",
+            "github-registry-mock",
             textwrap.dedent(
                 r"""#!/bin/sh
                 set -eu
-                printf 'gh' >>"$TEST_COMMAND_LOG"
-                for argument do printf '|%s' "$argument" >>"$TEST_COMMAND_LOG"; done
-                printf '\n' >>"$TEST_COMMAND_LOG"
-                case "$*" in
-                  'auth token --hostname github.com') printf '%s\n' 'ephemeral-test-password' ;;
-                  *'/orgs/milkinfrastructure/packages?package_type=container&per_page=100'*)
+                case " $* " in
+                  *' credential '*) printf '%s\n' 'ephemeral-test-password' ;;
+                  *' package-visibility '* )
                     if [ "${TEST_PUBLIC_PACKAGE:-0}" -eq 1 ]; then
-                      printf 'milk-gateway\tpublic\n'
+                      printf 'public\n'
                     else
-                      printf 'milk-gateway\tprivate\n'
+                      printf 'private\n'
                     fi
                     ;;
                   *) exit 91 ;;
@@ -622,8 +656,15 @@ class PrivateBuildScriptTests(unittest.TestCase):
                     ;;
                   'buildx build')
                     metadata=
+                    cache_export=
                     while [ "$#" -gt 0 ]; do
                       if [ "$1" = --metadata-file ]; then metadata=$2; shift 2; continue; fi
+                      if [ "$1" = --cache-to ]; then
+                        cache_export=${2#type=local,dest=}
+                        cache_export=${cache_export%,mode=max}
+                        shift 2
+                        continue
+                      fi
                       shift
                     done
                     [ -n "$metadata" ]
@@ -633,6 +674,10 @@ class PrivateBuildScriptTests(unittest.TestCase):
                     fi
                     printf '{"containerimage.digest":"sha256:%s"}\n' \
                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' >"$metadata"
+                    if [ -n "$cache_export" ]; then
+                      mkdir -p "$cache_export"
+                      printf '%s\n' '{"cache":"updated"}' >"$cache_export/index.json"
+                    fi
                     printf '%s\n' 'contentful fake build output'
                     ;;
                   'buildx rm') ;;
@@ -646,6 +691,10 @@ class PrivateBuildScriptTests(unittest.TestCase):
             textwrap.dedent(
                 r"""#!/bin/sh
                 set -eu
+                if [ "${1:-}" = "$TEST_REPO/tools/github_registry.py" ]; then
+                  shift
+                  exec "$TEST_GITHUB_REGISTRY_MOCK" "$@"
+                fi
                 if [ "${1:-}" = "$TEST_REPO/tools/verify-private-gateway.py" ]; then
                   shift
                   exec "$TEST_REAL_PYTHON" "$TEST_FAKE_VERIFIER" "$@"
@@ -662,6 +711,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
             "PATH": str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
             "TEST_COMMAND_LOG": str(self.command_log),
             "TEST_FAKE_VERIFIER": str(self.fake_verifier),
+            "TEST_GITHUB_REGISTRY_MOCK": str(self.bin / "github-registry-mock"),
             "TEST_REAL_PYTHON": sys.executable,
             "TEST_REPO": str(ROOT),
             "TEST_REVISION": self.revision,
@@ -671,16 +721,62 @@ class PrivateBuildScriptTests(unittest.TestCase):
         environment.update({key: str(value) for key, value in updates.items()})
         return environment
 
-    def _run(self, name, *, environment=None):
+    def _run(self, name, *, environment=None, cache_dir=None, token_stdin=False):
         evidence = self.test_root / name
+        arguments = [str(ROOT / "tools/build-private-gateway.sh")]
+        input_text = None
+        if token_stdin:
+            arguments.append("--registry-token-stdin")
+            input_text = "ephemeral-test-password\n"
+        else:
+            arguments.extend(("--registry-token-file", str(self.registry_token)))
+        if cache_dir is not None:
+            arguments.extend(("--cache-dir", str(cache_dir)))
+        arguments.append(str(evidence))
         result = subprocess.run(
-            [str(ROOT / "tools/build-private-gateway.sh"), str(evidence)],
+            arguments,
             env=environment or self._environment(),
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         return result, evidence
+
+    def test_optional_local_cache_is_path_free_and_keeps_linux_amd64(self):
+        cache = self.test_root / "buildkit-cache"
+        cache.mkdir(mode=0o700)
+        cache.joinpath("index.json").write_text('{"secret":"cache-content"}\n')
+        result, evidence = self._run("cached", cache_dir=cache)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertIn("|--cache-from|type=local,src=" + str(cache.resolve()), commands)
+        self.assertIn("|--cache-to|type=local,dest=", commands)
+        self.assertIn("|--platform|linux/amd64", commands)
+        receipt = json.loads((evidence / "cache.json").read_text())
+        self.assertEqual(receipt, {
+            "enabled": True,
+            "export_mode": "max",
+            "imported": True,
+            "method": "buildkit-local",
+            "schema_version": "milk.local-buildkit-cache.v1",
+        })
+        evidence_raw = b"".join(
+            path.read_bytes() for path in evidence.rglob("*") if path.is_file()
+        )
+        self.assertNotIn(str(cache.resolve()).encode(), evidence_raw)
+        self.assertNotIn(b"cache-content", evidence_raw)
+        self.assertEqual(cache.joinpath("index.json").read_text(), '{"cache":"updated"}\n')
+
+    def test_registry_credential_can_be_streamed_without_argv_or_evidence(self):
+        result, evidence = self._run("stdin-token", token_stdin=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn("ephemeral-test-password", commands)
+        evidence_raw = b"".join(
+            path.read_bytes() for path in evidence.rglob("*") if path.is_file()
+        )
+        self.assertNotIn(b"ephemeral-test-password", evidence_raw)
 
     def test_release_uses_committed_context_fresh_local_builder_and_hash_only_logs(self):
         result, evidence = self._run("success")
@@ -734,7 +830,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
         script.chmod(0o700)
         evidence = self.test_root / "missing-buildx-plugin"
         result = subprocess.run(
-            [str(script), str(evidence)],
+            [str(script), "--registry-token-file", str(self.registry_token), str(evidence)],
             env=self._environment(TEST_REPO=isolated_repo.resolve()),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -797,6 +893,7 @@ class PrivateBuildStaticContractTests(unittest.TestCase):
         self.assertIn("--sbom=true", script)
         self.assertNotIn("tee ", script)
         self.assertNotIn("modal run", script.lower())
+        self.assertNotRegex(script, r"\bgh\b")
 
 
 if __name__ == "__main__":

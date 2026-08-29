@@ -12,6 +12,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from github_registry import package_visibility
+
 
 REPOSITORY = "ghcr.io/milkinfrastructure/milk-gateway"
 SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-gateway"
@@ -603,15 +605,9 @@ def verify(arguments, github_token):
         raise ValueError("SLSA v1 provenance and SPDX SBOM are both required")
     statements.sort(key=lambda item: (item["predicate_type"], item["layer_sha256"]))
 
-    visibility = _run(
-        "gh",
-        "api",
-        "--hostname",
-        "github.com",
-        "/orgs/milkinfrastructure/packages/container/milk-gateway",
-        "--jq",
-        ".visibility",
-    ).decode("utf-8", errors="strict").strip()
+    visibility = package_visibility(
+        github_token.encode("ascii"), "milkinfrastructure", "milk-gateway"
+    )
     if visibility != "private":
         raise ValueError("Milk gateway package is not private")
 

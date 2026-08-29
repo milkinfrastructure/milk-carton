@@ -17,7 +17,36 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is unavailable" 69
 }
 
-[ "$#" -eq 1 ] || fail 'usage: build-private-gateway.sh NEW_EVIDENCE_DIR' 64
+registry_token_file=
+registry_token_stdin=0
+cache_dir=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --registry-token-file)
+      [ "$#" -ge 2 ] || fail 'registry credential file is missing' 64
+      [ "$registry_token_stdin" -eq 0 ] && [ -z "$registry_token_file" ] || \
+        fail 'registry credential input must be selected exactly once' 64
+      registry_token_file=$2
+      shift 2
+      ;;
+    --registry-token-stdin)
+      [ "$registry_token_stdin" -eq 0 ] && [ -z "$registry_token_file" ] || \
+        fail 'registry credential input must be selected exactly once' 64
+      registry_token_stdin=1
+      shift
+      ;;
+    --cache-dir)
+      [ "$#" -ge 2 ] && [ -z "$cache_dir" ] || fail 'cache directory is invalid' 64
+      cache_dir=$2
+      shift 2
+      ;;
+    --) shift; break ;;
+    -*) fail 'unsupported build option' 64 ;;
+    *) break ;;
+  esac
+done
+[ "$#" -eq 1 ] && { [ "$registry_token_stdin" -eq 1 ] || [ -n "$registry_token_file" ]; } || \
+  fail 'usage: build-private-gateway.sh [--cache-dir ABSOLUTE_DIR] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) NEW_EVIDENCE_DIR' 64
 requested_evidence_dir=$1
 case "$requested_evidence_dir" in
   /*) ;;
@@ -29,7 +58,7 @@ evidence_parent=$(dirname -- "$requested_evidence_dir")
 evidence_parent=$(CDPATH= cd -- "$evidence_parent" && pwd -P)
 evidence_dir=$evidence_parent/$(basename -- "$requested_evidence_dir")
 
-for command_name in date docker env gh git grep ln python3 sed tar; do
+for command_name in date docker env git grep ln python3 sed tar; do
   require_command "$command_name"
 done
 
@@ -67,7 +96,6 @@ case "$evidence_dir/" in
 esac
 
 docker=$(command -v docker)
-gh=$(command -v gh)
 python=$(command -v python3)
 context=$("$docker" context show 2>/dev/null) || fail 'cannot resolve the Docker context' 69
 [ -n "$context" ] || fail 'Docker context is empty' 69
@@ -103,6 +131,8 @@ builder_created=0
 scratch=
 docker_config=
 builder=
+cache_parent=
+cache_work=
 
 cleanup() {
   status=$?
@@ -132,6 +162,11 @@ PY
   case "$scratch" in
     "${TMPDIR:-/tmp}"/milk-gateway-release.*) rm -rf -- "$scratch" ;;
   esac
+  if [ -n "$cache_work" ] && [ -n "$cache_parent" ]; then
+    case "$cache_work" in
+      "$cache_parent"/.milk-gateway-cache.*) rm -rf -- "$cache_work" ;;
+    esac
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -141,6 +176,82 @@ trap 'exit 143' TERM
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/milk-gateway-release.XXXXXX") || \
   fail 'cannot create release scratch directory' 73
+registry_token=$scratch/github-registry-token
+if [ "$registry_token_stdin" -eq 1 ]; then
+  "$python" "$repo/tools/github_registry.py" --repository "$repo" --token-stdin credential \
+    >"$registry_token" || fail 'registry credential is invalid' 77
+else
+  "$python" "$repo/tools/github_registry.py" --repository "$repo" \
+    --token-file "$registry_token_file" credential >"$registry_token" || \
+    fail 'registry credential is invalid' 77
+fi
+[ -s "$registry_token" ] || fail 'registry credential is invalid' 77
+
+cache_enabled=false
+cache_imported=false
+if [ -n "$cache_dir" ]; then
+  case "$cache_dir" in
+    /*) ;;
+    *) fail 'cache directory must be absolute' 64 ;;
+  esac
+  cache_validation=$(
+    "$python" - "$cache_dir" "$repo" "$evidence_dir" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+repository = Path(sys.argv[2]).resolve(strict=True)
+evidence = Path(sys.argv[3])
+if path.name in {"", ".", ".."}:
+    raise SystemExit(1)
+parent = path.parent.resolve(strict=True)
+resolved = (parent / path.name).resolve(strict=False)
+if path.is_symlink() or resolved == repository or repository in resolved.parents:
+    raise SystemExit(1)
+if resolved == evidence or evidence in resolved.parents or resolved in evidence.parents:
+    raise SystemExit(1)
+parent_stat = parent.stat()
+if parent_stat.st_uid != os.getuid() or parent_stat.st_mode & 0o077:
+    raise SystemExit(1)
+imported = False
+if path.exists():
+    metadata = path.stat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise SystemExit(1)
+    index = path / "index.json"
+    imported = index.is_file() and not index.is_symlink()
+print(str(resolved))
+print(str(parent))
+print("true" if imported else "false")
+PY
+  ) || fail 'cache directory must be owner-only and outside the checkout and evidence' 64
+  cache_dir=$(printf '%s\n' "$cache_validation" | sed -n '1p')
+  cache_parent=$(printf '%s\n' "$cache_validation" | sed -n '2p')
+  cache_imported=$(printf '%s\n' "$cache_validation" | sed -n '3p')
+  cache_work=$(mktemp -d "$cache_parent/.milk-gateway-cache.XXXXXX") || \
+    fail 'cannot create local BuildKit cache export directory' 73
+  cache_enabled=true
+fi
+"$python" - "$evidence_dir/cache.json" "$cache_enabled" "$cache_imported" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, enabled, imported = sys.argv[1:]
+Path(path).write_text(json.dumps({
+    "schema_version": "milk.local-buildkit-cache.v1",
+    "enabled": enabled == "true",
+    "imported": imported == "true",
+    "method": "buildkit-local" if enabled == "true" else "disabled",
+    "export_mode": "max" if enabled == "true" else None,
+}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
 docker_config=$scratch/docker-config
 mkdir -m 0700 -- "$docker_config" || fail 'cannot create isolated Docker configuration' 73
 mkdir -m 0700 -- "$docker_config/cli-plugins" || \
@@ -195,30 +306,18 @@ Path(path).write_text(json.dumps({
 PY
 
 failure_stage=package-preflight
-packages=$scratch/packages.tsv
-"$gh" api --hostname github.com --paginate \
-  '/orgs/milkinfrastructure/packages?package_type=container&per_page=100' \
-  --jq '.[] | [.name, .visibility] | @tsv' >"$packages" || \
-  fail 'cannot inspect Milk container packages' 77
-"$python" - "$packages" <<'PY' || fail 'an existing milk-gateway package is not private' 77
-import sys
-from pathlib import Path
-
-seen = {}
-for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    fields = line.split("\t")
-    if len(fields) != 2:
-        raise SystemExit(1)
-    name, visibility = fields
-    if name in seen:
-        raise SystemExit(1)
-    seen[name] = visibility
-if "milk-gateway" in seen and seen["milk-gateway"] != "private":
-    raise SystemExit(1)
-PY
+package_visibility=$(
+  "$python" "$repo/tools/github_registry.py" --repository "$repo" \
+    --token-file "$registry_token" package-visibility milkinfrastructure milk-gateway
+) || fail 'cannot inspect Milk container package' 77
+case "$package_visibility" in
+  absent|private) ;;
+  *) fail 'an existing milk-gateway package is not private' 77 ;;
+esac
 
 failure_stage=registry-login
-if ! "$gh" auth token --hostname github.com | \
+if ! "$python" "$repo/tools/github_registry.py" --repository "$repo" \
+  --token-file "$registry_token" credential | \
   "$docker" --config "$docker_config" login ghcr.io \
     --username ShantanuJoshi --password-stdin >/dev/null; then
   fail 'private GHCR login failed' 77
@@ -274,7 +373,7 @@ build_log=$scratch/build.log
 build_started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 failure_stage=build
 set +e
-"$docker" --config "$docker_config" buildx build \
+set -- "$docker" --config "$docker_config" buildx build \
   --builder "$builder" \
   --platform linux/amd64 \
   --file "$dockerfile" \
@@ -289,8 +388,15 @@ set +e
   --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
   --metadata-file "$metadata" \
   --tag "$tagged" \
-  --push \
-  "$build_context" >"$build_log" 2>&1
+  --push
+if [ "$cache_enabled" = true ]; then
+  if [ "$cache_imported" = true ]; then
+    set -- "$@" --cache-from "type=local,src=$cache_dir"
+  fi
+  set -- "$@" --cache-to "type=local,dest=$cache_work/export,mode=max"
+fi
+set -- "$@" "$build_context"
+"$@" >"$build_log" 2>&1
 build_status=$?
 set -e
 build_completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -334,10 +440,23 @@ Path(target).write_text(json.dumps({
 }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
 [ "$build_status" -eq 0 ] || fail 'gateway image build failed' 70
+if [ "$cache_enabled" = true ]; then
+  [ -f "$cache_work/export/index.json" ] || fail 'BuildKit cache export is incomplete' 70
+  prior_cache=$cache_work/prior
+  if [ -e "$cache_dir" ]; then
+    mv -- "$cache_dir" "$prior_cache" || fail 'cannot rotate the local BuildKit cache' 73
+  fi
+  if ! mv -- "$cache_work/export" "$cache_dir"; then
+    [ ! -e "$prior_cache" ] || mv -- "$prior_cache" "$cache_dir" || :
+    fail 'cannot publish the local BuildKit cache' 73
+  fi
+  [ ! -e "$prior_cache" ] || rm -rf -- "$prior_cache"
+fi
 
 failure_stage=verify
 verification=$(
-  "$gh" auth token --hostname github.com | \
+  "$python" "$repo/tools/github_registry.py" --repository "$repo" \
+    --token-file "$registry_token" credential | \
     "$python" "$repo/tools/verify-private-gateway.py" \
       --tagged-reference "$tagged" \
       --source-commit "$commit" \
