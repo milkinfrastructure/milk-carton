@@ -21,6 +21,8 @@ The public contract is deliberately narrow:
 - The customer supplies one OpenAI-compatible endpoint and one `dt_live_...` key. The official SDK sends it through the standard `Authorization: Bearer` header and receives the normal response.
 - The hosted operator owns the gateway and eval configuration, separately credentialed R2 stores, upstream and GPU-provider credentials, capture policy, and route policy. Self-hosters provide equivalent storage and secrets themselves.
 
+During the single-tenant pilot, Milk issues, rotates, and revokes `dt_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `dragontales-gateway`, `DRAGONTALES_*`, and `dt_live_...` remain the stable binary, environment, and wire identifiers.
+
 The gateway records only completed traffic admitted by the operator's capture policy. It loads one strict startup configuration, reports its SHA-256, and polls signed, revisioned route state while retaining the last verified route after a failed refresh.
 
 Milk Gateway is MIT-licensed. The hosted cloud proof has not run, so there is no production-qualified hosted release or live customer endpoint yet.
@@ -96,6 +98,31 @@ target/release/dragontales-gateway --config "$PWD/dragontales.json" status
 ## Production deployment
 
 The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudflare Worker and Container. A non-bootstrap deployment uploads code and the reviewed `DRAGONTALES_CONFIG_JSON` in one atomic, versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update restores the prior Worker version and config binding together, then verifies that live health reports the exact pre-deploy config digest.
+
+Build and verify one private image from a clean published checkout:
+
+```sh
+tools/build-private-gateway.sh /absolute/new/gateway-release-evidence
+```
+
+Bootstrap the first application, or update an existing application, with the same guarded deploy command:
+
+```sh
+tools/deploy-private-gateway.sh --bootstrap \
+  /absolute/gateway-release-evidence \
+  /absolute/new/gateway-deploy-evidence \
+  /absolute/gateway-credential.json \
+  /absolute/bootstrap-secrets.json
+
+tools/deploy-private-gateway.sh \
+  /absolute/gateway-release-evidence \
+  <cloudflare-application-id> \
+  /absolute/new/gateway-deploy-evidence \
+  /absolute/gateway-credential.json \
+  /absolute/gateway-config.json
+```
+
+The [`milk-harness` production runbook](https://github.com/milkinfrastructure/milk-harness/blob/main/docs/reference/production-runbook.md) continues from this deployment through eval admission, five-minute reconciliation, one-use paid dispatches, signed zero, and verified zero compute.
 
 The release contract keeps the gateway image CPU-only, with no shell, package manager, Python, Node, GPU runtime, model weights, or local GPU dependency.
 
