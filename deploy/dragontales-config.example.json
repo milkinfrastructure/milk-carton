@@ -3,6 +3,7 @@
   "traffic_keys": [
     {
       "api_key_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "capture_allowed": true,
       "cohort_id": "production-cohort-v1"
     }
   ],
@@ -33,7 +34,6 @@
   "outcome_verifier_id": "customer-correction-v1",
   "outcome_rights_state": "contract-reviewed-v1",
   "outcome_retention_days": 30,
-  "allow_student_fixture": false,
   "stores": {
     "capture": {
       "type": "local",

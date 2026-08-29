@@ -40,6 +40,8 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 TAG = re.compile(r"[a-z0-9_][a-z0-9._-]{0,127}")
 REPOSITORY = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")
+COHORT_ID = re.compile(r"[A-Za-z0-9._~-]{1,128}")
+MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:~-]{0,255}")
 POLL_ATTEMPTS = 20
 POLL_INTERVAL_SECONDS = 15
 MAX_JSON = 1024 * 1024
@@ -559,6 +561,47 @@ def parse_secret_names(raw):
     return set(names)
 
 
+def parse_gateway_config(raw):
+    config = parse_json(raw, "gateway config", 65536)
+    traffic_keys = config.get("traffic_keys") if isinstance(config, dict) else None
+    if (
+        raw != canonical_json(config)
+        or not isinstance(traffic_keys, list)
+        or not 1 <= len(traffic_keys) <= 64
+    ):
+        raise DeployFailure("gateway config is invalid")
+    hashes = set()
+    for traffic_key in traffic_keys:
+        if (
+            not isinstance(traffic_key, dict)
+            or set(traffic_key) != {"api_key_sha256", "capture_allowed", "cohort_id"}
+            or not isinstance(traffic_key["api_key_sha256"], str)
+            or SHA256.fullmatch(traffic_key["api_key_sha256"]) is None
+            or not isinstance(traffic_key["capture_allowed"], bool)
+            or not isinstance(traffic_key["cohort_id"], str)
+            or COHORT_ID.fullmatch(traffic_key["cohort_id"]) is None
+            or traffic_key["api_key_sha256"] in hashes
+        ):
+            raise DeployFailure("gateway traffic keys are invalid")
+        hashes.add(traffic_key["api_key_sha256"])
+    return config
+
+
+def validate_gateway_config_file(path, repository):
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise DeployFailure("gateway config must be an absolute regular file")
+    metadata = path.stat()
+    if (
+        metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o777 != 0o600
+        or not 1 <= metadata.st_size <= 65536
+        or within(path.resolve(strict=True), repository)
+    ):
+        raise DeployFailure("gateway config file must be owner-only mode 0600 outside the checkout")
+    return parse_gateway_config(read_regular(path, "gateway config", 65536))
+
+
 def validate_bootstrap_secrets(path, repository):
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise DeployFailure("bootstrap secrets must be an absolute regular file")
@@ -586,7 +629,47 @@ def validate_bootstrap_secrets(path, repository):
         or raw != canonical_json(value)
     ):
         raise DeployFailure("bootstrap secrets file is invalid")
-    return canonical_json(secrets_value)
+    gateway_config_raw = secrets_value["DRAGONTALES_CONFIG_JSON"].encode("utf-8")
+    gateway_config = parse_gateway_config(gateway_config_raw)
+    return canonical_json(secrets_value), gateway_config
+
+
+def validate_smoke_credential(path, gateway_config):
+    raw = read_regular(path, "gateway credential", 8192)
+    credential = parse_json(raw, "gateway credential", 8192)
+    require_keys(credential, {"api_key", "cohort_id", "model"}, "gateway credential")
+    api_key = credential["api_key"]
+    value = api_key.removeprefix("dt_live_") if isinstance(api_key, str) else ""
+    key_id, separator, secret = value.partition("_")
+    if (
+        raw != canonical_json(credential)
+        or not separator
+        or UUID.fullmatch(key_id) is None
+        or key_id == "00000000-0000-0000-0000-000000000000"
+        or not 16 <= len(secret) <= 256
+        or any(
+            not (byte.isascii() and (byte.isalnum() or byte in "-_.~"))
+            for byte in secret
+        )
+        or not isinstance(credential["cohort_id"], str)
+        or COHORT_ID.fullmatch(credential["cohort_id"]) is None
+        or not isinstance(credential["model"], str)
+        or MODEL.fullmatch(credential["model"]) is None
+    ):
+        raise DeployFailure("gateway credential is invalid")
+    api_key_sha256 = digest(api_key.encode())
+    matches = [
+        traffic_key
+        for traffic_key in gateway_config["traffic_keys"]
+        if traffic_key == {
+            "api_key_sha256": api_key_sha256,
+            "capture_allowed": False,
+            "cohort_id": credential["cohort_id"],
+        }
+    ]
+    if len(matches) != 1:
+        raise DeployFailure("gateway smoke credential is not an exact non-capturable traffic key")
+    return api_key_sha256, digest(credential["cohort_id"].encode())
 
 
 def split_cloudflare_image(image, account_id):
@@ -648,9 +731,9 @@ def make_deploy_config(base, path, image, entrypoint):
 
 def main():
     bootstrap = len(sys.argv) == 7 and sys.argv[2] == "--bootstrap"
-    if not bootstrap and len(sys.argv) != 6:
+    if not bootstrap and len(sys.argv) != 7:
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE\n"
+            "usage: deploy-private-gateway.sh RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE\n"
             "       deploy-private-gateway.sh --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE"
         )
     script = Path(sys.argv[1]).resolve(strict=True)
@@ -660,12 +743,15 @@ def main():
         application_id = None
         requested_evidence = Path(sys.argv[4])
         credential_file = Path(sys.argv[5])
-        bootstrap_secret_input = validate_bootstrap_secrets(Path(sys.argv[6]), repository)
+        bootstrap_secret_input, gateway_config = validate_bootstrap_secrets(
+            Path(sys.argv[6]), repository,
+        )
     else:
         release_directory = Path(sys.argv[2]).resolve(strict=True)
         application_id = sys.argv[3]
         requested_evidence = Path(sys.argv[4])
         credential_file = Path(sys.argv[5])
+        gateway_config = validate_gateway_config_file(Path(sys.argv[6]), repository)
         bootstrap_secret_input = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
         raise DeployFailure("deploy evidence directory must be a new absolute path")
@@ -686,6 +772,9 @@ def main():
         or within(credential_file.resolve(strict=True), repository)
     ):
         raise DeployFailure("gateway credential file is not private")
+    smoke_key_sha256, smoke_cohort_sha256 = validate_smoke_credential(
+        credential_file, gateway_config,
+    )
 
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}
     forbidden = re.compile(
@@ -1306,6 +1395,7 @@ def main():
             "authenticated", "choice_count", "content_retained", "endpoint_sha256",
             "finish_reason", "http_status", "request_sha256", "response_bytes",
             "response_sha256", "schema_version", "sdk", "sdk_version", "succeeded",
+            "traffic_cohort_sha256", "traffic_key_sha256",
         }, "official OpenAI SDK smoke")
         if (
             sdk_result.stdout != canonical_json(sdk_smoke)
@@ -1321,8 +1411,11 @@ def main():
             or isinstance(sdk_smoke["response_bytes"], bool)
             or not 1 <= sdk_smoke["response_bytes"] <= 65536
             or any(SHA256.fullmatch(sdk_smoke[key] or "") is None for key in (
-                "endpoint_sha256", "request_sha256", "response_sha256"
+                "endpoint_sha256", "request_sha256", "response_sha256",
+                "traffic_cohort_sha256", "traffic_key_sha256",
             ))
+            or sdk_smoke["traffic_key_sha256"] != smoke_key_sha256
+            or sdk_smoke["traffic_cohort_sha256"] != smoke_cohort_sha256
             or not isinstance(sdk_smoke["finish_reason"], (str, type(None)))
         ):
             raise ContractFailure("official OpenAI SDK smoke receipt is invalid")

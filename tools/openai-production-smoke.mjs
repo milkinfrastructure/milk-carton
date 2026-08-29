@@ -50,15 +50,15 @@ async function privateCredential(path, route) {
     Object.keys(value).sort(),
     route
       ? ["api_key", "cohort_id", "model", "reasoning_effort"]
-      : ["api_key", "model"],
+      : ["api_key", "cohort_id", "model"],
   );
   assert.match(
     value.api_key,
     /^dt_live_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[A-Za-z0-9._~-]{16,256}$/,
   );
   assert.match(value.model, /^[A-Za-z0-9][A-Za-z0-9._/:~-]{0,255}$/);
+  assert.match(value.cohort_id, /^[A-Za-z0-9._~-]{1,128}$/);
   if (route) {
-    assert.match(value.cohort_id, /^[A-Za-z0-9._~-]{1,128}$/);
     assert.ok(
       value.reasoning_effort === null ||
         ["low", "medium", "high", "max"].includes(value.reasoning_effort),
@@ -71,6 +71,23 @@ export function candidateRequest(credential) {
   const request = {
     messages: [{ role: "user", content: "Reply with only OK." }],
     model: credential.model,
+  };
+  if (credential.reasoning_effort !== null) {
+    request.reasoning_effort = credential.reasoning_effort;
+  }
+  return request;
+}
+
+export function saturationRequest(credential) {
+  const request = {
+    messages: [
+      {
+        role: "user",
+        content: "Write OK on 4096 separate lines. Do not summarize or stop early.",
+      },
+    ],
+    model: credential.model,
+    stream: true,
   };
   if (credential.reasoning_effort !== null) {
     request.reasoning_effort = credential.reasoning_effort;
@@ -104,6 +121,8 @@ export async function runBaselineSmoke(client, endpoint, credential) {
     sdk: "openai-node",
     sdk_version: SDK_VERSION,
     succeeded: true,
+    traffic_cohort_sha256: sha256(credential.cohort_id),
+    traffic_key_sha256: sha256(credential.api_key),
   };
 }
 
@@ -149,9 +168,82 @@ export async function runCandidateSmoke(client, endpoint, credential, expectedRo
   };
 }
 
+export async function runSaturationFallbackSmoke(
+  client,
+  endpoint,
+  credential,
+  expectedRouteRevision,
+) {
+  assert.match(expectedRouteRevision, SHA256);
+  const request = saturationRequest(credential);
+  let candidate;
+  let fallback;
+  try {
+    candidate = await client.chat.completions.create(request).withResponse();
+    assert.equal(candidate.response.status, 200);
+    assert.equal(
+      candidate.response.headers.get("x-dragontales-route-revision"),
+      expectedRouteRevision,
+    );
+    assert.equal(candidate.response.headers.get("x-dragontales-route-target"), "candidate");
+    const candidateSha256 = candidate.response.headers.get(
+      "x-dragontales-candidate-sha256",
+    );
+    const artifactSha256 = candidate.response.headers.get(
+      "x-dragontales-artifact-sha256",
+    );
+    const deploymentSha256 = candidate.response.headers.get(
+      "x-dragontales-deployment-sha256",
+    );
+    assert.match(candidateSha256 ?? "", SHA256);
+    assert.match(artifactSha256 ?? "", SHA256);
+    assert.match(deploymentSha256 ?? "", SHA256);
+    assert.equal(typeof candidate.data?.controller?.abort, "function");
+
+    fallback = await client.chat.completions.create(request).withResponse();
+    assert.equal(fallback.response.status, 200);
+    assert.equal(
+      fallback.response.headers.get("x-dragontales-route-revision"),
+      expectedRouteRevision,
+    );
+    assert.equal(fallback.response.headers.get("x-dragontales-route-target"), "openai");
+    assert.equal(typeof fallback.data?.controller?.abort, "function");
+
+    return {
+      artifact_sha256: artifactSha256,
+      authenticated: true,
+      candidate_http_status: candidate.response.status,
+      candidate_route_target: "candidate",
+      candidate_sha256: candidateSha256,
+      content_retained: false,
+      deployment_sha256: deploymentSha256,
+      endpoint_sha256: sha256(endpoint.href),
+      fallback_http_status: fallback.response.status,
+      fallback_route_target: "openai",
+      request_sha256: sha256(canonical(request)),
+      route_revision: expectedRouteRevision,
+      schema_version: "milk.official-openai-sdk-saturation-fallback-smoke.v1",
+      sdk: "openai-node",
+      sdk_version: SDK_VERSION,
+      succeeded: true,
+      traffic_cohort_sha256: sha256(credential.cohort_id),
+      traffic_key_sha256: sha256(credential.api_key),
+    };
+  } finally {
+    fallback?.data?.controller?.abort();
+    candidate?.data?.controller?.abort();
+  }
+}
+
 async function main() {
-  assert.ok(process.argv.length === 4 || process.argv.length === 5);
-  const route = process.argv.length === 5;
+  assert.ok(
+    process.argv.length === 4 ||
+      process.argv.length === 5 ||
+      process.argv.length === 6,
+  );
+  const saturationFallback = process.argv.length === 6;
+  if (saturationFallback) assert.equal(process.argv[5], "--saturation-fallback");
+  const route = process.argv.length >= 5;
   const endpoint = new URL(process.argv[2]);
   assert.equal(endpoint.protocol, "https:");
   assert.equal(endpoint.hostname, "api.dragontales.milkinfrastructure.com");
@@ -172,9 +264,11 @@ async function main() {
     maxRetries: 0,
     timeout: 15_000,
   });
-  const receipt = route
-    ? await runCandidateSmoke(client, endpoint, credential, process.argv[4])
-    : await runBaselineSmoke(client, endpoint, credential);
+  const receipt = saturationFallback
+    ? await runSaturationFallbackSmoke(client, endpoint, credential, process.argv[4])
+    : route
+      ? await runCandidateSmoke(client, endpoint, credential, process.argv[4])
+      : await runBaselineSmoke(client, endpoint, credential);
   process.stdout.write(`${canonical(receipt)}\n`);
 }
 

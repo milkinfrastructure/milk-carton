@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,7 +35,7 @@ jobs:
         run: |
           cargo +1.95.0 fetch --locked
           cargo +1.95.0 fmt --all -- --check
-          cargo +1.95.0 test --locked --offline --workspace
+          cargo +1.95.0 test --locked --offline --workspace --all-targets
           cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 
       - id: contracts

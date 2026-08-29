@@ -25,6 +25,7 @@ CANDIDATE_SHA = hashlib.sha256(CANDIDATE_KEY.encode()).hexdigest()
 CLOUDFLARE_TOKEN = "D" * 40
 MODAL_ADMISSION_SHA = "4" * 64
 MODAL_RESULT_SHA = "3" * 64
+MODAL_RESULT_OBJECT_SHA = "8" * 64
 MODAL_SERVICE_NOT_AFTER = "2030-08-27T20:00:00Z"
 GATEWAY_ANCHOR = {
     "source_commit": "c" * 40,
@@ -182,7 +183,7 @@ def modal_remove_request(installed_ack, trigger=None):
         "student_job_id": "1" * 64,
         "claim_sha256": "2" * 64,
         "winner_result_object_key": "control/winner-result.json",
-        "winner_result_sha256": MODAL_RESULT_SHA,
+        "winner_result_sha256": MODAL_RESULT_OBJECT_SHA,
         "provider_acceptance_sha256": "4" * 64,
         "run_id": "b" * 64,
         "selected_provider": "modal",
@@ -198,7 +199,6 @@ def modal_remove_request(installed_ack, trigger=None):
         ).hexdigest(),
         gateway_release_id=installed_ack["gateway_release_id"],
         gateway_release_sha256=installed_ack["gateway_release_sha256"],
-        trigger=trigger,
     )
 
 

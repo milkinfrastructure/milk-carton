@@ -26,6 +26,8 @@ The gateway recomputes the provider-neutral winner run ID from the canonical cla
 
 Winner admission keeps its GPU launch pointer active. A signed zero publication creates a `dragontales.provider-teardown-authorization.v1` and bounded control frontier containing the exact canary and zero receipts; service expiry creates the same authority without a route receipt. Jobs reads that authority, proves provider zero, archives private logs, and settles the shared budget. Until verified provider billing is part of the contract, settlement must account for the full accepted reservation. A gateway-owned ingest command accepts only the exact evidence-addressed result and then removes both active pointers. Provider credentials never enter the gateway, and jobs never receives control- or route-write access.
 
+For a Modal fallback winner, `prepare-modal-candidate-credential` derives the canonical install, verification, or removal request from the verified winner and current gateway anchor. `ingest-modal-candidate-credential-ack` accepts the helper's canonical acknowledgement and stores it create-only under the winner job. Existing requests without an acknowledgement recover through verification instead of replaying installation. Provider teardown is rejected until the exact `absent` acknowledgement is current in the scope lineage; that release ID becomes the next install anchor. Baseten winners return `ready` without creating Modal state. Neither command accepts a provider credential or makes a provider call.
+
 ## Local start
 
 Build with the pinned Rust toolchain:
@@ -34,7 +36,7 @@ Build with the pinned Rust toolchain:
 cargo +1.95.0 build --locked --release --package dragontales-gateway
 ```
 
-Copy `deploy/dragontales-config.example.json`, replace the traffic and outcome key hashes, choose a stable non-secret traffic cohort ID, and set three distinct private Local roots. `traffic_keys` contains 1 to 64 strict `{api_key_sha256, cohort_id}` mappings. Generate one request key without printing it:
+Copy `deploy/dragontales-config.example.json`, replace the traffic and outcome key hashes, choose a stable non-secret traffic cohort ID, and set three distinct private Local roots. `traffic_keys` contains 1 to 64 strict `{api_key_sha256, capture_allowed, cohort_id}` mappings. Set `capture_allowed: true` only for genuine user traffic with capture rights; production smoke and synthetic test keys must use `false`. Generate one request key without printing it:
 
 ```sh
 install -d -m 0700 "$PWD/.dragontales-secrets"
@@ -75,7 +77,7 @@ The explicit first production target is 99.5% monthly gateway-owned request avai
 
 A release is not production-qualified until a staging run forces that one instance to restart, observes exactly one replacement instance on the admitted image, and the authenticated official OpenAI Node SDK smoke succeeds within five minutes. The deploy acceptance always runs that bounded SDK smoke and automatically rolls back on failure. The controlled restart itself remains a manual release gate until repeated evidence demonstrates a need for automated failover.
 
-The deploy command requires a new private evidence directory and an absolute owner-only credential file containing canonical one-line JSON plus LF: `{"api_key":"dt_live_...","model":"..."}`. It retains only content-free hashes and immutable private ops-log references; prompt, response, and credential bytes are never written to evidence.
+The deploy command requires a new private evidence directory and an absolute owner-only credential file containing canonical one-line JSON plus LF: `{"api_key":"dt_live_...","cohort_id":"deployment-smoke-v1","model":"..."}`. Before any provider mutation, the key hash and cohort must identify exactly one `capture_allowed:false` traffic-key entry. Bootstrap proves this against the exact canonical config installed from `DRAGONTALES_CONFIG_JSON`; a later regular deploy proves it only against the reviewed canonical config file supplied to that command and does not claim Cloudflare secret-value equality. It retains only content-free hashes and immutable private ops-log references; prompt, response, and credential bytes are never written to evidence.
 
 Run offline checks:
 

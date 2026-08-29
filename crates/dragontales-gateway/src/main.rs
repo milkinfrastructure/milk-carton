@@ -30,16 +30,18 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use records::{
-    CAPTURE_SAMPLER_ID, CaptureState, EnqueueResult, MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
+    CAPTURE_SAMPLER_ID, CaptureState, EnqueueResult, MAX_MODAL_CANDIDATE_ACK_BYTES,
+    MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES, MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
     MAX_STUDENT_ARTIFACT_BYTES, MAX_STUDENT_ARTIFACT_FILES, MAX_STUDENT_RESULT_BYTES,
-    MAX_STUDENT_UPLOAD_BYTES, MAX_WINNER_DEPLOYMENT_RESULT_BYTES, OutcomeDisposition, OutcomeKind,
+    MAX_STUDENT_UPLOAD_BYTES, MAX_WINNER_DEPLOYMENT_RESULT_BYTES, ModalCandidateCredentialAck,
+    ModalCandidateCredentialAction, ModalGatewayAnchor, OutcomeDisposition, OutcomeKind,
     OutcomeSubmission, OutcomeValue, PartitionedObjectStore, ProviderTeardownResult, Records,
     RouteFallbackReason, RouteObservation, Scope, SnapshotAnalysisAuthorization,
     SnapshotAnalyzerConfig, SnapshotAnalyzerExecution, SnapshotAnalyzerReasoningEffort,
     StoreAccess, StorePartition, StudentArtifactInput, StudentArtifactSource,
     StudentBranchMaterialization, StudentBranchResult, StudentTrainResult, StudentUpload,
     StudentVariant, StudentWinnerDeploymentResult, TICK_LEASE_TTL_SECONDS, TeacherGpuTickWrite,
-    TraceCapture, TraceCatalog, current_effective_uid, is_not_found,
+    TraceCapture, TraceCatalog, WinnerProvider, current_effective_uid, is_not_found,
 };
 use route::{
     CandidateReasoningEffort, CandidateRoute, ED25519_SIGNATURE_BYTES, MAX_ROUTE_MANIFEST_BYTES,
@@ -170,6 +172,22 @@ enum Command {
         result: PathBuf,
     },
     #[command(hide = true)]
+    PrepareModalCandidateCredential {
+        #[arg(long)]
+        student_job_id: String,
+        #[arg(long)]
+        gateway_anchor: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    #[command(hide = true)]
+    IngestModalCandidateCredentialAck {
+        #[arg(long)]
+        student_job_id: String,
+        #[arg(long)]
+        acknowledgement: PathBuf,
+    },
+    #[command(hide = true)]
     AdvanceWinnerRoute {
         #[arg(long)]
         student_job_id: String,
@@ -236,7 +254,6 @@ struct FileConfig {
     outcome_verifier_id: String,
     outcome_rights_state: String,
     outcome_retention_days: i64,
-    allow_student_fixture: bool,
     stores: StoresConfig,
     baseline: OpenAiCompatibleEndpoint,
     teacher: Option<TeacherConfig>,
@@ -247,6 +264,7 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct TrafficKeyConfig {
     api_key_sha256: String,
+    capture_allowed: bool,
     cohort_id: String,
 }
 
@@ -329,6 +347,12 @@ impl StoreAccessPlan {
                     .then_some(ReadOnly),
                 ..Self::default()
             },
+            Command::PrepareModalCandidateCredential { .. }
+            | Command::IngestModalCandidateCredentialAck { .. } => Self {
+                control: Some(ReadWrite),
+                routes: Some(ReadOnly),
+                ..Self::default()
+            },
             Command::AdvanceWinnerRoute { .. } | Command::PrepareRoute { .. } => Self {
                 control: Some(ReadOnly),
                 routes: Some(ReadOnly),
@@ -397,7 +421,7 @@ struct Gateway {
     upstream: Url,
     route_runtime: Arc<RwLock<Arc<RouteRuntime>>>,
     candidate_api_key_sha256: Option<[u8; 32]>,
-    traffic_keys: Arc<[(TrafficKey, String)]>,
+    traffic_keys: Arc<[TrafficKey]>,
     outcome_key_id: Uuid,
     outcome_key_sha256: [u8; 32],
     scope: Scope,
@@ -416,7 +440,11 @@ struct Gateway {
 }
 
 #[derive(Clone)]
-struct TrafficKey([u8; 32]);
+struct TrafficKey {
+    api_key_sha256: [u8; 32],
+    capture_allowed: bool,
+    cohort_id: String,
+}
 
 #[derive(Clone)]
 struct CandidateTransport {
@@ -557,7 +585,7 @@ impl Gateway {
         let outcome_key_sha256 = decode_sha256(&config.outcome_key_sha256)?;
         if traffic_keys
             .iter()
-            .any(|(key, _)| key.0 == outcome_key_sha256)
+            .any(|key| key.api_key_sha256 == outcome_key_sha256)
         {
             bail!("traffic and outcome keys must differ");
         }
@@ -734,6 +762,14 @@ struct WinnerRouteAdvanceWrite {
     action: WinnerRouteAdvanceAction,
     route_revision: String,
     not_after: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct ModalCandidateCredentialPreparationWrite {
+    schema_version: &'static str,
+    selected_provider: WinnerProvider,
+    action: ModalCandidateCredentialAction,
+    request_sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1147,7 +1183,6 @@ async fn main() -> Result<()> {
                     result,
                     upload,
                     &mut artifacts,
-                    config.allow_student_fixture,
                 )
                 .await?;
             println!("{}", serde_json::to_string(&receipt)?);
@@ -1217,7 +1252,6 @@ async fn main() -> Result<()> {
                     result,
                     upload,
                     &mut artifacts,
-                    config.allow_student_fixture,
                 )
                 .await?;
             println!("{}", serde_json::to_string(&receipt)?);
@@ -1263,6 +1297,93 @@ async fn main() -> Result<()> {
             .context("storage initialization timed out")??;
             let receipt = records
                 .ingest_provider_teardown_result(&config_scope(&config), result, Utc::now())
+                .await?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
+        }
+        Command::PrepareModalCandidateCredential {
+            student_job_id,
+            gateway_anchor,
+            request,
+        } => {
+            let student_job_id = decode_lowercase_sha256(&student_job_id)?;
+            let mut anchor_input = OperatorInput::open_private(
+                &gateway_anchor,
+                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
+                "Modal gateway anchor",
+            )?;
+            let gateway_anchor = ModalGatewayAnchor::parse(anchor_input.initial())?;
+            if ModalGatewayAnchor::parse(&anchor_input.reread_unchanged()?)? != gateway_anchor {
+                bail!("Modal gateway anchor changed after validation");
+            }
+            let records = tokio::time::timeout(
+                Duration::from_millis(config.storage_timeout_ms),
+                start_records(&config, store_access),
+            )
+            .await
+            .context("storage initialization timed out")??;
+            let prepared = records
+                .prepare_modal_candidate_credential(
+                    &config_scope(&config),
+                    &student_job_id,
+                    gateway_anchor,
+                )
+                .await?;
+            let request_sha256 = if let Some(bytes) = prepared.request.as_deref() {
+                write_private_output(&request, bytes, "Modal candidate credential request")?;
+                Some(bytes_hex(&Sha256::digest(bytes)))
+            } else {
+                if !request.is_absolute() {
+                    bail!("Modal candidate credential request path must be absolute");
+                }
+                match fs::symlink_metadata(&request) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => bail!("Modal candidate credential no-op left a stale request path"),
+                }
+                None
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&ModalCandidateCredentialPreparationWrite {
+                    schema_version: "dragontales.modal-candidate-credential-preparation.v1",
+                    selected_provider: prepared.selected_provider,
+                    action: prepared.action,
+                    request_sha256,
+                })?
+            );
+            Ok(())
+        }
+        Command::IngestModalCandidateCredentialAck {
+            student_job_id,
+            acknowledgement,
+        } => {
+            let student_job_id = decode_lowercase_sha256(&student_job_id)?;
+            let mut acknowledgement_input = OperatorInput::open_private(
+                &acknowledgement,
+                MAX_MODAL_CANDIDATE_ACK_BYTES,
+                "Modal candidate credential acknowledgement",
+            )?;
+            let acknowledgement =
+                ModalCandidateCredentialAck::parse(acknowledgement_input.initial())?;
+            let acknowledgement_payload = acknowledgement_input.reread_unchanged()?;
+            if ModalCandidateCredentialAck::parse(&acknowledgement_payload)? != acknowledgement {
+                bail!("Modal candidate credential acknowledgement changed after validation");
+            }
+            let records = tokio::time::timeout(
+                Duration::from_millis(config.storage_timeout_ms),
+                start_records(&config, store_access),
+            )
+            .await
+            .context("storage initialization timed out")??;
+            let receipt = records
+                .ingest_modal_candidate_credential_ack(
+                    &config_scope(&config),
+                    &student_job_id,
+                    acknowledgement,
+                    &acknowledgement_payload,
+                    Utc::now(),
+                )
                 .await?;
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
@@ -1989,13 +2110,6 @@ fn validate_config_identity(config: &FileConfig) -> Result<()> {
     {
         bail!("capture, control, and route stores must have distinct identities");
     }
-    if config.allow_student_fixture
-        && (!all_local_stores(&config.stores)
-            || !config.listen.ip().is_loopback()
-            || config.route.is_some())
-    {
-        bail!("student fixture mode requires local storage, loopback listen, and no route");
-    }
     Ok(())
 }
 
@@ -2020,6 +2134,8 @@ fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -
         | Command::IngestStudentWinnerDeploymentResult { .. }
         | Command::IngestProviderTeardownResult { .. }
         | Command::AdvanceWinnerRoute { .. }
+        | Command::PrepareModalCandidateCredential { .. }
+        | Command::IngestModalCandidateCredentialAck { .. }
         | Command::PrepareRoute { .. }
         | Command::PublishRoute { .. } => {}
     }
@@ -2994,7 +3110,8 @@ async fn chat(
     gateway: web::Data<Gateway>,
 ) -> HttpResponse {
     let trace_id = Uuid::now_v7();
-    let Some(cohort_id) = authenticate_traffic_key(request.headers(), &gateway.traffic_keys) else {
+    let Some(traffic_key) = authenticate_traffic_key(request.headers(), &gateway.traffic_keys)
+    else {
         return local_error(
             StatusCode::UNAUTHORIZED,
             trace_id,
@@ -3060,7 +3177,7 @@ async fn chat(
             has_content_encoding: request.headers().contains_key(header::CONTENT_ENCODING),
             has_openai_beta: request.headers().contains_key("openai-beta"),
             query: request.query_string(),
-            routing_cohort: cohort_id.as_bytes(),
+            routing_cohort: traffic_key.cohort_id.as_bytes(),
         },
         Instant::now(),
     );
@@ -3102,8 +3219,12 @@ async fn chat(
         if gateway.records.is_some() {
             let request_content_type = header_text(request.headers(), header::CONTENT_TYPE);
             let request_content_encoding = header_text(request.headers(), header::CONTENT_ENCODING);
-            let capture_eligible =
-                capture_eligible(&gateway, request_content_type.as_deref(), request.headers());
+            let capture_eligible = capture_eligible(
+                &gateway,
+                traffic_key.capture_allowed,
+                request_content_type.as_deref(),
+                request.headers(),
+            );
             let selected =
                 capture_eligible && capture_selected(trace_id, gateway.capture.basis_points);
             let request_capture = selected.then(|| body.clone());
@@ -3330,12 +3451,14 @@ async fn chat(
 
 fn capture_eligible(
     gateway: &Gateway,
+    capture_allowed: bool,
     content_type: Option<&str>,
     request_headers: &HeaderMap,
 ) -> bool {
     let (content_encoding, multiple_content_encodings) =
         one_header(request_headers, header::CONTENT_ENCODING.as_str());
     gateway.records.is_some()
+        && capture_allowed
         && gateway.capture.mode == CaptureMode::WholeBodyAuthorized
         && gateway.capture.basis_points > 0
         && is_json_content_type(content_type)
@@ -3455,23 +3578,23 @@ fn valid_outcome_key(headers: &HeaderMap, expected_id: Uuid, expected_sha256: &[
     actual.as_slice().ct_eq(expected_sha256).into()
 }
 
-fn authenticate_traffic_key(
+fn authenticate_traffic_key<'a>(
     headers: &HeaderMap,
-    configured: &[(TrafficKey, String)],
-) -> Option<String> {
+    configured: &'a [TrafficKey],
+) -> Option<&'a TrafficKey> {
     let mut values = headers.get_all(header::AUTHORIZATION);
     let raw = values.next()?.to_str().ok()?.strip_prefix("Bearer ")?;
     if values.next().is_some() || !valid_traffic_key(raw) {
         return None;
     }
     let actual: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
-    let mut cohort = None;
-    for (key, cohort_id) in configured {
-        if key.0.ct_eq(&actual).unwrap_u8() == 1 {
-            cohort = Some(cohort_id.clone());
+    let mut authenticated = None;
+    for key in configured {
+        if key.api_key_sha256.ct_eq(&actual).unwrap_u8() == 1 {
+            authenticated = Some(key);
         }
     }
-    cohort
+    authenticated
 }
 
 fn valid_traffic_key(raw: &str) -> bool {
@@ -3488,7 +3611,7 @@ fn valid_traffic_key(raw: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
 }
 
-fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<(TrafficKey, String)>> {
+fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<TrafficKey>> {
     if values.is_empty() || values.len() > MAX_TRAFFIC_KEYS {
         bail!("traffic_keys must contain 1..={MAX_TRAFFIC_KEYS} entries");
     }
@@ -3506,7 +3629,11 @@ fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<(TrafficKe
         {
             bail!("traffic key cohort_id is invalid");
         }
-        configured.push((TrafficKey(sha256), value.cohort_id.clone()));
+        configured.push(TrafficKey {
+            api_key_sha256: sha256,
+            capture_allowed: value.capture_allowed,
+            cohort_id: value.cohort_id.clone(),
+        });
     }
     Ok(configured)
 }
@@ -3866,6 +3993,8 @@ mod cli_tests {
             "ingest-student-train-execution",
             "materialize-student-branch",
             "ingest-student-branch-execution",
+            "prepare-modal-candidate-credential",
+            "ingest-modal-candidate-credential-ack",
             "advance-winner-route",
             "prepare-route",
             "publish-route",
@@ -4033,6 +4162,38 @@ mod cli_tests {
                 prefix[0],
                 prefix[1],
                 prefix[2],
+                "prepare-modal-candidate-credential",
+                "--student-job-id",
+                &"e".repeat(64),
+                "--gateway-anchor",
+                "/run/dragontales/gateway-anchor.json",
+                "--request",
+                "/run/dragontales/modal-request.json",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::PrepareModalCandidateCredential { .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                prefix[0],
+                prefix[1],
+                prefix[2],
+                "ingest-modal-candidate-credential-ack",
+                "--student-job-id",
+                &"e".repeat(64),
+                "--acknowledgement",
+                "/run/dragontales/modal-ack.json",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::IngestModalCandidateCredentialAck { .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                prefix[0],
+                prefix[1],
+                prefix[2],
                 "advance-winner-route",
                 "--student-job-id",
                 &"c".repeat(64),
@@ -4096,6 +4257,20 @@ mod cli_tests {
                 r#"{{"schema_version":"dragontales.winner-route-advance.v1","action":"observe","route_revision":"{}","not_after":"2026-08-25T12:15:00Z"}}"#,
                 "a".repeat(64)
             )
+        );
+    }
+
+    #[test]
+    fn modal_candidate_preparation_output_is_strict_and_content_free() {
+        let output = ModalCandidateCredentialPreparationWrite {
+            schema_version: "dragontales.modal-candidate-credential-preparation.v1",
+            selected_provider: WinnerProvider::Modal,
+            action: ModalCandidateCredentialAction::Ready,
+            request_sha256: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&output).unwrap(),
+            r#"{"schema_version":"dragontales.modal-candidate-credential-preparation.v1","selected_provider":"modal","action":"ready","request_sha256":null}"#
         );
     }
 
@@ -4219,6 +4394,26 @@ mod cli_tests {
                 routes: Some(ReadOnly),
             }
         );
+        for command in [
+            Command::PrepareModalCandidateCredential {
+                student_job_id: "a".repeat(64),
+                gateway_anchor: "/tmp/anchor.json".into(),
+                request: "/tmp/request.json".into(),
+            },
+            Command::IngestModalCandidateCredentialAck {
+                student_job_id: "a".repeat(64),
+                acknowledgement: "/tmp/ack.json".into(),
+            },
+        ] {
+            assert_eq!(
+                StoreAccessPlan::for_command(&command),
+                StoreAccessPlan {
+                    capture: None,
+                    control: Some(ReadWrite),
+                    routes: Some(ReadOnly),
+                }
+            );
+        }
     }
 
     #[test]

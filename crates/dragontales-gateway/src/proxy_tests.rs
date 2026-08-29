@@ -43,6 +43,7 @@ use crate::route::{RoutePolicy, RouteStartupConfig};
 
 const OUTCOME_KEY_ID: &str = "018f3f54-7a5b-7cc0-8000-000000000002";
 const KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000001_test-secret-0001";
+const SMOKE_KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000003_test-smoke-secret-0003";
 const COHORT_ID: &str = "production-test-cohort";
 const OUTCOME_KEY: &str = "dt_live_018f3f54-7a5b-7cc0-8000-000000000002_test-outcome-secret-0002";
 const CANDIDATE_KEY: &str = "candidate-test-secret";
@@ -92,10 +93,12 @@ fn traffic_authentication_returns_only_the_configured_cohort() {
     let configured = configured_traffic_keys(&[
         TrafficKeyConfig {
             api_key_sha256: format!("{:x}", Sha256::digest(KEY.as_bytes())),
+            capture_allowed: true,
             cohort_id: COHORT_ID.into(),
         },
         TrafficKeyConfig {
-            api_key_sha256: "9".repeat(64),
+            api_key_sha256: format!("{:x}", Sha256::digest(SMOKE_KEY.as_bytes())),
+            capture_allowed: false,
             cohort_id: COHORT_ID.into(),
         },
     ])
@@ -109,10 +112,16 @@ fn traffic_authentication_returns_only_the_configured_cohort() {
         actix_web::http::header::HeaderName::from_static("x-dragontales-route-unit"),
         actix_web::http::header::HeaderValue::from_static("caller-choice"),
     );
-    assert_eq!(
-        authenticate_traffic_key(&headers, &configured).as_deref(),
-        Some(COHORT_ID)
+    let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
+    assert_eq!(authenticated.cohort_id, COHORT_ID);
+    assert!(authenticated.capture_allowed);
+    headers.insert(
+        actix_web::http::header::AUTHORIZATION,
+        actix_web::http::header::HeaderValue::from_str(&format!("Bearer {SMOKE_KEY}")).unwrap(),
     );
+    let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
+    assert_eq!(authenticated.cohort_id, COHORT_ID);
+    assert!(!authenticated.capture_allowed);
 }
 
 #[test]
@@ -138,6 +147,7 @@ fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
     too_many_keys.traffic_keys = (0..=super::MAX_TRAFFIC_KEYS)
         .map(|index| TrafficKeyConfig {
             api_key_sha256: format!("{index:064x}"),
+            capture_allowed: true,
             cohort_id: format!("cohort-{index}"),
         })
         .collect();
@@ -236,12 +246,6 @@ fn gpu_teacher_file_config_requires_shared_r2_storage() {
     };
     gpu.stores = local_stores(&root);
     assert!(validate_teacher_config(&gpu).is_err());
-    gpu.allow_student_fixture = true;
-    assert!(
-        validate_teacher_config(&gpu).is_err(),
-        "fixture authority cannot make a deployable Local GPU job safe"
-    );
-    gpu.allow_student_fixture = false;
     gpu.stores.capture = ObjectStoreConfig::CloudflareR2 {
         account_id: "a".repeat(32),
         bucket: "test-capture".to_owned(),
@@ -556,6 +560,7 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         traffic_keys: vec![TrafficKeyConfig {
             api_key_sha256: format!("{:x}", Sha256::digest(KEY.as_bytes())),
+            capture_allowed: true,
             cohort_id: COHORT_ID.into(),
         }],
         outcome_key_id: Uuid::parse_str(OUTCOME_KEY_ID).unwrap(),
@@ -585,7 +590,6 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
         outcome_verifier_id: "test-verifier-v1".into(),
         outcome_rights_state: "authorized".into(),
         outcome_retention_days: 1,
-        allow_student_fixture: false,
         stores: StoresConfig {
             capture: ObjectStoreConfig::CloudflareR2 {
                 account_id: "a".repeat(32),
@@ -1314,6 +1318,11 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
     gateway_config.capture_basis_points = 10_000;
     gateway_config.capture_policy_version = "test-authorized-v1".to_owned();
     gateway_config.capture_rights_state = "authorized".to_owned();
+    gateway_config.traffic_keys.push(TrafficKeyConfig {
+        api_key_sha256: format!("{:x}", Sha256::digest(SMOKE_KEY.as_bytes())),
+        capture_allowed: false,
+        cohort_id: COHORT_ID.into(),
+    });
     let scope = Scope {
         tenant_id: gateway_config.tenant_id,
         project_id: gateway_config.project_id,
@@ -1398,6 +1407,20 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
     assert!(stored.catalog.capture_selected);
     assert!(stored.request.content_encoding.is_none());
     assert!(stored.response.content_encoding.is_none());
+
+    let synthetic = client(false)
+        .post(format!("{}/v1/chat/completions", gateway.address))
+        .bearer_auth(SMOKE_KEY)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        synthetic.headers()["x-dragontales-capture-intent"],
+        "not_selected"
+    );
+    std::mem::drop(synthetic.bytes().await.unwrap());
 
     let not_selected = client(false)
         .post(format!("{}/v1/chat/completions", gateway.address))

@@ -335,7 +335,7 @@ GATEWAY_ANCHOR_KEYS = (
 )
 MODAL_REMOVE_KEYS = (
     "gateway_release_id", "gateway_release_sha256", "gateway_cleanup_authorization",
-    "gateway_cleanup_authorization_sha256", "trigger",
+    "gateway_cleanup_authorization_sha256",
 )
 MODAL_VERIFY_KEYS = ("gateway_release_id", "gateway_release_sha256")
 
@@ -407,19 +407,21 @@ def parse_modal_request(raw, mode):
         or SHA256.fullmatch(value["gateway_cleanup_authorization_sha256"] or "") is None
     ):
         raise OperationFailure("invalid Modal remove request")
-    trigger = ordered_trigger(value["trigger"])
+    embedded = value["gateway_cleanup_authorization"]
+    if not isinstance(embedded, dict):
+        raise OperationFailure("invalid teardown authorization")
+    trigger = ordered_trigger(embedded.get("trigger"))
+    authorization = ordered_authorization(
+        embedded,
+        {"provider": "modal", "run_id": metadata["run_id"], "trigger": trigger},
+    )
     if (
         trigger.get("kind") == "service_expired"
         and trigger["service_not_after"] != metadata["service_not_after"]
     ):
         raise OperationFailure("Modal expiry trigger differs from the admitted service deadline")
-    authorization = ordered_authorization(
-        value["gateway_cleanup_authorization"],
-        {"provider": "modal", "run_id": metadata["run_id"], "trigger": trigger},
-    )
     if (
-        authorization["winner_result_sha256"] != metadata["gateway_result_sha256"]
-        or not hmac.compare_digest(
+        not hmac.compare_digest(
             hashlib.sha256(gateway_json(authorization)).hexdigest(),
             value["gateway_cleanup_authorization_sha256"],
         )
@@ -431,7 +433,6 @@ def parse_modal_request(raw, mode):
         ],
         "gateway_release_id": value["gateway_release_id"],
         "gateway_release_sha256": value["gateway_release_sha256"],
-        "trigger": trigger,
     })
     return metadata
 

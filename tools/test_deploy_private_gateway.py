@@ -20,16 +20,8 @@ CURRENT_WORKER = "22222222-2222-2222-2222-222222222222"
 PREVIOUS_IMAGE = f"registry.cloudflare.com/{ACCOUNT}/legacy-gateway:previous"
 BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
 DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
-BOOTSTRAP_SECRETS = {
-    "DRAGONTALES_CONFIG_JSON": '{"schema_version":"dragontales.config.v1"}',
-    "DRAGONTALES_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
-    "DRAGONTALES_OPENAI_API_KEY": "bootstrap-openai-private",
-    "DRAGONTALES_ROUTE_SECRET_HEX": "0" * 64,
-    "MILK_CAPTURE_STORE_ACCESS_KEY_ID": "bootstrap-capture-access-private",
-    "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY": "bootstrap-capture-secret-private",
-    "MILK_ROUTE_STORE_ACCESS_KEY_ID": "bootstrap-route-access-private",
-    "MILK_ROUTE_STORE_SECRET_ACCESS_KEY": "bootstrap-route-secret-private",
-}
+SMOKE_API_KEY = "dt_live_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee_private-test-secret"
+SMOKE_COHORT = "deployment-smoke-v1"
 
 
 def canonical(value):
@@ -38,6 +30,26 @@ def canonical(value):
 
 def sha256(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+SMOKE_GATEWAY_CONFIG = json.loads(
+    (ROOT / "deploy/dragontales-config.example.json").read_text()
+)
+SMOKE_GATEWAY_CONFIG["traffic_keys"] = [{
+    "api_key_sha256": sha256(SMOKE_API_KEY.encode()),
+    "capture_allowed": False,
+    "cohort_id": SMOKE_COHORT,
+}]
+BOOTSTRAP_SECRETS = {
+    "DRAGONTALES_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
+    "DRAGONTALES_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
+    "DRAGONTALES_OPENAI_API_KEY": "bootstrap-openai-private",
+    "DRAGONTALES_ROUTE_SECRET_HEX": "0" * 64,
+    "MILK_CAPTURE_STORE_ACCESS_KEY_ID": "bootstrap-capture-access-private",
+    "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY": "bootstrap-capture-secret-private",
+    "MILK_ROUTE_STORE_ACCESS_KEY_ID": "bootstrap-route-access-private",
+    "MILK_ROUTE_STORE_SECRET_ACCESS_KEY": "bootstrap-route-secret-private",
+}
 
 
 def make_release(directory):
@@ -158,6 +170,7 @@ def make_release(directory):
 
 FAKE_COMMAND = r'''#!/usr/bin/env python3
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -212,6 +225,7 @@ if name == "gh":
 if name == "node":
     if state["mode"] in {"sdk_fail", "bootstrap_sdk_fail", "bootstrap_cleanup_fail"}:
         done(70)
+    credential = json.loads(Path(args[-1]).read_text())
     print(json.dumps({
         "authenticated": True,
         "choice_count": 1,
@@ -226,6 +240,8 @@ if name == "node":
         "sdk": "openai-node",
         "sdk_version": "6.33.0",
         "succeeded": True,
+        "traffic_cohort_sha256": hashlib.sha256(credential["cohort_id"].encode()).hexdigest(),
+        "traffic_key_sha256": hashlib.sha256(credential["api_key"].encode()).hexdigest(),
     }, sort_keys=True, separators=(",", ":")))
     done()
 
@@ -402,10 +418,15 @@ class Fixture:
         for name in ("curl", "docker", "gh", "git", "node", "sleep", "wrangler"):
             os.link(command, self.bin / name)
         self.credential = self.root / "gateway-credential.json"
-        self.credential.write_text(
-            '{"api_key":"dt_live_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee_private-test-secret","model":"test-model"}\n'
-        )
+        self.credential.write_bytes(canonical({
+            "api_key": SMOKE_API_KEY,
+            "cohort_id": SMOKE_COHORT,
+            "model": "test-model",
+        }))
         self.credential.chmod(0o600)
+        self.gateway_config = self.root / "gateway-config.json"
+        self.gateway_config.write_bytes(canonical(SMOKE_GATEWAY_CONFIG))
+        self.gateway_config.chmod(0o600)
         self.bootstrap_secrets = self.root / "bootstrap-secrets.json"
         self.bootstrap_secrets.write_bytes(canonical({
             "schema_version": "milk.gateway-bootstrap-secrets.v1",
@@ -427,7 +448,7 @@ class Fixture:
     def run(self):
         arguments = [
             str(SCRIPT), str(self.release), APPLICATION, str(self.evidence),
-            str(self.credential),
+            str(self.credential), str(self.gateway_config),
         ]
         if self.bootstrap:
             arguments = [
@@ -455,6 +476,25 @@ class Fixture:
 
 
 class DeployPrivateGatewayTests(unittest.TestCase):
+    def test_smoke_key_must_be_exactly_non_capturable_in_canonical_gateway_config(self):
+        for defect in ("capture", "cohort", "key"):
+            with self.subTest(defect=defect):
+                fixture = Fixture()
+                self.addCleanup(fixture.close)
+                config = json.loads(fixture.gateway_config.read_text())
+                if defect == "capture":
+                    config["traffic_keys"][0]["capture_allowed"] = True
+                elif defect == "cohort":
+                    config["traffic_keys"][0]["cohort_id"] = "different-cohort"
+                else:
+                    config["traffic_keys"][0]["api_key_sha256"] = "0" * 64
+                fixture.gateway_config.write_bytes(canonical(config))
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"not an exact non-capturable traffic key", result.stderr)
+                self.assertFalse(fixture.evidence.exists())
+                self.assertEqual(fixture.state["commands"], [])
+
     def test_success_uses_only_admitted_prebuilt_image_and_content_free_evidence(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
