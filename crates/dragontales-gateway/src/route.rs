@@ -37,8 +37,7 @@ pub(crate) const WINNER_ROUTE_RUNWAY_SECONDS: u32 =
     WINNER_CANARY_VALID_FOR_SECONDS + WINNER_ZERO_VALID_FOR_SECONDS;
 pub(crate) const MAX_WINNER_DEPLOYMENT_WALL_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_WINNER_DEPLOYMENT_COST_MICROUSD: u64 = 1_000_000_000;
-pub(crate) const WINNER_PRIMARY_PROVIDER: &str = "baseten";
-pub(crate) const WINNER_FALLBACK_PROVIDER: &str = "modal";
+pub(crate) const WINNER_PROVIDER: &str = "baseten";
 const TEMPLATE_TOKENS_PER_MESSAGE: usize = 64;
 const OUTPUT_AND_FIXED_RESERVE_TOKENS: usize = 1_024;
 const _: () = assert!(
@@ -79,10 +78,9 @@ impl RouteStartupConfig {
 
     pub(crate) fn winner_deployment_authority(&self) -> Result<WinnerDeploymentAuthority> {
         let authority = WinnerDeploymentAuthority {
-            schema_version: "dragontales.winner-deployment-authority.v2".to_owned(),
+            schema_version: "dragontales.winner-deployment-authority.v3".to_owned(),
             provider_policy: WinnerProviderPolicy {
-                primary: WINNER_PRIMARY_PROVIDER.to_owned(),
-                fallback: WINNER_FALLBACK_PROVIDER.to_owned(),
+                only: WINNER_PROVIDER.to_owned(),
             },
             provider_terms_sha256: self.authorized_provider_terms_sha256.clone(),
             student_branch_runtime_image_reference: self
@@ -136,8 +134,7 @@ pub(crate) struct WinnerDeploymentAuthority {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WinnerProviderPolicy {
-    pub(crate) primary: String,
-    pub(crate) fallback: String,
+    pub(crate) only: String,
 }
 
 impl WinnerDeploymentAuthority {
@@ -152,9 +149,8 @@ impl WinnerDeploymentAuthority {
             &self.admission_program_sha256,
             "authorized admission program SHA-256",
         )?;
-        if self.schema_version != "dragontales.winner-deployment-authority.v2"
-            || self.provider_policy.primary != WINNER_PRIMARY_PROVIDER
-            || self.provider_policy.fallback != WINNER_FALLBACK_PROVIDER
+        if self.schema_version != "dragontales.winner-deployment-authority.v3"
+            || self.provider_policy.only != WINNER_PROVIDER
             || self.authorization_not_after.nanosecond() != 0
             || !(60..=MAX_WINNER_DEPLOYMENT_WALL_SECONDS).contains(&self.max_wall_seconds)
             || !(1..=MAX_WINNER_DEPLOYMENT_COST_MICROUSD).contains(&self.max_cost_microusd)
@@ -333,10 +329,7 @@ impl WinnerAdmissionReceipt {
         if self.schema_version != WINNER_ADMISSION_SCHEMA_VERSION {
             bail!("winner admission receipt has an unsupported schema version");
         }
-        if !valid_provider(&self.provider)
-            || (self.provider != authority.provider_policy.primary
-                && self.provider != authority.provider_policy.fallback)
-        {
+        if !valid_provider(&self.provider) || self.provider != authority.provider_policy.only {
             bail!("winner admission provider is not authorized");
         }
         if !valid_model_alias(&self.model_alias) {
@@ -1666,7 +1659,7 @@ mod tests {
                 dev_receipt_sha256: repeated_digest(0x77),
                 winner_admission: WinnerAdmissionReceipt {
                     schema_version: WINNER_ADMISSION_SCHEMA_VERSION.to_owned(),
-                    provider: "modal".to_owned(),
+                    provider: WINNER_PROVIDER.to_owned(),
                     student_job_id: repeated_digest(0x33),
                     student_variant: WinnerVariant::StaticFp8,
                     model_manifest_sha256: repeated_digest(0x44),
@@ -2107,6 +2100,22 @@ mod tests {
     }
 
     #[test]
+    fn winner_authority_is_exactly_baseten_only_v3() {
+        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
+        let authority = fixture.config.winner_deployment_authority().unwrap();
+        let encoded = serde_json::to_string(&authority).unwrap();
+        assert!(encoded.starts_with(
+            r#"{"schema_version":"dragontales.winner-deployment-authority.v3","provider_policy":{"only":"baseten"},"provider_terms_sha256":"#
+        ));
+        assert!(!encoded.contains("primary"));
+        assert!(!encoded.contains("fallback"));
+
+        let mut obsolete = authority;
+        obsolete.schema_version = "dragontales.winner-deployment-authority.v2".to_owned();
+        assert!(obsolete.validate().is_err());
+    }
+
+    #[test]
     fn live_pointer_is_typed_canonical_and_scope_bound() {
         let fixture = Fixture::active(10_000, "[]");
         let pointer =
@@ -2454,22 +2463,6 @@ mod tests {
             manifest.winner_admission.deployment_sha256().unwrap()
         );
         assert!(!String::from_utf8_lossy(&fixture.manifest).contains("\"deployment_sha256\""));
-
-        let mut baseten_manifest: RouteManifest =
-            serde_json::from_slice(&fixture.manifest).unwrap();
-        baseten_manifest.winner_admission.provider = WINNER_PRIMARY_PROVIDER.to_owned();
-        let baseten_manifest = serde_json::to_vec(&baseten_manifest).unwrap();
-        let baseten_signature = signing_key().sign(&baseten_manifest);
-        assert!(
-            RoutePublication::parse_for_publication(
-                &fixture.config,
-                &fixture.scope,
-                &baseten_manifest,
-                Some(baseten_signature.as_ref()),
-                ACTIVE_NOW.parse().unwrap(),
-            )
-            .is_ok()
-        );
 
         let mut unsupported_manifest: RouteManifest =
             serde_json::from_slice(&fixture.manifest).unwrap();

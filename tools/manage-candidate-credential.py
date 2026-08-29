@@ -28,10 +28,6 @@ DELIVERY_SCHEMA = "milk.baseten-candidate-key-delivery.v1"
 VERIFY_SCHEMA = "milk.baseten-candidate-key-delivery-verify.v1"
 REMOVE_SCHEMA = "milk.baseten-candidate-key-remove.v1"
 ACK_SCHEMA = "milk.baseten-candidate-key-delivery-ack.v1"
-MODAL_INSTALL_SCHEMA = "milk.modal-candidate-key-install.v1"
-MODAL_VERIFY_SCHEMA = "milk.modal-candidate-key-verify.v1"
-MODAL_REMOVE_SCHEMA = "milk.modal-candidate-key-remove.v1"
-MODAL_ACK_SCHEMA = "milk.modal-candidate-key-ack.v1"
 RESTART_SCHEMA = "milk.gateway-candidate-container-restart.v1"
 INSPECTION_SCHEMA = "milk.gateway-candidate-container-inspection.v1"
 RELEASE_SCHEMA = "milk.gateway-process-release.v1"
@@ -40,7 +36,6 @@ ROUTE_RECEIPT_SCHEMA = "dragontales.route-publication-receipt.v2"
 ACCOUNT_ID = re.compile(r"[0-9a-f]{32}")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
-SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}")
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 KEY_NAME = re.compile(r"[a-z0-9-]{1,64}")
 IMAGE_TAG = re.compile(r"[a-z0-9_][a-z0-9._-]{0,127}")
@@ -329,118 +324,6 @@ def parse_remove(value):
     return metadata
 
 
-MODAL_BASE_KEYS = (
-    "schema_version", "run_id", "selected_provider", "winner_admission_sha256",
-    "gateway_result_sha256", "candidate_key_sha256", "service_not_after", "gateway_anchor",
-)
-GATEWAY_ANCHOR_KEYS = (
-    "source_commit", "image_admission_sha256", "release_sha256", "application_id",
-    "application_version", "container_image", "worker_version_id",
-)
-MODAL_REMOVE_KEYS = (
-    "gateway_release_id", "gateway_release_sha256", "gateway_cleanup_authorization",
-    "gateway_cleanup_authorization_sha256",
-)
-MODAL_VERIFY_KEYS = ("gateway_release_id", "gateway_release_sha256")
-
-
-def validate_modal_base(value):
-    anchor = ordered(value.get("gateway_anchor"), GATEWAY_ANCHOR_KEYS, "gateway anchor")
-    if (
-        SHA256.fullmatch(value.get("run_id") or "") is None
-        or value.get("selected_provider") != "modal"
-        or SHA256.fullmatch(value.get("winner_admission_sha256") or "") is None
-        or SHA256.fullmatch(value.get("gateway_result_sha256") or "") is None
-        or SHA256.fullmatch(value.get("candidate_key_sha256") or "") is None
-        or SOURCE_COMMIT.fullmatch(anchor["source_commit"] or "") is None
-        or SHA256.fullmatch(anchor["image_admission_sha256"] or "") is None
-        or SHA256.fullmatch(anchor["release_sha256"] or "") is None
-        or UUID.fullmatch(anchor["application_id"] or "") is None
-        or not valid_positive_integer(anchor["application_version"])
-        or not bounded_text(anchor["container_image"], 2048)
-        or UUID.fullmatch(anchor["worker_version_id"] or "") is None
-    ):
-        raise OperationFailure("invalid Modal candidate metadata")
-    validate_timestamp(value.get("service_not_after"))
-    return {
-        "candidate_key_sha256": value["candidate_key_sha256"],
-        "gateway_anchor": anchor,
-        "gateway_result_sha256": value["gateway_result_sha256"],
-        "run_id": value["run_id"],
-        "selected_provider": value["selected_provider"],
-        "service_not_after": value["service_not_after"],
-        "winner_admission_sha256": value["winner_admission_sha256"],
-    }
-
-
-def parse_modal_request(raw, mode):
-    value = parse_canonical(raw, MAX_REQUEST, "Modal candidate request")
-    schema = {
-        "install-modal": MODAL_INSTALL_SCHEMA,
-        "verify-modal": MODAL_VERIFY_SCHEMA,
-        "remove-modal": MODAL_REMOVE_SCHEMA,
-    }[mode]
-    keys = set(MODAL_BASE_KEYS)
-    if mode == "verify-modal":
-        keys.update(MODAL_VERIFY_KEYS)
-    elif mode == "remove-modal":
-        keys.update(MODAL_REMOVE_KEYS)
-    require_exact_keys(value, keys, "Modal candidate request")
-    if value["schema_version"] != schema:
-        raise OperationFailure("invalid Modal candidate request")
-    metadata = validate_modal_base(value)
-    if mode == "install-modal":
-        return metadata
-    if mode == "verify-modal":
-        release_id = value["gateway_release_id"]
-        release_sha256 = value["gateway_release_sha256"]
-        if not (
-            (release_id is None and release_sha256 is None)
-            or (
-                UUID.fullmatch(release_id or "") is not None
-                and SHA256.fullmatch(release_sha256 or "") is not None
-            )
-        ):
-            raise OperationFailure("invalid Modal verify request")
-        metadata["gateway_release_id"] = release_id
-        metadata["gateway_release_sha256"] = release_sha256
-        return metadata
-    if (
-        UUID.fullmatch(value["gateway_release_id"] or "") is None
-        or SHA256.fullmatch(value["gateway_release_sha256"] or "") is None
-        or SHA256.fullmatch(value["gateway_cleanup_authorization_sha256"] or "") is None
-    ):
-        raise OperationFailure("invalid Modal remove request")
-    embedded = value["gateway_cleanup_authorization"]
-    if not isinstance(embedded, dict):
-        raise OperationFailure("invalid teardown authorization")
-    trigger = ordered_trigger(embedded.get("trigger"))
-    authorization = ordered_authorization(
-        embedded,
-        {"provider": "modal", "run_id": metadata["run_id"], "trigger": trigger},
-    )
-    if (
-        trigger.get("kind") == "service_expired"
-        and trigger["service_not_after"] != metadata["service_not_after"]
-    ):
-        raise OperationFailure("Modal expiry trigger differs from the admitted service deadline")
-    if (
-        not hmac.compare_digest(
-            hashlib.sha256(gateway_json(authorization)).hexdigest(),
-            value["gateway_cleanup_authorization_sha256"],
-        )
-    ):
-        raise OperationFailure("Modal teardown authorization differs")
-    metadata.update({
-        "gateway_cleanup_authorization_sha256": value[
-            "gateway_cleanup_authorization_sha256"
-        ],
-        "gateway_release_id": value["gateway_release_id"],
-        "gateway_release_sha256": value["gateway_release_sha256"],
-    })
-    return metadata
-
-
 def read_admin_key(descriptor):
     if descriptor < 3:
         raise OperationFailure("admin key descriptor is invalid")
@@ -460,45 +343,6 @@ def read_admin_key(descriptor):
     if not 32 <= len(raw) <= 512 or any(not 33 <= byte <= 126 for byte in raw):
         raise OperationFailure("admin key is invalid")
     return raw
-
-
-def read_candidate_key(descriptor):
-    if descriptor < 3:
-        raise OperationFailure("candidate key descriptor is invalid")
-    try:
-        status = os.fstat(descriptor)
-    except OSError as error:
-        raise OperationFailure("candidate key descriptor is unavailable") from error
-    if not (stat.S_ISFIFO(status.st_mode) or stat.S_ISSOCK(status.st_mode)):
-        raise OperationFailure("candidate key descriptor must be a pipe or socket")
-    try:
-        with os.fdopen(descriptor, "rb", closefd=True) as stream:
-            raw = bytearray(stream.read(4098))
-    except OSError as error:
-        raise OperationFailure("candidate key read failed") from error
-    if raw.endswith(b"\n"):
-        raw.pop()
-    if not 1 <= len(raw) <= 4096 or any(not 33 <= byte <= 126 for byte in raw):
-        raise OperationFailure("candidate key is invalid")
-    return raw
-
-
-def read_modal_request(path, mode):
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb", closefd=True) as stream:
-            status = os.fstat(stream.fileno())
-            raw = stream.read(MAX_REQUEST + 1)
-    except OSError as error:
-        raise OperationFailure("Modal candidate request is unavailable") from error
-    if (
-        not stat.S_ISREG(status.st_mode)
-        or not 1 <= status.st_size <= MAX_REQUEST
-        or len(raw) != status.st_size
-    ):
-        raise OperationFailure("invalid Modal candidate request file")
-    return parse_modal_request(raw, mode)
 
 
 def parse_json(raw, description):
@@ -753,224 +597,6 @@ def assert_admitted_identity(arguments, runner, account_id, expected_worker=None
     return current
 
 
-def modal_acknowledgement(metadata, state, worker, release_sha256):
-    return {
-        "candidate_key_sha256": metadata["candidate_key_sha256"],
-        "gateway_anchor": metadata["gateway_anchor"],
-        "gateway_release_id": worker,
-        "gateway_release_sha256": release_sha256,
-        "gateway_result_sha256": metadata["gateway_result_sha256"],
-        "run_id": metadata["run_id"],
-        "schema_version": MODAL_ACK_SCHEMA,
-        "selected_provider": metadata["selected_provider"],
-        "service_not_after": metadata["service_not_after"],
-        "state": state,
-        "verified_at": dt.datetime.now(dt.timezone.utc).replace(
-            microsecond=0
-        ).isoformat().replace("+00:00", "Z"),
-        "winner_admission_sha256": metadata["winner_admission_sha256"],
-    }
-
-
-def assert_modal_identity(metadata, runner, account_id, expected_worker=None):
-    anchor = metadata["gateway_anchor"]
-    validate_image(anchor["container_image"], account_id)
-    current = current_identity(runner, anchor["application_id"], account_id)
-    worker, image, application_version, instance = current
-    if (
-        (expected_worker is not None and worker != expected_worker)
-        or image != anchor["container_image"]
-        or application_version != anchor["application_version"]
-        or instance != "gateway"
-    ):
-        raise OperationFailure("gateway identity changed")
-    return current
-
-
-def modal_release_sha256(metadata, worker, application_version, image, restart):
-    return process_release_sha256(
-        worker,
-        metadata["gateway_anchor"]["application_id"],
-        application_version,
-        image,
-        restart,
-    )
-
-
-def verify_expected_modal_release(
-    metadata, worker, application_version, image, restart, previous
-):
-    expected_worker = metadata.get("gateway_release_id")
-    expected_sha256 = metadata.get("gateway_release_sha256")
-    if expected_worker is None:
-        return
-    release = restart
-    if previous:
-        release = {
-            "container_instance": restart["container_instance"],
-            "container_last_change": restart["previous_container_last_change"],
-        }
-    if (
-        worker != expected_worker
-        or not hmac.compare_digest(
-            modal_release_sha256(
-                metadata, worker, application_version, image, release
-            ),
-            expected_sha256,
-        )
-    ):
-        raise OperationFailure("installed gateway release changed")
-
-
-def modal_delete_secret(runner, worker):
-    try:
-        runner.wrangler("secret", "delete", SECRET, "--name", WORKER)
-    except OperationFailure:
-        names = parse_secret_names(
-            runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-        )
-        if SECRET in names:
-            raise
-    return wait_for_worker(runner, worker)
-
-
-def modal_cleanup(metadata, runner, account_id, admin_key):
-    worker, _image, _application_version, _instance = assert_modal_identity(
-        metadata, runner, account_id
-    )
-    names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    if SECRET in names:
-        live = call_container_admin(
-            runner, admin_key, "verify", metadata["candidate_key_sha256"]
-        )
-        if live["state"] != "loaded":
-            raise OperationFailure("candidate credential is not live")
-        worker = modal_delete_secret(runner, worker)
-    restart = call_container_admin(
-        runner, admin_key, "remove", metadata["candidate_key_sha256"]
-    )
-    worker, image, application_version, _instance = assert_modal_identity(
-        metadata, runner, account_id, worker
-    )
-    names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    if SECRET in names:
-        raise OperationFailure("candidate credential remains installed")
-    return worker, image, application_version, restart
-
-
-def install_modal(metadata, candidate, runner, account_id, admin_key):
-    anchor = metadata["gateway_anchor"]
-    expected_worker = anchor["worker_version_id"]
-    assert_modal_identity(metadata, runner, account_id, expected_worker)
-    names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    if SECRET in names:
-        raise OperationFailure("candidate credential is already installed")
-    try:
-        runner.wrangler(
-            "secret", "put", SECRET, "--name", WORKER,
-            input_bytes=bytes(candidate) + b"\n",
-        )
-        worker = wait_for_worker(runner, expected_worker)
-        restart = call_container_admin(
-            runner, admin_key, "install", metadata["candidate_key_sha256"]
-        )
-        worker, image, application_version, _instance = assert_modal_identity(
-            metadata, runner, account_id, worker
-        )
-        names = parse_secret_names(
-            runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-        )
-        if SECRET not in names:
-            raise OperationFailure("candidate credential is not installed")
-        return modal_acknowledgement(
-            metadata,
-            "installed",
-            worker,
-            modal_release_sha256(metadata, worker, application_version, image, restart),
-        )
-    except OperationFailure:
-        try:
-            modal_cleanup(metadata, runner, account_id, admin_key)
-        except OperationFailure:
-            pass
-        raise
-
-
-def verify_modal(metadata, runner, account_id, admin_key):
-    worker, image, application_version, _instance = assert_modal_identity(
-        metadata, runner, account_id
-    )
-    names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    restart = call_container_admin(
-        runner, admin_key, "verify", metadata["candidate_key_sha256"]
-    )
-    if (SECRET in names) != (restart["state"] == "loaded"):
-        raise OperationFailure("candidate secret state changed during verification")
-    verify_expected_modal_release(
-        metadata, worker, application_version, image, restart, True
-    )
-    worker, image, application_version, _instance = assert_modal_identity(
-        metadata, runner, account_id, worker
-    )
-    final_names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    if (SECRET in final_names) != (restart["state"] == "loaded"):
-        raise OperationFailure("candidate secret state changed during verification")
-    return modal_acknowledgement(
-        metadata,
-        "installed" if restart["state"] == "loaded" else "absent",
-        worker,
-        modal_release_sha256(metadata, worker, application_version, image, restart),
-    )
-
-
-def remove_modal(metadata, runner, account_id, admin_key):
-    worker, image, application_version, _instance = assert_modal_identity(
-        metadata, runner, account_id
-    )
-    names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    if SECRET in names:
-        live = call_container_admin(
-            runner, admin_key, "inspect", metadata["candidate_key_sha256"]
-        )
-        if live["state"] != "loaded":
-            raise OperationFailure("candidate credential is not live")
-        verify_expected_modal_release(
-            metadata, worker, application_version, image, live, False
-        )
-        worker = modal_delete_secret(runner, worker)
-    elif worker == metadata["gateway_release_id"]:
-        raise OperationFailure("candidate deletion did not advance Worker version")
-    restart = call_container_admin(
-        runner, admin_key, "remove", metadata["candidate_key_sha256"]
-    )
-    worker, image, application_version, _instance = assert_modal_identity(
-        metadata, runner, account_id, worker
-    )
-    names = parse_secret_names(
-        runner.wrangler("secret", "list", "--name", WORKER, "--format", "json")
-    )
-    if SECRET in names:
-        raise OperationFailure("candidate credential remains installed")
-    return modal_acknowledgement(
-        metadata,
-        "absent",
-        worker,
-        modal_release_sha256(metadata, worker, application_version, image, restart),
-    )
-
-
 def install(metadata, candidate, arguments, runner, account_id, admin_key):
     expected_worker = arguments.expected_worker_version_id
     assert_admitted_identity(arguments, runner, account_id, expected_worker)
@@ -1071,30 +697,14 @@ def parse_arguments():
     baseten.add_argument("--expected-application-version", type=int, required=True)
     baseten.add_argument("--expected-container-image", required=True)
     baseten.add_argument("--expected-worker-version-id", required=True)
-    for mode in ("install-modal", "verify-modal", "remove-modal"):
-        command = modes.add_parser(mode, allow_abbrev=False)
-        command.add_argument("--request", type=Path, required=True)
-        command.add_argument("--admin-key-fd", type=int, required=True)
-        if mode == "install-modal":
-            command.add_argument("--candidate-key-fd", type=int, required=True)
     arguments = parser.parse_args()
-    if arguments.mode == "serve-baseten":
-        if (
-            UUID.fullmatch(arguments.application_id or "") is None
-            or not valid_positive_integer(arguments.expected_application_version)
-            or UUID.fullmatch(arguments.expected_worker_version_id or "") is None
-        ):
-            parser.error("exact gateway identity is invalid")
-    elif (
-        arguments.admin_key_fd < 3
-        or (
-            arguments.mode == "install-modal"
-            and (
-                arguments.candidate_key_fd < 3
-                or arguments.candidate_key_fd == arguments.admin_key_fd
-            )
-        )
+    if (
+        UUID.fullmatch(arguments.application_id or "") is None
+        or not valid_positive_integer(arguments.expected_application_version)
+        or UUID.fullmatch(arguments.expected_worker_version_id or "") is None
     ):
+        parser.error("exact gateway identity is invalid")
+    if arguments.admin_key_fd < 3:
         parser.error("secret descriptors are invalid")
     return arguments
 
@@ -1277,21 +887,9 @@ def serve_once(path, arguments, runner, account_id, admin_key):
 def main():
     arguments = parse_arguments()
     admin_key = None
-    candidate = None
     try:
-        if arguments.mode == "serve-baseten":
-            validate_socket_path(arguments.socket_path)
-            admin_key = read_admin_key(arguments.admin_key_fd)
-        else:
-            metadata = read_modal_request(arguments.request, arguments.mode)
-            if arguments.mode == "install-modal":
-                candidate = read_candidate_key(arguments.candidate_key_fd)
-                if not hmac.compare_digest(
-                    hashlib.sha256(candidate).hexdigest(),
-                    metadata["candidate_key_sha256"],
-                ):
-                    raise OperationFailure("candidate key digest mismatch")
-            admin_key = read_admin_key(arguments.admin_key_fd)
+        validate_socket_path(arguments.socket_path)
+        admin_key = read_admin_key(arguments.admin_key_fd)
         with tempfile.TemporaryDirectory(prefix="milk-candidate-credential.") as scratch_name:
             scratch = Path(scratch_name)
             account_id, environment = command_environment(scratch)
@@ -1300,25 +898,12 @@ def main():
                 Path(__file__).resolve().parent.parent,
             )
             verify_pinned_wrangler(runner)
-            if arguments.mode == "serve-baseten":
-                serve_once(arguments.socket_path, arguments, runner, account_id, admin_key)
-            elif arguments.mode == "install-modal":
-                result = install_modal(metadata, candidate, runner, account_id, admin_key)
-                sys.stdout.buffer.write(canonical_json(result))
-            elif arguments.mode == "verify-modal":
-                result = verify_modal(metadata, runner, account_id, admin_key)
-                sys.stdout.buffer.write(canonical_json(result))
-            else:
-                result = remove_modal(metadata, runner, account_id, admin_key)
-                sys.stdout.buffer.write(canonical_json(result))
+            serve_once(arguments.socket_path, arguments, runner, account_id, admin_key)
         return 0
     except (OperationFailure, UnicodeError, ValueError, OSError):
         sys.stderr.write("candidate credential operation failed\n")
         return 1
     finally:
-        if candidate is not None:
-            for index in range(len(candidate)):
-                candidate[index] = 0
         if admin_key is not None:
             for index in range(len(admin_key)):
                 admin_key[index] = 0

@@ -65,8 +65,6 @@ const MAX_GPU_LAUNCH_OUTBOX_BYTES: usize = 16 * 1_024;
 const MAX_GPU_LAUNCH_FRONTIER_BYTES: usize = 4 * 1_024;
 const MAX_WINNER_DEPLOYMENT_CLAIM_BYTES: usize = 32 * 1_024;
 pub(crate) const MAX_WINNER_DEPLOYMENT_RESULT_BYTES: usize = 32 * 1_024;
-pub(crate) const MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES: usize = 32 * 1_024;
-pub(crate) const MAX_MODAL_CANDIDATE_ACK_BYTES: usize = 4 * 1_024;
 const MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES: usize = 8 * 1_024;
 pub(crate) const MAX_PROVIDER_TEARDOWN_RESULT_BYTES: usize = 16 * 1_024;
 const MAX_GPU_LAUNCH_INTENT_BYTES: usize =
@@ -2126,14 +2124,12 @@ struct StudentWinnerDeploymentClaim {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WinnerProvider {
     Baseten,
-    Modal,
 }
 
 impl WinnerProvider {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Baseten => crate::route::WINNER_PRIMARY_PROVIDER,
-            Self::Modal => crate::route::WINNER_FALLBACK_PROVIDER,
+            Self::Baseten => crate::route::WINNER_PROVIDER,
         }
     }
 }
@@ -2147,41 +2143,9 @@ struct BasetenProviderIdentity {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ModalProviderIdentity {
-    provider: WinnerProvider,
-    workspace_id: String,
-    workspace_name: String,
-    environment_id: String,
-    environment_name: String,
-    app_id: String,
-    app_name: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 struct ReadyProviderPreflight {
     provider: WinnerProvider,
     outcome: String,
-    evidence_sha256: String,
-    observed_at: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ProviderPreflightFailureReason {
-    CapabilityUnavailable,
-    Timeout,
-    RateLimited,
-    ServerUnavailable,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RetryableProviderPreflight {
-    provider: WinnerProvider,
-    outcome: String,
-    reason: ProviderPreflightFailureReason,
-    status: Option<u16>,
     evidence_sha256: String,
     observed_at: String,
 }
@@ -2197,18 +2161,12 @@ enum WinnerProviderSelection {
         provider_identity: BasetenProviderIdentity,
         primary_preflight: ReadyProviderPreflight,
     },
-    Modal {
-        provider_identity: ModalProviderIdentity,
-        primary_preflight: RetryableProviderPreflight,
-        fallback_preflight: ReadyProviderPreflight,
-    },
 }
 
 impl WinnerProviderSelection {
     fn selected_provider(&self) -> WinnerProvider {
         match self {
             Self::Baseten { .. } => WinnerProvider::Baseten,
-            Self::Modal { .. } => WinnerProvider::Modal,
         }
     }
 }
@@ -2312,221 +2270,6 @@ struct ProviderTeardownAuthorization {
     execution_id: String,
     trigger: ProviderTeardownTrigger,
     authorized_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModalGatewayAnchor {
-    application_id: String,
-    application_version: u64,
-    container_image: String,
-    image_admission_sha256: String,
-    release_sha256: String,
-    source_commit: String,
-    worker_version_id: String,
-}
-
-impl ModalGatewayAnchor {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        let anchor = parse_canonical_json_line(
-            bytes,
-            MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            "Modal gateway anchor",
-        )?;
-        validate_modal_gateway_anchor(&anchor)?;
-        Ok(anchor)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ModalCandidateCredentialState {
-    Absent,
-    Installed,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModalCandidateCredentialAck {
-    candidate_key_sha256: String,
-    gateway_anchor: ModalGatewayAnchor,
-    gateway_release_id: String,
-    gateway_release_sha256: String,
-    gateway_result_sha256: String,
-    run_id: String,
-    schema_version: String,
-    selected_provider: WinnerProvider,
-    service_not_after: DateTime<Utc>,
-    state: ModalCandidateCredentialState,
-    verified_at: DateTime<Utc>,
-    winner_admission_sha256: String,
-}
-
-impl ModalCandidateCredentialAck {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        parse_canonical_json_line(
-            bytes,
-            MAX_MODAL_CANDIDATE_ACK_BYTES,
-            "Modal candidate credential acknowledgement",
-        )
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ModalCandidateInstallRequest {
-    candidate_key_sha256: String,
-    gateway_anchor: ModalGatewayAnchor,
-    gateway_result_sha256: String,
-    run_id: String,
-    schema_version: String,
-    selected_provider: WinnerProvider,
-    service_not_after: DateTime<Utc>,
-    winner_admission_sha256: String,
-}
-
-#[derive(Serialize)]
-struct ModalCandidateVerifyRequest<'a> {
-    candidate_key_sha256: &'a str,
-    gateway_anchor: &'a ModalGatewayAnchor,
-    gateway_release_id: Option<&'a str>,
-    gateway_release_sha256: Option<&'a str>,
-    gateway_result_sha256: &'a str,
-    run_id: &'a str,
-    schema_version: &'static str,
-    selected_provider: WinnerProvider,
-    service_not_after: DateTime<Utc>,
-    winner_admission_sha256: &'a str,
-}
-
-#[derive(Serialize)]
-struct ModalCandidateRemoveRequest<'a> {
-    candidate_key_sha256: &'a str,
-    gateway_anchor: &'a ModalGatewayAnchor,
-    gateway_cleanup_authorization: SortedProviderTeardownAuthorization<'a>,
-    gateway_cleanup_authorization_sha256: String,
-    gateway_release_id: &'a str,
-    gateway_release_sha256: &'a str,
-    gateway_result_sha256: &'a str,
-    run_id: &'a str,
-    schema_version: &'static str,
-    selected_provider: WinnerProvider,
-    service_not_after: DateTime<Utc>,
-    winner_admission_sha256: &'a str,
-}
-
-#[derive(Serialize)]
-struct SortedProviderTeardownAuthorization<'a> {
-    authorized_at: DateTime<Utc>,
-    claim_sha256: &'a str,
-    execution_id: &'a str,
-    provider_acceptance_sha256: &'a str,
-    run_id: &'a str,
-    schema_version: &'a str,
-    scope: SortedScope<'a>,
-    selected_provider: WinnerProvider,
-    student_job_id: &'a str,
-    trigger: SortedProviderTeardownTrigger<'a>,
-    winner_result_object_key: &'a str,
-    winner_result_sha256: &'a str,
-}
-
-#[derive(Serialize)]
-struct SortedScope<'a> {
-    environment_id: &'a Uuid,
-    eval_id: &'a str,
-    project_id: &'a Uuid,
-    tenant_id: &'a Uuid,
-    workload_id: &'a Uuid,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum SortedProviderTeardownTrigger<'a> {
-    RouteZero(Box<SortedRouteZeroTrigger<'a>>),
-    ServiceExpired(SortedServiceExpiredTrigger),
-}
-
-#[derive(Serialize)]
-struct SortedRouteZeroTrigger<'a> {
-    canary_route_receipt: SortedRoutePublicationWrite<'a>,
-    kind: &'static str,
-    retirement_object_key: &'a str,
-    retirement_sha256: &'a str,
-    zero_route_receipt: SortedRoutePublicationWrite<'a>,
-    zero_route_revision: &'a str,
-}
-
-#[derive(Serialize)]
-struct SortedServiceExpiredTrigger {
-    kind: &'static str,
-    service_not_after: DateTime<Utc>,
-}
-
-#[derive(Serialize)]
-struct SortedRoutePublicationWrite<'a> {
-    candidate_basis_points: u16,
-    dev_receipt_sha256: &'a str,
-    live_pointer_object_key: &'a str,
-    manifest_object_key: &'a str,
-    model_manifest_sha256: &'a str,
-    previous_route_revision: Option<&'a str>,
-    route_revision: &'a str,
-    schema_version: &'a str,
-    signature_object_key: &'a str,
-    state: &'a str,
-    student_job_id: &'a str,
-    student_result_sha256: &'a str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ModalCandidateCredentialAction {
-    Absent,
-    Install,
-    Ready,
-    Remove,
-    Verify,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModalCandidateCredentialAckSlot {
-    Absent,
-    Installed,
-    RecoveryAbsent,
-    Verified,
-}
-
-pub(crate) struct ModalCandidateCredentialPreparation {
-    pub(crate) action: ModalCandidateCredentialAction,
-    pub(crate) request: Option<Vec<u8>>,
-    pub(crate) selected_provider: WinnerProvider,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModalCandidateCredentialAckWrite {
-    schema_version: String,
-    state: ModalCandidateCredentialState,
-    object_key: String,
-    sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ModalCandidateCredentialLineage {
-    acknowledgement_object_key: String,
-    acknowledgement_sha256: String,
-    gateway_release_id: String,
-    schema_version: String,
-    student_job_id: String,
-    verified_at: DateTime<Utc>,
-}
-
-#[derive(Serialize)]
-struct ModalCandidateInstallRetry {
-    recovery_ack_sha256: String,
-    schema_version: &'static str,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4368,36 +4111,6 @@ impl Records {
             .await?
             .admission
             .to_canonical_json_line()
-    }
-
-    pub(crate) async fn prepare_modal_candidate_credential(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        gateway_anchor: ModalGatewayAnchor,
-    ) -> Result<ModalCandidateCredentialPreparation> {
-        self.store
-            .prepare_modal_candidate_credential(scope, student_job_id, gateway_anchor)
-            .await
-    }
-
-    pub(crate) async fn ingest_modal_candidate_credential_ack(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        acknowledgement: ModalCandidateCredentialAck,
-        acknowledgement_payload: &[u8],
-        observed_at: DateTime<Utc>,
-    ) -> Result<ModalCandidateCredentialAckWrite> {
-        self.store
-            .ingest_modal_candidate_credential_ack(
-                scope,
-                student_job_id,
-                acknowledgement,
-                acknowledgement_payload,
-                observed_at,
-            )
-            .await
     }
 
     pub(crate) async fn verify_route_publication(
@@ -9812,702 +9525,6 @@ impl RecordStore {
         ))
     }
 
-    async fn prepare_modal_candidate_credential(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        gateway_anchor: ModalGatewayAnchor,
-    ) -> Result<ModalCandidateCredentialPreparation> {
-        let (result, result_payload) = self
-            .load_verified_student_winner_deployment_result_with_payload(scope, student_job_id)
-            .await?;
-        if result.provider_acceptance.selection.selected_provider() == WinnerProvider::Baseten {
-            validate_modal_gateway_anchor(&gateway_anchor)?;
-            return Ok(ModalCandidateCredentialPreparation {
-                action: ModalCandidateCredentialAction::Ready,
-                request: None,
-                selected_provider: WinnerProvider::Baseten,
-            });
-        }
-        let install_key = modal_candidate_install_request_key(scope, student_job_id);
-        let (install, install_bytes, install_created) = if self.exists(&install_key).await? {
-            let bytes = self
-                .load_bytes(&install_key, MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES)
-                .await?;
-            let stored: ModalCandidateInstallRequest = parse_canonical_json_line(
-                &bytes,
-                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-                "stored Modal candidate install request",
-            )?;
-            let mut supplied = gateway_anchor;
-            supplied.worker_version_id = stored.gateway_anchor.worker_version_id.clone();
-            if supplied != stored.gateway_anchor
-                || modal_candidate_install_request(
-                    &result,
-                    &result_payload,
-                    stored.gateway_anchor.clone(),
-                )? != stored
-            {
-                bail!("stored Modal candidate install request differs from gateway authority");
-            }
-            (stored, bytes.to_vec(), false)
-        } else {
-            let gateway_anchor = if let Some((_, acknowledgement, _)) =
-                self.load_modal_candidate_lineage(scope).await?
-            {
-                let mut supplied = gateway_anchor;
-                supplied.worker_version_id = acknowledgement.gateway_release_id.clone();
-                let mut expected = acknowledgement.gateway_anchor;
-                expected.worker_version_id = acknowledgement.gateway_release_id;
-                if supplied != expected {
-                    bail!("Modal gateway anchor differs from durable credential lineage");
-                }
-                expected
-            } else {
-                gateway_anchor
-            };
-            let install =
-                modal_candidate_install_request(&result, &result_payload, gateway_anchor)?;
-            let bytes = canonical_json_line(&install)?;
-            let disposition = self
-                .put_create_same(&encode_bytes(install_key, bytes.clone())?)
-                .await?;
-            (install, bytes, disposition == PutDisposition::Created)
-        };
-
-        let installed = self
-            .load_modal_candidate_ack(
-                scope,
-                student_job_id,
-                ModalCandidateCredentialAckSlot::Installed,
-                &install,
-                &result,
-                Utc::now(),
-            )
-            .await?;
-        let verified = self
-            .load_modal_candidate_ack(
-                scope,
-                student_job_id,
-                ModalCandidateCredentialAckSlot::Verified,
-                &install,
-                &result,
-                Utc::now(),
-            )
-            .await?;
-        if verified.is_some() && installed.is_none() {
-            bail!("Modal candidate verified acknowledgement has no installed predecessor");
-        }
-        let teardown_exists = self
-            .exists(&provider_teardown_authorization_key(scope, student_job_id))
-            .await?;
-        let absent = self
-            .load_modal_candidate_ack(
-                scope,
-                student_job_id,
-                ModalCandidateCredentialAckSlot::Absent,
-                &install,
-                &result,
-                Utc::now(),
-            )
-            .await?;
-        if absent.is_some() {
-            if !teardown_exists {
-                bail!("Modal candidate absence has no gateway teardown authority");
-            }
-            return Ok(ModalCandidateCredentialPreparation {
-                action: ModalCandidateCredentialAction::Absent,
-                request: None,
-                selected_provider: WinnerProvider::Modal,
-            });
-        }
-
-        if teardown_exists {
-            let (authorization, authorization_payload) = self
-                .load_verified_provider_teardown_authorization(scope, student_job_id)
-                .await?;
-            if authorization.selected_provider != WinnerProvider::Modal {
-                bail!("Modal candidate teardown authority selected another provider");
-            }
-            if let Some(latest) = verified.as_ref().or(installed.as_ref()) {
-                let request = modal_candidate_remove_request(
-                    &install,
-                    latest,
-                    &authorization,
-                    &authorization_payload,
-                    &result_payload,
-                )?;
-                let key = modal_candidate_remove_request_key(scope, student_job_id);
-                self.put_create_same(&encode_bytes(key, request.clone())?)
-                    .await?;
-                return Ok(ModalCandidateCredentialPreparation {
-                    action: ModalCandidateCredentialAction::Remove,
-                    request: Some(request),
-                    selected_provider: WinnerProvider::Modal,
-                });
-            }
-            let request = modal_candidate_verify_request(&install, None)?;
-            let key = modal_candidate_verify_absence_request_key(scope, student_job_id);
-            self.put_create_same(&encode_bytes(key, request.clone())?)
-                .await?;
-            return Ok(ModalCandidateCredentialPreparation {
-                action: ModalCandidateCredentialAction::Verify,
-                request: Some(request),
-                selected_provider: WinnerProvider::Modal,
-            });
-        }
-
-        let recovery_absent = self
-            .load_modal_candidate_ack(
-                scope,
-                student_job_id,
-                ModalCandidateCredentialAckSlot::RecoveryAbsent,
-                &install,
-                &result,
-                Utc::now(),
-            )
-            .await?;
-        if verified.is_some() {
-            return Ok(ModalCandidateCredentialPreparation {
-                action: ModalCandidateCredentialAction::Ready,
-                request: None,
-                selected_provider: WinnerProvider::Modal,
-            });
-        }
-        if let Some(installed) = installed.as_ref() {
-            let request = modal_candidate_verify_request(&install, Some(installed))?;
-            let key = modal_candidate_verify_installed_request_key(scope, student_job_id);
-            self.put_create_same(&encode_bytes(key, request.clone())?)
-                .await?;
-            return Ok(ModalCandidateCredentialPreparation {
-                action: ModalCandidateCredentialAction::Verify,
-                request: Some(request),
-                selected_provider: WinnerProvider::Modal,
-            });
-        }
-        if !install_created {
-            if let Some(recovery_absent) = recovery_absent.as_ref() {
-                let recovery_payload = canonical_json_line(recovery_absent)?;
-                let retry = ModalCandidateInstallRetry {
-                    recovery_ack_sha256: hex_digest(&Sha256::digest(&recovery_payload).into()),
-                    schema_version: "dragontales.modal-candidate-install-retry.v1",
-                };
-                let retry_object = encode_json(
-                    modal_candidate_install_retry_key(scope, student_job_id),
-                    &retry,
-                )?;
-                if self.put_create_same(&retry_object).await? == PutDisposition::Created {
-                    return Ok(ModalCandidateCredentialPreparation {
-                        action: ModalCandidateCredentialAction::Install,
-                        request: Some(install_bytes),
-                        selected_provider: WinnerProvider::Modal,
-                    });
-                }
-            }
-            let request = modal_candidate_verify_request(&install, None)?;
-            let key = modal_candidate_verify_install_recovery_request_key(scope, student_job_id);
-            self.put_create_same(&encode_bytes(key, request.clone())?)
-                .await?;
-            return Ok(ModalCandidateCredentialPreparation {
-                action: ModalCandidateCredentialAction::Verify,
-                request: Some(request),
-                selected_provider: WinnerProvider::Modal,
-            });
-        }
-        Ok(ModalCandidateCredentialPreparation {
-            action: ModalCandidateCredentialAction::Install,
-            request: Some(install_bytes),
-            selected_provider: WinnerProvider::Modal,
-        })
-    }
-
-    async fn ingest_modal_candidate_credential_ack(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        acknowledgement: ModalCandidateCredentialAck,
-        acknowledgement_payload: &[u8],
-        observed_at: DateTime<Utc>,
-    ) -> Result<ModalCandidateCredentialAckWrite> {
-        let (result, result_payload) = self
-            .load_verified_student_winner_deployment_result_with_payload(scope, student_job_id)
-            .await?;
-        let install_key = modal_candidate_install_request_key(scope, student_job_id);
-        let install_payload = self
-            .load_bytes(&install_key, MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES)
-            .await?;
-        let install: ModalCandidateInstallRequest = parse_canonical_json_line(
-            &install_payload,
-            MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            "stored Modal candidate install request",
-        )?;
-        if modal_candidate_install_request(
-            &result,
-            &result_payload,
-            install.gateway_anchor.clone(),
-        )? != install
-        {
-            bail!("stored Modal candidate install request differs from gateway authority");
-        }
-        if canonical_json_line(&acknowledgement)? != acknowledgement_payload {
-            bail!("Modal candidate acknowledgement changed after validation");
-        }
-        validate_modal_candidate_ack(&acknowledgement, &install, &result, observed_at)?;
-        let teardown_exists = self
-            .exists(&provider_teardown_authorization_key(scope, student_job_id))
-            .await?;
-
-        let slot = match acknowledgement.state {
-            ModalCandidateCredentialState::Installed => {
-                let installed = self
-                    .load_modal_candidate_ack(
-                        scope,
-                        student_job_id,
-                        ModalCandidateCredentialAckSlot::Installed,
-                        &install,
-                        &result,
-                        observed_at,
-                    )
-                    .await?;
-                if teardown_exists {
-                    let verified = self
-                        .load_modal_candidate_ack(
-                            scope,
-                            student_job_id,
-                            ModalCandidateCredentialAckSlot::Verified,
-                            &install,
-                            &result,
-                            observed_at,
-                        )
-                        .await?;
-                    if installed.as_ref() == Some(&acknowledgement) {
-                        ModalCandidateCredentialAckSlot::Installed
-                    } else if verified.as_ref() == Some(&acknowledgement) {
-                        ModalCandidateCredentialAckSlot::Verified
-                    } else if installed.is_none() && verified.is_none() {
-                        let (authorization, _) = self
-                            .load_verified_provider_teardown_authorization(scope, student_job_id)
-                            .await?;
-                        let expected = modal_candidate_verify_request(&install, None)?;
-                        let stored = self
-                            .load_bytes(
-                                &modal_candidate_verify_absence_request_key(scope, student_job_id),
-                                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-                            )
-                            .await?;
-                        if stored != expected
-                            || acknowledgement.verified_at < authorization.authorized_at
-                        {
-                            bail!("Modal teardown discovery acknowledgement is invalid");
-                        }
-                        ModalCandidateCredentialAckSlot::Installed
-                    } else {
-                        bail!("Modal installed acknowledgement changed after teardown");
-                    }
-                } else {
-                    if acknowledgement.verified_at >= install.service_not_after {
-                        bail!(
-                            "Modal candidate installed acknowledgement is outside route authority"
-                        );
-                    }
-                    match installed {
-                        None => ModalCandidateCredentialAckSlot::Installed,
-                        Some(existing) if existing == acknowledgement => {
-                            ModalCandidateCredentialAckSlot::Installed
-                        }
-                        Some(existing) => {
-                            let expected =
-                                modal_candidate_verify_request(&install, Some(&existing))?;
-                            let stored = self
-                                .load_bytes(
-                                    &modal_candidate_verify_installed_request_key(
-                                        scope,
-                                        student_job_id,
-                                    ),
-                                    MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-                                )
-                                .await?;
-                            if stored != expected
-                                || acknowledgement.gateway_release_id != existing.gateway_release_id
-                                || acknowledgement.gateway_release_sha256
-                                    != existing.gateway_release_sha256
-                                || acknowledgement.verified_at <= existing.verified_at
-                            {
-                                bail!("Modal candidate verification acknowledgement is invalid");
-                            }
-                            if let Some(verified) = self
-                                .load_modal_candidate_ack(
-                                    scope,
-                                    student_job_id,
-                                    ModalCandidateCredentialAckSlot::Verified,
-                                    &install,
-                                    &result,
-                                    observed_at,
-                                )
-                                .await?
-                                && verified != acknowledgement
-                            {
-                                bail!("Modal candidate verification acknowledgement changed");
-                            }
-                            ModalCandidateCredentialAckSlot::Verified
-                        }
-                    }
-                }
-            }
-            ModalCandidateCredentialState::Absent => {
-                if !teardown_exists {
-                    let expected = modal_candidate_verify_request(&install, None)?;
-                    let stored = self
-                        .load_bytes(
-                            &modal_candidate_verify_install_recovery_request_key(
-                                scope,
-                                student_job_id,
-                            ),
-                            MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-                        )
-                        .await?;
-                    if stored != expected {
-                        bail!("Modal install recovery absence was not prepared");
-                    }
-                    ModalCandidateCredentialAckSlot::RecoveryAbsent
-                } else {
-                    let (authorization, _) = self
-                        .load_verified_provider_teardown_authorization(scope, student_job_id)
-                        .await?;
-                    if authorization.selected_provider != WinnerProvider::Modal
-                        || acknowledgement.verified_at < authorization.authorized_at
-                    {
-                        bail!("Modal candidate absence differs from gateway teardown authority");
-                    }
-                    let installed = self
-                        .load_modal_candidate_ack(
-                            scope,
-                            student_job_id,
-                            ModalCandidateCredentialAckSlot::Installed,
-                            &install,
-                            &result,
-                            observed_at,
-                        )
-                        .await?;
-                    let verified = self
-                        .load_modal_candidate_ack(
-                            scope,
-                            student_job_id,
-                            ModalCandidateCredentialAckSlot::Verified,
-                            &install,
-                            &result,
-                            observed_at,
-                        )
-                        .await?;
-                    if let Some(latest) = verified.as_ref().or(installed.as_ref()) {
-                        let (_, authorization_payload) = self
-                            .load_verified_provider_teardown_authorization(scope, student_job_id)
-                            .await?;
-                        let expected = modal_candidate_remove_request(
-                            &install,
-                            latest,
-                            &authorization,
-                            &authorization_payload,
-                            &result_payload,
-                        )?;
-                        let stored = self
-                            .load_bytes(
-                                &modal_candidate_remove_request_key(scope, student_job_id),
-                                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-                            )
-                            .await?;
-                        if stored != expected
-                            || acknowledgement.gateway_release_id == latest.gateway_release_id
-                            || acknowledgement.gateway_release_sha256
-                                == latest.gateway_release_sha256
-                        {
-                            bail!("Modal candidate removal acknowledgement is invalid");
-                        }
-                    } else {
-                        let expected = modal_candidate_verify_request(&install, None)?;
-                        let stored = self
-                            .load_bytes(
-                                &modal_candidate_verify_absence_request_key(scope, student_job_id),
-                                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-                            )
-                            .await?;
-                        if stored != expected {
-                            bail!("Modal candidate absence verification was not prepared");
-                        }
-                    }
-                    ModalCandidateCredentialAckSlot::Absent
-                }
-            }
-        };
-        let object_key = modal_candidate_ack_key(scope, student_job_id, slot);
-        let object = encode_bytes(object_key.clone(), acknowledgement_payload.to_vec())?;
-        self.put_create_same(&object).await?;
-        if slot == ModalCandidateCredentialAckSlot::Absent {
-            self.advance_modal_candidate_lineage(scope, student_job_id, &acknowledgement, &object)
-                .await?;
-        }
-        Ok(ModalCandidateCredentialAckWrite {
-            schema_version: "dragontales.modal-candidate-credential-ack-write.v1".to_owned(),
-            state: acknowledgement.state,
-            object_key,
-            sha256: hex_digest(&object.sha256),
-        })
-    }
-
-    async fn load_modal_candidate_ack(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        slot: ModalCandidateCredentialAckSlot,
-        install: &ModalCandidateInstallRequest,
-        result: &StudentWinnerDeploymentResult,
-        observed_at: DateTime<Utc>,
-    ) -> Result<Option<ModalCandidateCredentialAck>> {
-        let key = modal_candidate_ack_key(scope, student_job_id, slot);
-        if !self.exists(&key).await? {
-            return Ok(None);
-        }
-        let payload = self.load_bytes(&key, MAX_MODAL_CANDIDATE_ACK_BYTES).await?;
-        let acknowledgement = ModalCandidateCredentialAck::parse(&payload)?;
-        validate_modal_candidate_ack(&acknowledgement, install, result, observed_at)?;
-        let expected_state = match slot {
-            ModalCandidateCredentialAckSlot::Absent
-            | ModalCandidateCredentialAckSlot::RecoveryAbsent => {
-                ModalCandidateCredentialState::Absent
-            }
-            ModalCandidateCredentialAckSlot::Installed
-            | ModalCandidateCredentialAckSlot::Verified => ModalCandidateCredentialState::Installed,
-        };
-        if acknowledgement.state != expected_state {
-            bail!("Modal candidate acknowledgement is stored in the wrong state slot");
-        }
-        Ok(Some(acknowledgement))
-    }
-
-    async fn load_modal_candidate_lineage(
-        &self,
-        scope: &Scope,
-    ) -> Result<
-        Option<(
-            ModalCandidateCredentialLineage,
-            ModalCandidateCredentialAck,
-            ObjectMeta,
-        )>,
-    > {
-        let key = modal_candidate_lineage_key(scope);
-        let result = match self.objects.get(&ObjectPath::parse(&key)?).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if result.meta.size > MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES as u64 {
-            bail!("Modal candidate credential lineage exceeds its hard byte limit");
-        }
-        let meta = result.meta.clone();
-        let payload = result.bytes().await?;
-        let lineage: ModalCandidateCredentialLineage = serde_json::from_slice(&payload)
-            .context("Modal candidate credential lineage is not strict typed JSON")?;
-        let student_job_id = decode_hex_digest(&lineage.student_job_id)?;
-        let acknowledgement_key = modal_candidate_ack_key(
-            scope,
-            &student_job_id,
-            ModalCandidateCredentialAckSlot::Absent,
-        );
-        let acknowledgement_payload = self
-            .load_bytes(&acknowledgement_key, MAX_MODAL_CANDIDATE_ACK_BYTES)
-            .await?;
-        let acknowledgement = ModalCandidateCredentialAck::parse(&acknowledgement_payload)?;
-        let (winner, winner_payload) = self
-            .load_verified_student_winner_deployment_result_with_payload(scope, &student_job_id)
-            .await?;
-        let install_payload = self
-            .load_bytes(
-                &modal_candidate_install_request_key(scope, &student_job_id),
-                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            )
-            .await?;
-        let install: ModalCandidateInstallRequest = parse_canonical_json_line(
-            &install_payload,
-            MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            "stored Modal candidate install request",
-        )?;
-        if modal_candidate_install_request(
-            &winner,
-            &winner_payload,
-            install.gateway_anchor.clone(),
-        )? != install
-        {
-            bail!("Modal candidate lineage install request differs from gateway authority");
-        }
-        validate_modal_candidate_ack(&acknowledgement, &install, &winner, Utc::now())?;
-        let (authorization, _) = self
-            .load_verified_provider_teardown_authorization(scope, &student_job_id)
-            .await?;
-        if serde_json::to_vec(&lineage)? != payload
-            || lineage.schema_version != "dragontales.modal-candidate-credential-lineage.v1"
-            || lineage.acknowledgement_object_key != acknowledgement_key
-            || lineage.acknowledgement_sha256
-                != hex_digest(&Sha256::digest(&acknowledgement_payload).into())
-            || lineage.gateway_release_id != acknowledgement.gateway_release_id
-            || lineage.student_job_id != hex_digest(&student_job_id)
-            || lineage.verified_at != acknowledgement.verified_at
-            || acknowledgement.state != ModalCandidateCredentialState::Absent
-            || authorization.selected_provider != WinnerProvider::Modal
-            || acknowledgement.verified_at < authorization.authorized_at
-        {
-            bail!("Modal candidate credential lineage is invalid");
-        }
-        Ok(Some((lineage, acknowledgement, meta)))
-    }
-
-    async fn advance_modal_candidate_lineage(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        acknowledgement: &ModalCandidateCredentialAck,
-        acknowledgement_object: &EncodedObject,
-    ) -> Result<()> {
-        let lineage = ModalCandidateCredentialLineage {
-            acknowledgement_object_key: acknowledgement_object.key.clone(),
-            acknowledgement_sha256: hex_digest(&acknowledgement_object.sha256),
-            gateway_release_id: acknowledgement.gateway_release_id.clone(),
-            schema_version: "dragontales.modal-candidate-credential-lineage.v1".to_owned(),
-            student_job_id: hex_digest(student_job_id),
-            verified_at: acknowledgement.verified_at,
-        };
-        let key = modal_candidate_lineage_key(scope);
-        let path = ObjectPath::parse(&key)?;
-        let payload = Bytes::from(serde_json::to_vec(&lineage)?);
-        match self.load_modal_candidate_lineage(scope).await? {
-            None => {
-                match self
-                    .objects
-                    .put_opts(
-                        &path,
-                        payload.clone().into(),
-                        PutOptions {
-                            mode: PutMode::Create,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Some((current, current_acknowledgement, meta)) => {
-                if current == lineage {
-                    return Ok(());
-                }
-                let mut expected_anchor = current_acknowledgement.gateway_anchor;
-                expected_anchor.worker_version_id = current_acknowledgement.gateway_release_id;
-                if acknowledgement.gateway_anchor != expected_anchor
-                    || acknowledgement.verified_at <= current.verified_at
-                {
-                    bail!("Modal candidate credential lineage does not advance exactly once");
-                }
-                self.objects
-                    .put_opts(
-                        &path,
-                        payload.clone().into(),
-                        PutOptions {
-                            mode: PutMode::Update(conditional_update_version(
-                                &meta,
-                                "Modal candidate credential lineage",
-                            )?),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-            }
-        }
-        let (stored, _, _) = self
-            .load_modal_candidate_lineage(scope)
-            .await?
-            .context("Modal candidate credential lineage disappeared after update")?;
-        if stored != lineage {
-            bail!("Modal candidate credential lineage changed concurrently");
-        }
-        Ok(())
-    }
-
-    async fn require_modal_candidate_absence(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        authorization: &ProviderTeardownAuthorization,
-        winner: &StudentWinnerDeploymentResult,
-        verified_zero_at: DateTime<Utc>,
-    ) -> Result<()> {
-        if winner.provider_acceptance.selection.selected_provider() != WinnerProvider::Modal {
-            return Ok(());
-        }
-        let (stored_winner, winner_payload) = self
-            .load_verified_student_winner_deployment_result_with_payload(scope, student_job_id)
-            .await?;
-        if stored_winner != *winner {
-            bail!("Modal absence winner changed after verification");
-        }
-        let install_payload = self
-            .load_bytes(
-                &modal_candidate_install_request_key(scope, student_job_id),
-                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            )
-            .await?;
-        let install: ModalCandidateInstallRequest = parse_canonical_json_line(
-            &install_payload,
-            MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            "stored Modal candidate install request",
-        )?;
-        if modal_candidate_install_request(winner, &winner_payload, install.gateway_anchor.clone())?
-            != install
-        {
-            bail!("Modal absence install request differs from gateway authority");
-        }
-        let absent = self
-            .load_modal_candidate_ack(
-                scope,
-                student_job_id,
-                ModalCandidateCredentialAckSlot::Absent,
-                &install,
-                winner,
-                verified_zero_at,
-            )
-            .await?
-            .context("Modal provider teardown has no credential absence acknowledgement")?;
-        let acknowledgement_key = modal_candidate_ack_key(
-            scope,
-            student_job_id,
-            ModalCandidateCredentialAckSlot::Absent,
-        );
-        let acknowledgement_payload = self
-            .load_bytes(&acknowledgement_key, MAX_MODAL_CANDIDATE_ACK_BYTES)
-            .await?;
-        let lineage_payload = self
-            .load_bytes(
-                &modal_candidate_lineage_key(scope),
-                MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            )
-            .await?;
-        let lineage: ModalCandidateCredentialLineage = serde_json::from_slice(&lineage_payload)
-            .context("Modal candidate credential lineage is not strict typed JSON")?;
-        if absent.verified_at < authorization.authorized_at
-            || absent.verified_at > verified_zero_at
-            || serde_json::to_vec(&lineage)? != lineage_payload
-            || lineage.schema_version != "dragontales.modal-candidate-credential-lineage.v1"
-            || lineage.acknowledgement_object_key != acknowledgement_key
-            || lineage.acknowledgement_sha256
-                != hex_digest(&Sha256::digest(&acknowledgement_payload).into())
-            || lineage.gateway_release_id != absent.gateway_release_id
-            || lineage.student_job_id != hex_digest(student_job_id)
-            || lineage.verified_at != absent.verified_at
-        {
-            bail!("Modal provider teardown is not bound to credential absence");
-        }
-        Ok(())
-    }
-
     async fn ingest_provider_teardown_result(
         &self,
         scope: &Scope,
@@ -10546,14 +9563,6 @@ impl RecordStore {
             &result,
             observed_at,
         )?;
-        Box::pin(self.require_modal_candidate_absence(
-            scope,
-            &student_job_id,
-            &authorization,
-            &winner,
-            observed_at,
-        ))
-        .await?;
         let object = encode_json(key.clone(), &result)?;
         if object.payload.len() > MAX_PROVIDER_TEARDOWN_RESULT_BYTES {
             bail!("provider teardown result exceeds its hard byte limit");
@@ -11447,14 +10456,6 @@ impl RecordStore {
             &result,
             result.verified_zero_at,
         )?;
-        Box::pin(self.require_modal_candidate_absence(
-            scope,
-            student_job_id,
-            &authorization,
-            &winner,
-            result.verified_zero_at,
-        ))
-        .await?;
         Ok(result)
     }
 
@@ -13894,19 +12895,6 @@ fn encode_json<T: Serialize>(key: String, value: &T) -> Result<EncodedObject> {
     })
 }
 
-fn encode_bytes(key: String, payload: Vec<u8>) -> Result<EncodedObject> {
-    if payload.is_empty() || payload.len() > MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES {
-        bail!("Modal candidate credential object exceeds its hard byte limit");
-    }
-    let payload = Bytes::from(payload);
-    let sha256 = Sha256::digest(&payload).into();
-    Ok(EncodedObject {
-        key,
-        payload,
-        sha256,
-    })
-}
-
 fn encode_compressed<T: Serialize>(key: String, value: &T) -> Result<EncodedObject> {
     let payload = Bytes::from(zstd::encode_all(
         Cursor::new(serde_json::to_vec(value)?),
@@ -15070,7 +14058,7 @@ impl WinnerProviderAcceptance {
         {
             bail!("winner provider acceptance bounds are invalid");
         }
-        let (selected_provider, first_preflight_at, last_preflight_at) = match &self.selection {
+        let (first_preflight_at, last_preflight_at) = match &self.selection {
             WinnerProviderSelection::Baseten {
                 provider_identity,
                 primary_preflight,
@@ -15084,49 +14072,7 @@ impl WinnerProviderAcceptance {
                     bail!("Baseten winner provider selection is invalid");
                 }
                 let observed_at = parse_provider_acceptance_time(&primary_preflight.observed_at)?;
-                (WinnerProvider::Baseten, observed_at, observed_at)
-            }
-            WinnerProviderSelection::Modal {
-                provider_identity,
-                primary_preflight,
-                fallback_preflight,
-            } => {
-                if provider_identity.provider != WinnerProvider::Modal
-                    || [
-                        &provider_identity.workspace_id,
-                        &provider_identity.workspace_name,
-                        &provider_identity.environment_id,
-                        &provider_identity.environment_name,
-                        &provider_identity.app_id,
-                        &provider_identity.app_name,
-                    ]
-                    .into_iter()
-                    .any(|value| !valid_provider_identity(value, 256, b"._:/-"))
-                    || primary_preflight.provider != WinnerProvider::Baseten
-                    || primary_preflight.outcome != "retryable_unavailable"
-                    || !valid_lowercase_sha256(&primary_preflight.evidence_sha256)
-                    || fallback_preflight.provider != WinnerProvider::Modal
-                    || fallback_preflight.outcome != "ready"
-                    || !valid_lowercase_sha256(&fallback_preflight.evidence_sha256)
-                    || !matches!(
-                        (primary_preflight.reason, primary_preflight.status),
-                        (ProviderPreflightFailureReason::CapabilityUnavailable, None)
-                            | (ProviderPreflightFailureReason::Timeout, None)
-                            | (ProviderPreflightFailureReason::RateLimited, Some(429))
-                            | (
-                                ProviderPreflightFailureReason::ServerUnavailable,
-                                Some(500..=599)
-                            )
-                    )
-                {
-                    bail!("Modal winner provider selection is invalid");
-                }
-                let primary_at = parse_provider_acceptance_time(&primary_preflight.observed_at)?;
-                let fallback_at = parse_provider_acceptance_time(&fallback_preflight.observed_at)?;
-                if primary_at > fallback_at {
-                    bail!("winner provider preflight order is invalid");
-                }
-                (WinnerProvider::Modal, primary_at, fallback_at)
+                (observed_at, observed_at)
             }
         };
         let reserved_at = parse_provider_acceptance_time(&self.reserved_at)?;
@@ -15146,7 +14092,7 @@ impl WinnerProviderAcceptance {
             bail!("winner provider acceptance timing is invalid");
         }
         Ok(VerifiedWinnerProviderAcceptance {
-            selected_provider,
+            selected_provider: WinnerProvider::Baseten,
             first_preflight_at,
             last_preflight_at,
             reserved_at,
@@ -15234,216 +14180,6 @@ fn parse_provider_acceptance_time(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .context("winner provider acceptance time must be UTC RFC3339")?
         .with_timezone(&Utc))
-}
-
-fn validate_modal_gateway_anchor(anchor: &ModalGatewayAnchor) -> Result<()> {
-    let canonical_uuid = |value: &str| {
-        Uuid::parse_str(value).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == value)
-    };
-    if !canonical_uuid(&anchor.application_id)
-        || anchor.application_version == 0
-        || anchor.container_image.is_empty()
-        || anchor.container_image.len() > 2_048
-        || !anchor
-            .container_image
-            .bytes()
-            .all(|byte| (b'!'..=b'~').contains(&byte))
-        || !valid_lowercase_sha256(&anchor.image_admission_sha256)
-        || !valid_lowercase_sha256(&anchor.release_sha256)
-        || anchor.source_commit.len() != 40
-        || !anchor
-            .source_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || !canonical_uuid(&anchor.worker_version_id)
-    {
-        bail!("Modal gateway anchor is invalid");
-    }
-    Ok(())
-}
-
-impl<'a> SortedRoutePublicationWrite<'a> {
-    fn new(receipt: &'a RoutePublicationWrite) -> Self {
-        Self {
-            candidate_basis_points: receipt.candidate_basis_points,
-            dev_receipt_sha256: &receipt.dev_receipt_sha256,
-            live_pointer_object_key: &receipt.live_pointer_object_key,
-            manifest_object_key: &receipt.manifest_object_key,
-            model_manifest_sha256: &receipt.model_manifest_sha256,
-            previous_route_revision: receipt.previous_route_revision.as_deref(),
-            route_revision: &receipt.route_revision,
-            schema_version: &receipt.schema_version,
-            signature_object_key: &receipt.signature_object_key,
-            state: &receipt.state,
-            student_job_id: &receipt.student_job_id,
-            student_result_sha256: &receipt.student_result_sha256,
-        }
-    }
-}
-
-impl<'a> SortedProviderTeardownTrigger<'a> {
-    fn new(trigger: &'a ProviderTeardownTrigger) -> Self {
-        match trigger {
-            ProviderTeardownTrigger::RouteZero {
-                retirement_object_key,
-                retirement_sha256,
-                zero_route_revision,
-                canary_route_receipt,
-                zero_route_receipt,
-            } => Self::RouteZero(Box::new(SortedRouteZeroTrigger {
-                canary_route_receipt: SortedRoutePublicationWrite::new(canary_route_receipt),
-                kind: "route_zero",
-                retirement_object_key,
-                retirement_sha256,
-                zero_route_receipt: SortedRoutePublicationWrite::new(zero_route_receipt),
-                zero_route_revision,
-            })),
-            ProviderTeardownTrigger::ServiceExpired { service_not_after } => {
-                Self::ServiceExpired(SortedServiceExpiredTrigger {
-                    kind: "service_expired",
-                    service_not_after: *service_not_after,
-                })
-            }
-        }
-    }
-}
-
-impl<'a> SortedProviderTeardownAuthorization<'a> {
-    fn new(authorization: &'a ProviderTeardownAuthorization) -> Self {
-        Self {
-            authorized_at: authorization.authorized_at,
-            claim_sha256: &authorization.claim_sha256,
-            execution_id: &authorization.execution_id,
-            provider_acceptance_sha256: &authorization.provider_acceptance_sha256,
-            run_id: &authorization.run_id,
-            schema_version: &authorization.schema_version,
-            scope: SortedScope {
-                environment_id: &authorization.scope.environment_id,
-                eval_id: &authorization.scope.eval_id,
-                project_id: &authorization.scope.project_id,
-                tenant_id: &authorization.scope.tenant_id,
-                workload_id: &authorization.scope.workload_id,
-            },
-            selected_provider: authorization.selected_provider,
-            student_job_id: &authorization.student_job_id,
-            trigger: SortedProviderTeardownTrigger::new(&authorization.trigger),
-            winner_result_object_key: &authorization.winner_result_object_key,
-            winner_result_sha256: &authorization.winner_result_sha256,
-        }
-    }
-}
-
-fn modal_candidate_install_request(
-    result: &StudentWinnerDeploymentResult,
-    result_payload: &[u8],
-    gateway_anchor: ModalGatewayAnchor,
-) -> Result<ModalCandidateInstallRequest> {
-    validate_modal_gateway_anchor(&gateway_anchor)?;
-    if result.provider_acceptance.selection.selected_provider() != WinnerProvider::Modal
-        || result.admission.provider != crate::route::WINNER_FALLBACK_PROVIDER
-    {
-        bail!("Modal candidate credential requires an admitted Modal winner");
-    }
-    let mut result_line = result_payload.to_vec();
-    result_line.push(b'\n');
-    Ok(ModalCandidateInstallRequest {
-        candidate_key_sha256: result.admission.candidate_api_key_sha256.clone(),
-        gateway_anchor,
-        gateway_result_sha256: hex_digest(&Sha256::digest(result_line).into()),
-        run_id: result.provider_acceptance.run_id.clone(),
-        schema_version: "milk.modal-candidate-key-install.v1".to_owned(),
-        selected_provider: WinnerProvider::Modal,
-        service_not_after: result.admission.service_not_after,
-        winner_admission_sha256: hex_digest(
-            &Sha256::digest(result.admission.to_canonical_json_line()?).into(),
-        ),
-    })
-}
-
-fn validate_modal_candidate_ack(
-    ack: &ModalCandidateCredentialAck,
-    install: &ModalCandidateInstallRequest,
-    result: &StudentWinnerDeploymentResult,
-    observed_at: DateTime<Utc>,
-) -> Result<()> {
-    validate_modal_gateway_anchor(&ack.gateway_anchor)?;
-    let release_id = Uuid::parse_str(&ack.gateway_release_id)
-        .context("Modal candidate acknowledgement release ID is invalid")?;
-    if ack.schema_version != "milk.modal-candidate-key-ack.v1"
-        || ack.candidate_key_sha256 != install.candidate_key_sha256
-        || ack.gateway_anchor != install.gateway_anchor
-        || release_id.is_nil()
-        || release_id.to_string() != ack.gateway_release_id
-        || !valid_lowercase_sha256(&ack.gateway_release_sha256)
-        || ack.gateway_result_sha256 != install.gateway_result_sha256
-        || ack.run_id != install.run_id
-        || ack.selected_provider != WinnerProvider::Modal
-        || ack.service_not_after != install.service_not_after
-        || ack.winner_admission_sha256 != install.winner_admission_sha256
-        || ack.verified_at.nanosecond() != 0
-        || ack.verified_at < result.admission.admitted_at
-        || ack.verified_at > observed_at + TimeDelta::minutes(5)
-    {
-        bail!("Modal candidate credential acknowledgement differs from the admitted winner");
-    }
-    Ok(())
-}
-
-fn modal_candidate_request_bytes<T: Serialize>(request: &T) -> Result<Vec<u8>> {
-    let bytes = canonical_json_line(request)?;
-    if bytes.len() > MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES {
-        bail!("Modal candidate credential request exceeds its hard byte limit");
-    }
-    Ok(bytes)
-}
-
-fn modal_candidate_verify_request(
-    install: &ModalCandidateInstallRequest,
-    acknowledgement: Option<&ModalCandidateCredentialAck>,
-) -> Result<Vec<u8>> {
-    modal_candidate_request_bytes(&ModalCandidateVerifyRequest {
-        candidate_key_sha256: &install.candidate_key_sha256,
-        gateway_anchor: &install.gateway_anchor,
-        gateway_release_id: acknowledgement.map(|value| value.gateway_release_id.as_str()),
-        gateway_release_sha256: acknowledgement.map(|value| value.gateway_release_sha256.as_str()),
-        gateway_result_sha256: &install.gateway_result_sha256,
-        run_id: &install.run_id,
-        schema_version: "milk.modal-candidate-key-verify.v1",
-        selected_provider: WinnerProvider::Modal,
-        service_not_after: install.service_not_after,
-        winner_admission_sha256: &install.winner_admission_sha256,
-    })
-}
-
-fn modal_candidate_remove_request(
-    install: &ModalCandidateInstallRequest,
-    acknowledgement: &ModalCandidateCredentialAck,
-    authorization: &ProviderTeardownAuthorization,
-    authorization_payload: &[u8],
-    result_payload: &[u8],
-) -> Result<Vec<u8>> {
-    let result_object_sha256 = hex_digest(&Sha256::digest(result_payload).into());
-    if authorization.winner_result_sha256 != result_object_sha256 {
-        bail!("Modal teardown authorization winner object digest is invalid");
-    }
-    let mut authorization_line = authorization_payload.to_vec();
-    authorization_line.push(b'\n');
-    modal_candidate_request_bytes(&ModalCandidateRemoveRequest {
-        candidate_key_sha256: &install.candidate_key_sha256,
-        gateway_anchor: &install.gateway_anchor,
-        gateway_cleanup_authorization: SortedProviderTeardownAuthorization::new(authorization),
-        gateway_cleanup_authorization_sha256: hex_digest(
-            &Sha256::digest(authorization_line).into(),
-        ),
-        gateway_release_id: &acknowledgement.gateway_release_id,
-        gateway_release_sha256: &acknowledgement.gateway_release_sha256,
-        gateway_result_sha256: &install.gateway_result_sha256,
-        run_id: &install.run_id,
-        schema_version: "milk.modal-candidate-key-remove.v1",
-        selected_provider: WinnerProvider::Modal,
-        service_not_after: install.service_not_after,
-        winner_admission_sha256: &install.winner_admission_sha256,
-    })
 }
 
 fn validate_student_winner_deployment_result(
@@ -17459,86 +16195,6 @@ fn student_winner_deployment_result_key(scope: &Scope, student_job_id: &[u8; 32]
     )
 }
 
-fn modal_candidate_credential_prefix(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/jobs/student/{}/winner-deployment/modal-candidate-credential",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
-fn modal_candidate_install_request_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/install-request.json",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_verify_installed_request_key(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-) -> String {
-    format!(
-        "{}/verify-installed-request.json",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_verify_absence_request_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/verify-absence-request.json",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_verify_install_recovery_request_key(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-) -> String {
-    format!(
-        "{}/verify-install-recovery-request.json",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_install_retry_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/install-retry.json",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_remove_request_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/remove-request.json",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_ack_key(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-    slot: ModalCandidateCredentialAckSlot,
-) -> String {
-    let name = match slot {
-        ModalCandidateCredentialAckSlot::Absent => "absent-ack.json",
-        ModalCandidateCredentialAckSlot::Installed => "installed-ack.json",
-        ModalCandidateCredentialAckSlot::RecoveryAbsent => "recovery-absent-ack.json",
-        ModalCandidateCredentialAckSlot::Verified => "verified-ack.json",
-    };
-    format!(
-        "{}/{name}",
-        modal_candidate_credential_prefix(scope, student_job_id)
-    )
-}
-
-fn modal_candidate_lineage_key(scope: &Scope) -> String {
-    format!(
-        "{}/modal-candidate-credential/lineage.json",
-        scope_prefix(scope)
-    )
-}
-
 fn provider_teardown_frontier_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
     format!(
         "{}/frontier/provider-teardown/{}.json",
@@ -17952,8 +16608,7 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
             let student_job_id = decode_hex_digest(student_job_id)?;
             valid_lowercase_sha256(student_result_sha256)
                 && valid_lowercase_sha256(provider_binding_sha256)
-                && provider_policy.primary == crate::route::WINNER_PRIMARY_PROVIDER
-                && provider_policy.fallback == crate::route::WINNER_FALLBACK_PROVIDER
+                && provider_policy.only == crate::route::WINNER_PROVIDER
                 && (60..=crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS)
                     .contains(max_wall_seconds)
                 && (1..=crate::route::MAX_WINNER_DEPLOYMENT_COST_MICROUSD)
@@ -19326,10 +17981,9 @@ mod tests {
 
     fn winner_test_authority(now: DateTime<Utc>) -> WinnerDeploymentAuthority {
         WinnerDeploymentAuthority {
-            schema_version: "dragontales.winner-deployment-authority.v2".to_owned(),
+            schema_version: "dragontales.winner-deployment-authority.v3".to_owned(),
             provider_policy: WinnerProviderPolicy {
-                primary: crate::route::WINNER_PRIMARY_PROVIDER.to_owned(),
-                fallback: crate::route::WINNER_FALLBACK_PROVIDER.to_owned(),
+                only: crate::route::WINNER_PROVIDER.to_owned(),
             },
             provider_terms_sha256: hex_digest(&[0x41; 32]),
             student_branch_runtime_image_reference: TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
@@ -19356,7 +18010,6 @@ mod tests {
     fn winner_test_result(
         claim: &StudentWinnerDeploymentClaim,
         claim_payload: &[u8],
-        provider: &str,
     ) -> StudentWinnerDeploymentResult {
         let (_, outbox) =
             student_winner_deployment_gpu_launch_outbox(&claim.scope, claim, claim_payload)
@@ -19364,45 +18017,17 @@ mod tests {
         let observed_at = claim
             .claimed_at
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let selection = if provider == crate::route::WINNER_FALLBACK_PROVIDER {
-            WinnerProviderSelection::Modal {
-                provider_identity: ModalProviderIdentity {
-                    provider: WinnerProvider::Modal,
-                    workspace_id: "milk-workspace-id".to_owned(),
-                    workspace_name: "milk-workspace".to_owned(),
-                    environment_id: "milk-environment-id".to_owned(),
-                    environment_name: "milk-production".to_owned(),
-                    app_id: "milk-app-id".to_owned(),
-                    app_name: "milk-winner".to_owned(),
-                },
-                primary_preflight: RetryableProviderPreflight {
-                    provider: WinnerProvider::Baseten,
-                    outcome: "retryable_unavailable".to_owned(),
-                    reason: ProviderPreflightFailureReason::RateLimited,
-                    status: Some(429),
-                    evidence_sha256: hex_digest(&[0x81; 32]),
-                    observed_at: observed_at.clone(),
-                },
-                fallback_preflight: ReadyProviderPreflight {
-                    provider: WinnerProvider::Modal,
-                    outcome: "ready".to_owned(),
-                    evidence_sha256: hex_digest(&[0x82; 32]),
-                    observed_at: observed_at.clone(),
-                },
-            }
-        } else {
-            WinnerProviderSelection::Baseten {
-                provider_identity: BasetenProviderIdentity {
-                    provider: WinnerProvider::Baseten,
-                    team_name: "milk-production".to_owned(),
-                },
-                primary_preflight: ReadyProviderPreflight {
-                    provider: WinnerProvider::Baseten,
-                    outcome: "ready".to_owned(),
-                    evidence_sha256: hex_digest(&[0x80; 32]),
-                    observed_at: observed_at.clone(),
-                },
-            }
+        let selection = WinnerProviderSelection::Baseten {
+            provider_identity: BasetenProviderIdentity {
+                provider: WinnerProvider::Baseten,
+                team_name: "milk-production".to_owned(),
+            },
+            primary_preflight: ReadyProviderPreflight {
+                provider: WinnerProvider::Baseten,
+                outcome: "ready".to_owned(),
+                evidence_sha256: hex_digest(&[0x80; 32]),
+                observed_at: observed_at.clone(),
+            },
         };
         let mut provider_acceptance = WinnerProviderAcceptance {
             schema_version: "milk.winner-provider-acceptance.v1".to_owned(),
@@ -19446,7 +18071,7 @@ mod tests {
             observed_cost_microusd: 1_000_000,
             admission: WinnerAdmissionReceipt {
                 schema_version: crate::route::WINNER_ADMISSION_SCHEMA_VERSION.to_owned(),
-                provider: provider.to_owned(),
+                provider: crate::route::WINNER_PROVIDER.to_owned(),
                 student_job_id: claim.student_job_id.clone(),
                 student_variant: match claim.winner {
                     StudentVariant::Bf16 => WinnerVariant::Bf16,
@@ -19477,364 +18102,6 @@ mod tests {
                     + TimeDelta::seconds(2),
             },
         }
-    }
-
-    async fn persist_admitted_modal_test_winner(
-        store: &RecordStore,
-        scope: &Scope,
-        now: DateTime<Utc>,
-        seed: u8,
-    ) -> ([u8; 32], StudentWinnerDeploymentResult, Vec<u8>) {
-        let (provider_binding, student_job_id) =
-            persist_gpu_launch_test_winner_with_seed(store, scope, now, seed).await;
-        store
-            .claim_student_winner_deployment(
-                scope,
-                &provider_binding,
-                winner_test_authority(now),
-                now,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let (claim, claim_payload) = store
-            .load_verified_student_winner_deployment_claim(scope, &student_job_id)
-            .await
-            .unwrap();
-        let result = winner_test_result(&claim, &claim_payload, "modal");
-        store
-            .ingest_student_winner_deployment_result(scope, result.clone())
-            .await
-            .unwrap();
-        let (_, payload) = store
-            .load_verified_student_winner_deployment_result_with_payload(scope, &student_job_id)
-            .await
-            .unwrap();
-        (student_job_id, result, payload.to_vec())
-    }
-
-    fn modal_test_gateway_anchor() -> ModalGatewayAnchor {
-        ModalGatewayAnchor {
-            application_id: Uuid::from_u128(10).to_string(),
-            application_version: 7,
-            container_image: concat!(
-                "registry.cloudflare.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
-                "milk-gateway:sha256-admitted"
-            )
-            .to_owned(),
-            image_admission_sha256: hex_digest(&[0xd0; 32]),
-            release_sha256: hex_digest(&[0xd1; 32]),
-            source_commit: "c".repeat(40),
-            worker_version_id: Uuid::from_u128(11).to_string(),
-        }
-    }
-
-    fn modal_test_ack(
-        install: &ModalCandidateInstallRequest,
-        state: ModalCandidateCredentialState,
-        gateway_release_id: Uuid,
-        gateway_release_sha256: [u8; 32],
-        verified_at: DateTime<Utc>,
-    ) -> ModalCandidateCredentialAck {
-        ModalCandidateCredentialAck {
-            candidate_key_sha256: install.candidate_key_sha256.clone(),
-            gateway_anchor: install.gateway_anchor.clone(),
-            gateway_release_id: gateway_release_id.to_string(),
-            gateway_release_sha256: hex_digest(&gateway_release_sha256),
-            gateway_result_sha256: install.gateway_result_sha256.clone(),
-            run_id: install.run_id.clone(),
-            schema_version: "milk.modal-candidate-key-ack.v1".to_owned(),
-            selected_provider: WinnerProvider::Modal,
-            service_not_after: install.service_not_after,
-            state,
-            verified_at,
-            winner_admission_sha256: install.winner_admission_sha256.clone(),
-        }
-    }
-
-    async fn ingest_modal_test_ack(
-        store: &RecordStore,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        acknowledgement: ModalCandidateCredentialAck,
-    ) -> ModalCandidateCredentialAckWrite {
-        let payload = canonical_json_line(&acknowledgement).unwrap();
-        store
-            .ingest_modal_candidate_credential_ack(
-                scope,
-                student_job_id,
-                acknowledgement.clone(),
-                &payload,
-                acknowledgement.verified_at,
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn complete_modal_test_cycle(
-        store: &RecordStore,
-        scope: &Scope,
-        now: DateTime<Utc>,
-        seed: u8,
-        gateway_anchor: ModalGatewayAnchor,
-        crash_after_install: bool,
-    ) -> (
-        [u8; 32],
-        ModalCandidateInstallRequest,
-        ModalCandidateCredentialAck,
-    ) {
-        let (student_job_id, result, result_payload) =
-            persist_admitted_modal_test_winner(store, scope, now, seed).await;
-        let prepared = store
-            .prepare_modal_candidate_credential(scope, &student_job_id, gateway_anchor)
-            .await
-            .unwrap();
-        assert_eq!(prepared.action, ModalCandidateCredentialAction::Install);
-        let install_payload = prepared.request.unwrap();
-        let install: ModalCandidateInstallRequest = parse_canonical_json_line(
-            &install_payload,
-            MAX_MODAL_CANDIDATE_CREDENTIAL_BYTES,
-            "test Modal install request",
-        )
-        .unwrap();
-        let result_object_sha256 = hex_digest(&Sha256::digest(&result_payload).into());
-        let mut result_line = result_payload.clone();
-        result_line.push(b'\n');
-        assert_eq!(
-            install.gateway_result_sha256,
-            hex_digest(&Sha256::digest(&result_line).into())
-        );
-        assert_ne!(install.gateway_result_sha256, result_object_sha256);
-        assert_eq!(
-            install.winner_admission_sha256,
-            hex_digest(&Sha256::digest(result.admission.to_canonical_json_line().unwrap()).into())
-        );
-
-        if crash_after_install {
-            let recovered = store
-                .prepare_modal_candidate_credential(
-                    scope,
-                    &student_job_id,
-                    install.gateway_anchor.clone(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(recovered.action, ModalCandidateCredentialAction::Verify);
-            assert_eq!(
-                recovered.request.unwrap(),
-                modal_candidate_verify_request(&install, None).unwrap()
-            );
-        }
-
-        let installed_at = result.admission.admitted_at + TimeDelta::seconds(1);
-        let installed = modal_test_ack(
-            &install,
-            ModalCandidateCredentialState::Installed,
-            Uuid::from_u128(100 + u128::from(seed) * 10),
-            [0xe0_u8.wrapping_add(seed); 32],
-            installed_at,
-        );
-        ingest_modal_test_ack(store, scope, &student_job_id, installed.clone()).await;
-        let verify = store
-            .prepare_modal_candidate_credential(
-                scope,
-                &student_job_id,
-                install.gateway_anchor.clone(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(verify.action, ModalCandidateCredentialAction::Verify);
-        assert_eq!(
-            verify.request.unwrap(),
-            modal_candidate_verify_request(&install, Some(&installed)).unwrap()
-        );
-        let mut verified = installed.clone();
-        verified.verified_at += TimeDelta::seconds(1);
-        ingest_modal_test_ack(store, scope, &student_job_id, verified.clone()).await;
-        assert_eq!(
-            store
-                .prepare_modal_candidate_credential(
-                    scope,
-                    &student_job_id,
-                    install.gateway_anchor.clone(),
-                )
-                .await
-                .unwrap()
-                .action,
-            ModalCandidateCredentialAction::Ready
-        );
-
-        let (claim, _) = store
-            .load_verified_student_winner_deployment_claim(scope, &student_job_id)
-            .await
-            .unwrap();
-        let route_seed = 0xa0_u8.wrapping_add(seed.saturating_mul(8));
-        let prior = persist_test_route_receipt(store, scope, &claim, 0, None, route_seed).await;
-        let canary = persist_test_route_receipt(
-            store,
-            scope,
-            &claim,
-            crate::route::WINNER_CANARY_BASIS_POINTS,
-            Some(&prior),
-            route_seed.wrapping_add(2),
-        )
-        .await;
-        let zero = persist_test_route_receipt(
-            store,
-            scope,
-            &claim,
-            0,
-            Some(&canary),
-            route_seed.wrapping_add(4),
-        )
-        .await;
-        let retirement = RouteStudentRetirement {
-            schema_version: "dragontales.route-student-retirement.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: hex_digest(&student_job_id),
-            zero_route_revision: zero.route_revision.clone(),
-        };
-        let retirement_object = encode_json(
-            route_student_retirement_key(scope, &student_job_id),
-            &retirement,
-        )
-        .unwrap();
-        store.put_create_same(&retirement_object).await.unwrap();
-        let teardown_at = result.admission.admitted_at + TimeDelta::seconds(3);
-        store
-            .ensure_provider_teardown_authorization(
-                scope,
-                &student_job_id,
-                ProviderTeardownTrigger::RouteZero {
-                    retirement_object_key: retirement_object.key.clone(),
-                    retirement_sha256: hex_digest(&retirement_object.sha256),
-                    zero_route_revision: zero.route_revision.clone(),
-                    canary_route_receipt: Box::new(canary),
-                    zero_route_receipt: Box::new(zero),
-                },
-                teardown_at,
-            )
-            .await
-            .unwrap();
-        let (authorization, authorization_payload) = store
-            .load_verified_provider_teardown_authorization(scope, &student_job_id)
-            .await
-            .unwrap();
-        assert_eq!(authorization.winner_result_sha256, result_object_sha256);
-        let remove = store
-            .prepare_modal_candidate_credential(
-                scope,
-                &student_job_id,
-                install.gateway_anchor.clone(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(remove.action, ModalCandidateCredentialAction::Remove);
-        let expected_remove = modal_candidate_remove_request(
-            &install,
-            &verified,
-            &authorization,
-            &authorization_payload,
-            &result_payload,
-        )
-        .unwrap();
-        assert_eq!(remove.request.unwrap(), expected_remove);
-        let mut wrong_authorization = authorization.clone();
-        wrong_authorization.winner_result_sha256 = install.gateway_result_sha256.clone();
-        assert!(
-            modal_candidate_remove_request(
-                &install,
-                &verified,
-                &wrong_authorization,
-                &authorization_payload,
-                &result_payload,
-            )
-            .is_err()
-        );
-
-        let reference = |offset: u8, key: &str| ProviderEvidenceReference {
-            store_identity_sha256: hex_digest(&[route_seed.wrapping_add(offset); 32]),
-            object_key: key.to_owned(),
-            sha256: hex_digest(&[route_seed.wrapping_add(offset).wrapping_add(1); 32]),
-            bytes: 128,
-        };
-        let teardown = ProviderTeardownResult {
-            schema_version: "dragontales.provider-teardown-result.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: hex_digest(&student_job_id),
-            claim_sha256: result.claim_sha256.clone(),
-            run_id: result.provider_acceptance.run_id.clone(),
-            selected_provider: WinnerProvider::Modal,
-            execution_id: result.admission.execution_id.clone(),
-            teardown_authorization_sha256: hex_digest(
-                &Sha256::digest(&authorization_payload).into(),
-            ),
-            accounted_microusd: result.provider_acceptance.reserved_microusd,
-            provider_zero_evidence: reference(0x10, "providers/modal/zero.json"),
-            private_log_artifact: reference(0x20, "operational/provider/modal.log.json"),
-            budget_settlement: reference(0x30, "campaigns/modal/settlement.json"),
-            terminated_at: teardown_at + TimeDelta::seconds(1),
-            verified_zero_at: teardown_at + TimeDelta::seconds(2),
-            state: "zero".to_owned(),
-        };
-        assert!(
-            store
-                .ingest_provider_teardown_result(
-                    scope,
-                    teardown.clone(),
-                    teardown.verified_zero_at,
-                )
-                .await
-                .is_err(),
-            "Modal provider teardown must not precede credential absence"
-        );
-        assert!(
-            !store
-                .exists(&provider_teardown_result_key(scope, &student_job_id))
-                .await
-                .unwrap()
-        );
-
-        let absent = modal_test_ack(
-            &install,
-            ModalCandidateCredentialState::Absent,
-            Uuid::from_u128(101 + u128::from(seed) * 10),
-            [0xf0_u8.wrapping_add(seed); 32],
-            teardown_at + TimeDelta::seconds(1),
-        );
-        let mut wrong_digest = absent.clone();
-        wrong_digest.gateway_result_sha256 = result_object_sha256;
-        let wrong_payload = canonical_json_line(&wrong_digest).unwrap();
-        assert!(
-            store
-                .ingest_modal_candidate_credential_ack(
-                    scope,
-                    &student_job_id,
-                    wrong_digest.clone(),
-                    &wrong_payload,
-                    wrong_digest.verified_at,
-                )
-                .await
-                .is_err()
-        );
-        ingest_modal_test_ack(store, scope, &student_job_id, absent.clone()).await;
-        assert_eq!(
-            store
-                .prepare_modal_candidate_credential(
-                    scope,
-                    &student_job_id,
-                    install.gateway_anchor.clone(),
-                )
-                .await
-                .unwrap()
-                .action,
-            ModalCandidateCredentialAction::Absent
-        );
-        store
-            .ingest_provider_teardown_result(scope, teardown.clone(), teardown.verified_zero_at)
-            .await
-            .unwrap();
-        (student_job_id, install, absent)
     }
 
     async fn persist_test_route_receipt(
@@ -19900,42 +18167,27 @@ mod tests {
             r#"{"schema_version":"milk.winner-provider-acceptance.v1","campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","claim_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","outbox_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","provider_binding_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","selection":{"selected_provider":"baseten","provider_identity":{"provider":"baseten","team_name":"milk-production"},"primary_preflight":{"provider":"baseten","outcome":"ready","evidence_sha256":"5555555555555555555555555555555555555555555555555555555555555555","observed_at":"2026-08-27T20:00:00Z"}},"image_release_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","image_admission_sha256":"1111111111111111111111111111111111111111111111111111111111111111","provider_pass_claim_sha256":"2222222222222222222222222222222222222222222222222222222222222222","create_authorization_sha256":"3333333333333333333333333333333333333333333333333333333333333333","budget_reservation_sha256":"4444444444444444444444444444444444444444444444444444444444444444","reserved_microusd":3750000,"reserved_at":"2026-08-27T20:01:00Z","accepted_at":"2026-08-27T20:02:00Z","create_not_after":"2026-08-27T20:03:00Z","provider_not_after":"2026-08-27T20:32:00Z","max_wall_seconds":1800,"max_cost_microusd":10000000,"state":"accepted"}"#,
             "\n"
         );
-        const MODAL: &str = concat!(
-            r#"{"schema_version":"milk.winner-provider-acceptance.v1","campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","claim_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","outbox_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","provider_binding_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","selection":{"selected_provider":"modal","provider_identity":{"provider":"modal","workspace_id":"ws-123","workspace_name":"milk-workspace","environment_id":"env-123","environment_name":"milk-production","app_id":"ap-123","app_name":"milk-winner"},"primary_preflight":{"provider":"baseten","outcome":"retryable_unavailable","reason":"rate_limited","status":429,"evidence_sha256":"6666666666666666666666666666666666666666666666666666666666666666","observed_at":"2026-08-27T20:00:00Z"},"fallback_preflight":{"provider":"modal","outcome":"ready","evidence_sha256":"7777777777777777777777777777777777777777777777777777777777777777","observed_at":"2026-08-27T20:00:30Z"}},"image_release_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","image_admission_sha256":"1111111111111111111111111111111111111111111111111111111111111111","provider_pass_claim_sha256":"2222222222222222222222222222222222222222222222222222222222222222","create_authorization_sha256":"3333333333333333333333333333333333333333333333333333333333333333","budget_reservation_sha256":"4444444444444444444444444444444444444444444444444444444444444444","reserved_microusd":3750000,"reserved_at":"2026-08-27T20:01:00Z","accepted_at":"2026-08-27T20:02:00Z","create_not_after":"2026-08-27T20:03:00Z","provider_not_after":"2026-08-27T20:32:00Z","max_wall_seconds":1800,"max_cost_microusd":10000000,"state":"accepted"}"#,
-            "\n"
+        let acceptance: WinnerProviderAcceptance =
+            parse_canonical_json_line(BASETEN.as_bytes(), 8 * 1_024, "provider acceptance")
+                .unwrap();
+        assert_eq!(
+            acceptance.validate().unwrap().selected_provider,
+            WinnerProvider::Baseten
         );
-        for (raw, expected_sha256, provider) in [
-            (
-                BASETEN,
-                "54c4871a351a20d8e3599f2a761a21bc19b95069dbb140e8c9fae2f85505b314",
-                WinnerProvider::Baseten,
-            ),
-            (
-                MODAL,
-                "62ac9bc36782440b0d9740a4467fa44fe5a6da3a7a55240093e688cd70985019",
-                WinnerProvider::Modal,
-            ),
-        ] {
-            let acceptance: WinnerProviderAcceptance =
-                parse_canonical_json_line(raw.as_bytes(), 8 * 1_024, "provider acceptance")
-                    .unwrap();
-            assert_eq!(acceptance.validate().unwrap().selected_provider, provider);
-            assert_eq!(
-                hex_digest(&Sha256::digest(raw.as_bytes()).into()),
-                expected_sha256
-            );
-            assert_eq!(
-                provider_neutral_winner_run_id(
-                    &acceptance,
-                    &"8".repeat(64),
-                    &"9".repeat(64),
-                    StudentVariant::StaticFp8,
-                )
-                .unwrap(),
-                "856f94e25504165c35175edbc6e576b136ca9b69c046af05b9b92c0df18d1683"
-            );
-        }
-
+        assert_eq!(
+            hex_digest(&Sha256::digest(BASETEN.as_bytes()).into()),
+            "54c4871a351a20d8e3599f2a761a21bc19b95069dbb140e8c9fae2f85505b314"
+        );
+        assert_eq!(
+            provider_neutral_winner_run_id(
+                &acceptance,
+                &"8".repeat(64),
+                &"9".repeat(64),
+                StudentVariant::StaticFp8,
+            )
+            .unwrap(),
+            "856f94e25504165c35175edbc6e576b136ca9b69c046af05b9b92c0df18d1683"
+        );
         let reordered = BASETEN.replacen(
             r#"{"schema_version":"milk.winner-provider-acceptance.v1","campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#,
             r#"{"campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema_version":"milk.winner-provider-acceptance.v1""#,
@@ -19975,68 +18227,16 @@ mod tests {
         let mut malformed: WinnerProviderAcceptance =
             parse_canonical_json_line(BASETEN.as_bytes(), 8 * 1_024, "provider acceptance")
                 .unwrap();
-        if let WinnerProviderSelection::Baseten {
+        let WinnerProviderSelection::Baseten {
             provider_identity, ..
-        } = &mut malformed.selection
-        {
-            provider_identity.team_name = "Milk Production".to_owned();
-        }
+        } = &mut malformed.selection;
+        provider_identity.team_name = "Milk Production".to_owned();
         assert!(malformed.validate().is_ok());
-        if let WinnerProviderSelection::Baseten {
+        let WinnerProviderSelection::Baseten {
             provider_identity, ..
-        } = &mut malformed.selection
-        {
-            provider_identity.team_name = "milk-production-".to_owned();
-        }
+        } = &mut malformed.selection;
+        provider_identity.team_name = "milk-production-".to_owned();
         assert!(malformed.validate().is_err());
-
-        let modal: WinnerProviderAcceptance =
-            parse_canonical_json_line(MODAL.as_bytes(), 8 * 1_024, "provider acceptance").unwrap();
-        let mut wrong_status = modal.clone();
-        let WinnerProviderSelection::Modal {
-            primary_preflight, ..
-        } = &mut wrong_status.selection
-        else {
-            unreachable!()
-        };
-        primary_preflight.status = Some(500);
-        assert!(wrong_status.validate().is_err());
-        let mut capability_unavailable = modal.clone();
-        let WinnerProviderSelection::Modal {
-            primary_preflight, ..
-        } = &mut capability_unavailable.selection
-        else {
-            unreachable!()
-        };
-        primary_preflight.reason = ProviderPreflightFailureReason::CapabilityUnavailable;
-        primary_preflight.status = None;
-        assert!(capability_unavailable.validate().is_ok());
-        let WinnerProviderSelection::Modal {
-            primary_preflight, ..
-        } = &mut capability_unavailable.selection
-        else {
-            unreachable!()
-        };
-        primary_preflight.status = Some(501);
-        assert!(capability_unavailable.validate().is_err());
-        let mut wrong_order = modal.clone();
-        let WinnerProviderSelection::Modal {
-            primary_preflight, ..
-        } = &mut wrong_order.selection
-        else {
-            unreachable!()
-        };
-        primary_preflight.observed_at = "2026-08-27T20:00:31Z".to_owned();
-        assert!(wrong_order.validate().is_err());
-        let mut malformed_time = modal;
-        let WinnerProviderSelection::Modal {
-            fallback_preflight, ..
-        } = &mut malformed_time.selection
-        else {
-            unreachable!()
-        };
-        fallback_preflight.observed_at = "2026-08-27T20:00:30.Z".to_owned();
-        assert!(malformed_time.validate().is_err());
 
         let mut budget: WinnerProviderAcceptance =
             parse_canonical_json_line(BASETEN.as_bytes(), 8 * 1_024, "provider acceptance")
@@ -20046,39 +18246,6 @@ mod tests {
         budget.reserved_microusd = 1;
         budget.provider_pass_claim_sha256 = "0".repeat(63);
         assert!(budget.validate().is_err());
-    }
-
-    #[actix_web::test]
-    async fn modal_candidate_credentials_recover_crashes_and_advance_two_cycle_lineage() {
-        let store = gpu_launch_test_store(Arc::new(InMemory::new()));
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let static_anchor = modal_test_gateway_anchor();
-        let (first_job_id, first_install, first_absent) =
-            complete_modal_test_cycle(&store, &scope, now, 0, static_anchor.clone(), true).await;
-        assert_eq!(first_install.gateway_anchor, static_anchor);
-
-        let (second_job_id, second_install, second_absent) = complete_modal_test_cycle(
-            &store,
-            &scope,
-            now + TimeDelta::minutes(1),
-            1,
-            static_anchor,
-            false,
-        )
-        .await;
-        assert_ne!(first_job_id, second_job_id);
-        assert_eq!(
-            second_install.gateway_anchor.worker_version_id,
-            first_absent.gateway_release_id
-        );
-        let (lineage, stored_absent, _) = store
-            .load_modal_candidate_lineage(&scope)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(lineage.student_job_id, hex_digest(&second_job_id));
-        assert_eq!(stored_absent, second_absent);
     }
 
     #[actix_web::test]
@@ -21716,8 +19883,7 @@ mod tests {
         assert_eq!(
             launch.provider_policy,
             WinnerProviderPolicy {
-                primary: "baseten".to_owned(),
-                fallback: "modal".to_owned(),
+                only: "baseten".to_owned(),
             }
         );
         assert_eq!(launch.max_wall_seconds, authority.max_wall_seconds);
@@ -21756,23 +19922,10 @@ mod tests {
         let frontier_key = gpu_launch_frontier_key(&scope, outbox.expires_at, &dispatch_id);
         assert!(store.exists(&frontier_key).await.unwrap());
 
-        let result = winner_test_result(&claim, &claim_payload, "baseten");
-        let modal = winner_test_result(&claim, &claim_payload, "modal");
+        let result = winner_test_result(&claim, &claim_payload);
         assert_eq!(
-            result.provider_acceptance.run_id, modal.provider_acceptance.run_id,
-            "winner run identity must be provider-neutral"
-        );
-        validate_student_winner_deployment_result(
-            &scope,
-            &student_job_id,
-            &claim,
-            &claim_payload,
-            &modal,
-        )
-        .unwrap();
-        assert_eq!(
-            StudentWinnerDeploymentResult::parse(&canonical_json_line(&modal).unwrap()).unwrap(),
-            modal
+            StudentWinnerDeploymentResult::parse(&canonical_json_line(&result).unwrap()).unwrap(),
+            result
         );
 
         let mut wrong_claim = result.clone();
@@ -21793,7 +19946,7 @@ mod tests {
         let mut wrong_wall = result.clone();
         wrong_wall.provider_acceptance.max_wall_seconds -= 1;
         let mut wrong_provider = result.clone();
-        wrong_provider.admission.provider = "modal".to_owned();
+        wrong_provider.admission.provider = "runpod".to_owned();
         let mut late_acceptance = result.clone();
         late_acceptance.provider_acceptance.accepted_at = (claim.claimed_at
             + TimeDelta::seconds(2))
@@ -22068,7 +20221,7 @@ mod tests {
             outbox.expires_at,
             &decode_hex_digest(&outbox.dispatch_id).unwrap(),
         );
-        let result = winner_test_result(&claim, &claim_payload, "baseten");
+        let result = winner_test_result(&claim, &claim_payload);
         store
             .ingest_student_winner_deployment_result(&scope, result.clone())
             .await
@@ -22274,7 +20427,8 @@ mod tests {
             outbox.expires_at,
             &decode_hex_digest(&outbox.dispatch_id).unwrap(),
         );
-        let mut unauthorized = winner_test_result(&claim, &claim_payload, "runpod");
+        let mut unauthorized = winner_test_result(&claim, &claim_payload);
+        unauthorized.admission.provider = "runpod".to_owned();
         assert!(
             validate_student_winner_deployment_result(
                 &scope,
@@ -22285,7 +20439,7 @@ mod tests {
             )
             .is_err()
         );
-        unauthorized.admission.provider = "modal".to_owned();
+        unauthorized.admission.provider = "runpod".to_owned();
         unauthorized.claim_sha256 = hex_digest(&[0x66; 32]);
         objects
             .put(
