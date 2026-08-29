@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import os
 import re
@@ -15,6 +16,7 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_TOKEN_BYTES = 8192
 PACKAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 VISIBILITIES = {"internal", "private", "public"}
+GITHUB_USERNAME = "ShantanuJoshi"
 
 
 class GitHubRegistryError(ValueError):
@@ -59,6 +61,39 @@ def read_token(path, repository, stream=None):
     ):
         raise GitHubRegistryError("registry credential is invalid")
     return token
+
+
+def write_docker_config(directory, token):
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise GitHubRegistryError("Docker configuration directory is invalid")
+    metadata = directory.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        raise GitHubRegistryError("Docker configuration directory is not owner-only")
+    encoded = base64.b64encode(GITHUB_USERNAME.encode("ascii") + b":" + token).decode("ascii")
+    raw = (json.dumps(
+        {"auths": {"ghcr.io": {"auth": encoded}}},
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n").encode("ascii")
+    path = directory / "config.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+    written = path.stat()
+    if (
+        written.st_uid != os.getuid()
+        or written.st_nlink != 1
+        or written.st_mode & 0o077
+        or path.read_bytes() != raw
+    ):
+        raise GitHubRegistryError("Docker configuration was not written securely")
+    return path
 
 
 def _get_json(path, token):
@@ -131,6 +166,8 @@ def main(argv=None):
     source.add_argument("--token-stdin", action="store_true")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("credential")
+    docker_config = subcommands.add_parser("docker-config")
+    docker_config.add_argument("directory", type=Path)
     visibility = subcommands.add_parser("package-visibility")
     visibility.add_argument("organization")
     visibility.add_argument("package")
@@ -139,6 +176,8 @@ def main(argv=None):
         token = read_token(arguments.token_file, arguments.repository)
         if arguments.command == "credential":
             sys.stdout.buffer.write(token + b"\n")
+        elif arguments.command == "docker-config":
+            write_docker_config(arguments.directory, token)
         else:
             value = package_visibility(token, arguments.organization, arguments.package)
             print(value or "absent")

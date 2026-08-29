@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -188,6 +189,7 @@ def make_release(directory):
 
 
 FAKE_COMMAND = r'''#!/usr/bin/env python3
+import base64
 import copy
 import hashlib
 import json
@@ -304,6 +306,13 @@ if name == "docker":
         if not plugin.is_symlink() or plugin.resolve() != expected.resolve():
             done(94)
     values = without_global(args)
+    if values and values[0] == "pull" and "ghcr.io/" in values[-1]:
+        expected_auth = base64.b64encode(b"ShantanuJoshi:github-test-token").decode()
+        if json.loads((config / "config.json").read_text()) != {
+            "auths": {"ghcr.io": {"auth": expected_auth}}
+        } or (config / "config.json").stat().st_mode & 0o777 != 0o600:
+            done(95)
+        state["ghcr_auth_verified"] = True
     if values == ["context", "show"]:
         print("default")
     elif values[:2] == ["context", "inspect"]:
@@ -605,6 +614,19 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             and "@sha256:" in " ".join(item["arguments"])
             for item in commands
         ))
+        self.assertIs(state.get("ghcr_auth_verified"), True)
+        self.assertFalse(any(
+            item["command"] == "docker"
+            and "login" in item["arguments"]
+            and "ghcr.io" in item["arguments"]
+            for item in commands
+        ))
+        pull = next(
+            item for item in commands
+            if item["command"] == "docker" and "ghcr.io/" in " ".join(item["arguments"])
+        )
+        config_path = Path(pull["arguments"][pull["arguments"].index("--config") + 1])
+        self.assertFalse(config_path.parent.exists())
         deploy = next(
             item for item in commands
             if item["command"] == "wrangler" and "deploy" in item["arguments"]
@@ -637,6 +659,9 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             b"private-test-secret",
         ):
             self.assertNotIn(secret, evidence_raw)
+            self.assertNotIn(secret, result.stdout)
+            self.assertNotIn(secret, result.stderr)
+            self.assertFalse(any(secret.decode() in " ".join(item["arguments"]) for item in commands))
         self.assertNotIn(b'"provider":"uncontrolled"', evidence_raw)
         self.assertNotIn(b'"prompt"', evidence_raw)
         self.assertNotIn(b'"model_output"', evidence_raw)
