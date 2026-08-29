@@ -306,7 +306,10 @@ if name == "docker":
         if not plugin.is_symlink() or plugin.resolve() != expected.resolve():
             done(94)
     values = without_global(args)
-    if values and values[0] == "pull" and "ghcr.io/" in values[-1]:
+    expected_child = (
+        "ghcr.io/milkinfrastructure/milk-gateway@sha256:" + state["child_sha"]
+    )
+    if values == ["pull", "--platform", "linux/amd64", expected_child]:
         expected_auth = base64.b64encode(b"ShantanuJoshi:github-test-token").decode()
         if json.loads((config / "config.json").read_text()) != {
             "auths": {"ghcr.io": {"auth": expected_auth}}
@@ -606,25 +609,23 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         state = fixture.state
         commands = state["commands"]
-        self.assertTrue(any(
-            item["command"] == "docker"
-            and "pull" in item["arguments"]
-            and "--platform" in item["arguments"]
-            and "linux/amd64" in item["arguments"]
-            and "@sha256:" in " ".join(item["arguments"])
-            for item in commands
-        ))
+        child_reference = (
+            "ghcr.io/milkinfrastructure/milk-gateway@sha256:" + state["child_sha"]
+        )
+        expected_pull = ["pull", "--platform", "linux/amd64", child_reference]
+        pull = next(
+            item for item in commands
+            if item["command"] == "docker"
+            and item["arguments"][-len(expected_pull):] == expected_pull
+        )
         self.assertIs(state.get("ghcr_auth_verified"), True)
         self.assertFalse(any(
             item["command"] == "docker"
-            and "login" in item["arguments"]
-            and "ghcr.io" in item["arguments"]
+            and ("login", "ghcr.io") in zip(
+                item["arguments"], item["arguments"][1:]
+            )
             for item in commands
         ))
-        pull = next(
-            item for item in commands
-            if item["command"] == "docker" and "ghcr.io/" in " ".join(item["arguments"])
-        )
         config_path = Path(pull["arguments"][pull["arguments"].index("--config") + 1])
         self.assertFalse(config_path.parent.exists())
         deploy = next(
