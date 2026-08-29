@@ -12,7 +12,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY LICENSE ./
 COPY crates/dragontales-gateway ./crates/dragontales-gateway
 COPY deploy/licenses/bundle-rust.sh ./deploy/licenses/bundle-rust.sh
-RUN cargo build --locked --release --package dragontales-gateway --jobs 2 && \
+RUN cargo build --locked --release --package dragontales-gateway --jobs 4 && \
     /bin/sh deploy/licenses/bundle-rust.sh /src/THIRD_PARTY_LICENSES.txt
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a
