@@ -114,6 +114,7 @@ const TEACHER_TERMINALIZATION_MARGIN_SECONDS: i64 = 5 * 60;
 const TEACHER_MAX_GPU_SECONDS: u64 = 60 * 60;
 const TEACHER_MAX_CALLS: u8 = 64;
 const TEACHER_MAX_PARALLEL_RUNS: u8 = 16;
+pub(crate) const TEACHER_MAX_DECISIONS: u32 = 4_096;
 const MAX_ACTIVE_GPU_LAUNCHES: usize = 18;
 pub(crate) const TICK_LEASE_TTL_SECONDS: u64 = 10 * 60;
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -942,6 +943,7 @@ pub(crate) struct SnapshotAnalysisAuthorization {
     capture_rights_state: String,
     projection_id: String,
     analyzer_provider_binding_sha256: String,
+    max_decisions: u32,
     complete_snapshot_disclosure_allowed: bool,
     output_training_allowed: bool,
     not_after: DateTime<Utc>,
@@ -955,16 +957,18 @@ impl SnapshotAnalysisAuthorization {
         capture_policy_version: String,
         capture_rights_state: String,
         analyzer_provider_binding_sha256: [u8; 32],
+        max_decisions: u32,
         not_after: DateTime<Utc>,
     ) -> Result<(Self, [u8; 32])> {
         let policy = Self {
-            schema_version: "dragontales.teacher-policy.v1".to_owned(),
+            schema_version: "dragontales.teacher-policy.v2".to_owned(),
             policy_id,
             scope: scope.clone(),
             capture_policy_version,
             capture_rights_state,
             projection_id: SNAPSHOT_ANALYSIS_PROJECTION_ID.to_owned(),
             analyzer_provider_binding_sha256: hex_digest(&analyzer_provider_binding_sha256),
+            max_decisions,
             complete_snapshot_disclosure_allowed: true,
             output_training_allowed: true,
             not_after,
@@ -1854,7 +1858,10 @@ pub(crate) enum TeacherGpuTickWrite {
 }
 
 enum TeacherGpuClaimPreparation {
-    Ready(Box<TeacherJobClaim>),
+    Ready {
+        claim: Box<TeacherJobClaim>,
+        created_decision: bool,
+    },
     Advanced(SnapshotLocalRejectionWrite),
     None,
 }
@@ -3128,6 +3135,9 @@ pub(crate) struct ExpiryStatusWrite {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationStatusWrite {
     pub(crate) provider_binding_sha256: String,
+    pub(crate) max_decisions: u32,
+    pub(crate) claimed_decisions: u32,
+    pub(crate) remaining_decisions: u32,
     pub(crate) active_teacher_jobs: u64,
     pub(crate) active_ambiguous_teacher_jobs: u64,
     pub(crate) prepared_teacher_gpu_jobs: u64,
@@ -4115,10 +4125,11 @@ impl Records {
         &self,
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
+        max_decisions: u32,
         now: DateTime<Utc>,
     ) -> Result<RecordsStatusWrite> {
         self.store
-            .status(scope, teacher_provider_binding_sha256, now)
+            .status(scope, teacher_provider_binding_sha256, max_decisions, now)
             .await
     }
 
@@ -6186,6 +6197,22 @@ impl RecordStore {
         Ok(Some(index))
     }
 
+    async fn teacher_decision_count(&self, scope: &Scope) -> Result<u32> {
+        let key_prefix = teacher_job_batch_index_prefix(scope);
+        let prefix = ObjectPath::parse(&key_prefix)?;
+        let mut listed = self.objects.list(Some(&prefix));
+        let mut count = 0_u32;
+        while let Some(meta) = listed.next().await {
+            let key = meta?.location.to_string();
+            validate_teacher_job_batch_index_path(&key_prefix, &key)?;
+            if count >= TEACHER_MAX_DECISIONS {
+                bail!("teacher decision claims exceed {TEACHER_MAX_DECISIONS}");
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
     async fn load_teacher_gpu_slot(
         &self,
         scope: &Scope,
@@ -7075,6 +7102,7 @@ impl RecordStore {
         source_authorization_sha256: &[u8; 32],
         config: &SnapshotAnalyzerConfig,
         max_gpu_seconds: u64,
+        claimed_decisions: u32,
         now: DateTime<Utc>,
     ) -> Result<TeacherGpuClaimPreparation> {
         let Some(closed_hour) = self
@@ -7098,6 +7126,13 @@ impl RecordStore {
             return Ok(TeacherGpuClaimPreparation::None);
         };
         let batch_id = decode_hex_digest(&batch.snapshot_batch_id)?;
+        let created_decision = self
+            .load_teacher_job_index_by_batch(scope, &batch_id)
+            .await?
+            .is_none();
+        if created_decision && claimed_decisions >= authorization.max_decisions {
+            return Ok(TeacherGpuClaimPreparation::None);
+        }
         let prepared = match self
             .prepare_teacher_analysis(scope, &batch_id, config, now)
             .await?
@@ -7122,7 +7157,10 @@ impl RecordStore {
             .await?;
         let claim: TeacherJobClaim = serde_json::from_slice(&claim_payload)?;
         validate_teacher_job_claim(scope, &prepared.teacher_job_id, &claim, &claim_payload)?;
-        Ok(TeacherGpuClaimPreparation::Ready(Box::new(claim)))
+        Ok(TeacherGpuClaimPreparation::Ready {
+            claim: Box::new(claim),
+            created_decision,
+        })
     }
 
     async fn claim_teacher_gpu_run(
@@ -7157,6 +7195,7 @@ impl RecordStore {
         {
             return Ok(write);
         }
+        let mut claimed_decisions = self.teacher_decision_count(scope).await?;
         let active = self
             .load_active_teacher_jobs(scope, &provider_binding_sha256, now)
             .await?;
@@ -7195,11 +7234,22 @@ impl RecordStore {
                     &source_authorization_sha256,
                     &config,
                     max_gpu_seconds,
+                    claimed_decisions,
                     now,
                 )
                 .await?
             {
-                TeacherGpuClaimPreparation::Ready(claim) => *claim,
+                TeacherGpuClaimPreparation::Ready {
+                    claim,
+                    created_decision,
+                } => {
+                    if created_decision {
+                        claimed_decisions = claimed_decisions
+                            .checked_add(1)
+                            .context("teacher decision count overflow")?;
+                    }
+                    *claim
+                }
                 TeacherGpuClaimPreparation::Advanced(write) => {
                     return Ok(TeacherGpuTickWrite::Advanced(write));
                 }
@@ -7274,11 +7324,22 @@ impl RecordStore {
                     &source_authorization_sha256,
                     &config,
                     max_gpu_seconds,
+                    claimed_decisions,
                     now,
                 )
                 .await?
             {
-                TeacherGpuClaimPreparation::Ready(claim) => *claim,
+                TeacherGpuClaimPreparation::Ready {
+                    claim,
+                    created_decision,
+                } => {
+                    if created_decision {
+                        claimed_decisions = claimed_decisions
+                            .checked_add(1)
+                            .context("teacher decision count overflow")?;
+                    }
+                    *claim
+                }
                 TeacherGpuClaimPreparation::Advanced(write) => {
                     advanced = Some(write);
                     break;
@@ -9152,10 +9213,13 @@ impl RecordStore {
         &self,
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
+        max_decisions: u32,
         now: DateTime<Utc>,
     ) -> Result<RecordsStatusWrite> {
+        validate_teacher_max_decisions(max_decisions)?;
         let capture = self.capture_status(scope, now).await?;
         let expiry = self.expiry_status(scope, now).await?;
+        let claimed_decisions = self.teacher_decision_count(scope).await?;
         let student = self
             .load_student_reservation(scope, teacher_provider_binding_sha256)
             .await?
@@ -9174,8 +9238,12 @@ impl RecordStore {
             .filter(|source| !consumed.contains(source.reference.teacher_job_id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let mut generation =
-            summarize_generation(hex_digest(teacher_provider_binding_sha256), &unconsumed);
+        let mut generation = summarize_generation(
+            hex_digest(teacher_provider_binding_sha256),
+            &unconsumed,
+            max_decisions,
+            claimed_decisions,
+        );
         let mut active_ambiguous_teacher_jobs = 0_u64;
         let mut prepared_teacher_gpu_jobs = 0_u64;
         let mut terminal_not_started_teacher_jobs = HashSet::new();
@@ -9300,7 +9368,7 @@ impl RecordStore {
             }
         });
         Ok(RecordsStatusWrite {
-            schema_version: "dragontales.status-records.v4",
+            schema_version: "dragontales.status-records.v5",
             scope: scope.clone(),
             capture,
             expiry,
@@ -13437,6 +13505,8 @@ fn unconsumed_teacher_results(
 fn summarize_generation(
     provider_binding_sha256: String,
     sources: &[VerifiedTeacherResultObject],
+    max_decisions: u32,
+    claimed_decisions: u32,
 ) -> GenerationStatusWrite {
     let mut grouped = BTreeMap::<String, (Option<TeacherOutput>, BTreeSet<String>)>::new();
     let mut raw_entries = 0_u64;
@@ -13515,6 +13585,9 @@ fn summarize_generation(
     }
     GenerationStatusWrite {
         provider_binding_sha256,
+        max_decisions,
+        claimed_decisions,
+        remaining_decisions: max_decisions.saturating_sub(claimed_decisions),
         active_teacher_jobs: 0,
         active_ambiguous_teacher_jobs: 0,
         prepared_teacher_gpu_jobs: 0,
@@ -13912,18 +13985,26 @@ fn validate_snapshot_analysis_authorization(
     scope: &Scope,
     authorization: &SnapshotAnalysisAuthorization,
 ) -> Result<()> {
-    if authorization.schema_version != "dragontales.teacher-policy.v1"
+    if authorization.schema_version != "dragontales.teacher-policy.v2"
         || !valid_analysis_identifier(&authorization.policy_id, 128)
         || authorization.scope != *scope
         || !bounded_nonempty(&authorization.capture_policy_version, 256)
         || !bounded_nonempty(&authorization.capture_rights_state, 128)
         || authorization.projection_id != SNAPSHOT_ANALYSIS_PROJECTION_ID
         || !valid_lowercase_sha256(&authorization.analyzer_provider_binding_sha256)
+        || validate_teacher_max_decisions(authorization.max_decisions).is_err()
         || !authorization.complete_snapshot_disclosure_allowed
         || !authorization.output_training_allowed
         || authorization.not_after.timestamp() <= 0
     {
         bail!("teacher policy is invalid or lacks disclosure and training authority");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_teacher_max_decisions(max_decisions: u32) -> Result<()> {
+    if !(1..=TEACHER_MAX_DECISIONS).contains(&max_decisions) {
+        bail!("teacher max_decisions must be in 1..={TEACHER_MAX_DECISIONS}");
     }
     Ok(())
 }
@@ -17132,10 +17213,25 @@ fn retained_time_key(value: DateTime<Utc>) -> String {
 
 fn teacher_job_batch_index_key(scope: &Scope, snapshot_batch_id: &[u8; 32]) -> String {
     format!(
-        "{}/indexes/teacher/by-batch/{}.json",
-        scope_prefix(scope),
+        "{}/{}.json",
+        teacher_job_batch_index_prefix(scope),
         hex_digest(snapshot_batch_id)
     )
+}
+
+fn teacher_job_batch_index_prefix(scope: &Scope) -> String {
+    format!("{}/indexes/teacher/by-batch", scope_prefix(scope))
+}
+
+fn validate_teacher_job_batch_index_path(prefix: &str, key: &str) -> Result<()> {
+    let snapshot_batch_id = key
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_prefix('/'))
+        .and_then(|value| value.strip_suffix(".json"));
+    if snapshot_batch_id.is_none_or(|value| !valid_lowercase_sha256(value)) {
+        bail!("teacher decision index has a malformed object key");
+    }
+    Ok(())
 }
 
 fn teacher_job_frontier_prefix(scope: &Scope, provider_binding_sha256: &[u8; 32]) -> String {
@@ -18584,12 +18680,22 @@ mod tests {
         analyzer: &SnapshotAnalyzerConfig,
         not_after: DateTime<Utc>,
     ) -> (SnapshotAnalysisAuthorization, [u8; 32]) {
+        test_snapshot_authorization_with_limit(scope, analyzer, TEACHER_MAX_DECISIONS, not_after)
+    }
+
+    fn test_snapshot_authorization_with_limit(
+        scope: &Scope,
+        analyzer: &SnapshotAnalyzerConfig,
+        max_decisions: u32,
+        not_after: DateTime<Utc>,
+    ) -> (SnapshotAnalysisAuthorization, [u8; 32]) {
         SnapshotAnalysisAuthorization::root_owned(
             "test-policy".to_owned(),
             scope.clone(),
             "test-v1".to_owned(),
             "authorized".to_owned(),
             analyzer.provider_binding_sha256().unwrap(),
+            max_decisions,
             not_after,
         )
         .unwrap()
@@ -20925,6 +21031,7 @@ mod tests {
             "test-v1".to_owned(),
             "authorized".to_owned(),
             [8; 32],
+            TEACHER_MAX_DECISIONS,
             now + TimeDelta::days(30),
         )
         .unwrap();
@@ -20964,6 +21071,7 @@ mod tests {
             "test-v1".to_owned(),
             "authorized".to_owned(),
             [8; 32],
+            TEACHER_MAX_DECISIONS,
             now + TimeDelta::days(30),
         )
         .unwrap();
@@ -23185,6 +23293,230 @@ mod tests {
         );
     }
 
+    #[test]
+    fn teacher_decision_limit_is_bounded_and_bound_to_authorization() {
+        let scope = qualification_scope();
+        let analyzer = test_snapshot_analyzer(1_024 * 1_024);
+        let not_after = Utc::now().with_nanosecond(0).unwrap() + TimeDelta::days(1);
+        let (one, one_sha256) =
+            test_snapshot_authorization_with_limit(&scope, &analyzer, 1, not_after);
+        let (two, two_sha256) =
+            test_snapshot_authorization_with_limit(&scope, &analyzer, 2, not_after);
+
+        assert_eq!(one.schema_version, "dragontales.teacher-policy.v2");
+        assert_eq!(
+            one.analyzer_provider_binding_sha256,
+            two.analyzer_provider_binding_sha256
+        );
+        assert_eq!((one.max_decisions, two.max_decisions), (1, 2));
+        assert_ne!(one_sha256, two_sha256);
+        for invalid in [0, TEACHER_MAX_DECISIONS + 1] {
+            assert!(
+                SnapshotAnalysisAuthorization::root_owned(
+                    "test-policy".to_owned(),
+                    scope.clone(),
+                    "test-v1".to_owned(),
+                    "authorized".to_owned(),
+                    analyzer.provider_binding_sha256().unwrap(),
+                    invalid,
+                    not_after,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn teacher_decision_counter_rejects_malformed_index_keys() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = gpu_launch_test_store(Arc::clone(&objects));
+        let scope = qualification_scope();
+        let key = ObjectPath::parse(format!(
+            "{}/not-a-sha256.json",
+            teacher_job_batch_index_prefix(&scope)
+        ))
+        .unwrap();
+        objects
+            .put(&key, Bytes::from_static(b"not-read").into())
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .teacher_decision_count(&scope)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("malformed object key")
+        );
+    }
+
+    #[actix_web::test]
+    async fn capped_workload_repairs_an_index_written_before_its_claim() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = gpu_launch_test_store(objects);
+        let scope = qualification_scope();
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        persist_gpu_test_traces(&store, &scope, now, 1).await;
+        let analyzer = test_gpu_snapshot_analyzer(60, 1, 1);
+        let (authorization, authorization_sha256) =
+            test_snapshot_authorization_with_limit(&scope, &analyzer, 1, now + TimeDelta::days(1));
+        let hour = store
+            .next_snapshot_hour(&scope, &authorization, &authorization_sha256, now)
+            .await
+            .unwrap()
+            .unwrap();
+        let batch = store
+            .freeze_snapshot_batch_if_present(
+                &scope,
+                authorization.clone(),
+                authorization_sha256,
+                hour,
+                hour,
+                1,
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let batch_id = decode_hex_digest(&batch.snapshot_batch_id).unwrap();
+        let prepared = match store
+            .prepare_teacher_analysis(&scope, &batch_id, &analyzer, now)
+            .await
+            .unwrap()
+        {
+            PreparedTeacherAnalysisLoad::Ready(prepared) => *prepared,
+            PreparedTeacherAnalysisLoad::Advanced(_) => panic!("test trace must be analyzable"),
+        };
+        let index = TeacherJobIndex {
+            schema_version: "dragontales.teacher-job-index.v2".to_owned(),
+            scope: scope.clone(),
+            snapshot_batch_id: batch.snapshot_batch_id,
+            teacher_job_id: hex_digest(&prepared.teacher_job_id),
+            expires_at: prepared.definition.expires_at,
+            claim: TeacherJobClaim {
+                schema_version: "dragontales.teacher-job-claim.v2".to_owned(),
+                scope: scope.clone(),
+                teacher_job_id: hex_digest(&prepared.teacher_job_id),
+                definition: prepared.definition,
+                claimed_at: now,
+            },
+        };
+        store
+            .put_create_same(
+                &encode_json(teacher_job_batch_index_key(&scope, &batch_id), &index).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.teacher_decision_count(&scope).await.unwrap(), 1);
+
+        let launch = store
+            .claim_teacher_gpu_run(
+                &scope,
+                authorization,
+                authorization_sha256,
+                analyzer,
+                now + TimeDelta::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(launch, TeacherGpuTickWrite::Launch(_)));
+        let teacher_job_id = decode_hex_digest(&index.teacher_job_id).unwrap();
+        assert!(
+            store
+                .exists(&teacher_job_claim_key(&scope, &teacher_job_id))
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.teacher_decision_count(&scope).await.unwrap(), 1);
+    }
+
+    #[actix_web::test]
+    async fn workload_teacher_decision_limit_survives_terminalization_and_provider_rotation() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = gpu_launch_test_store(objects);
+        let scope = qualification_scope();
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        persist_gpu_test_traces(&store, &scope, now, 2).await;
+
+        let first_analyzer = test_gpu_snapshot_analyzer(60, 2, 1);
+        let first_binding = first_analyzer.provider_binding_sha256().unwrap();
+        let (first_authorization, first_authorization_sha256) =
+            test_snapshot_authorization_with_limit(
+                &scope,
+                &first_analyzer,
+                1,
+                now + TimeDelta::days(1),
+            );
+        let launch = match store
+            .claim_teacher_gpu_run(
+                &scope,
+                first_authorization,
+                first_authorization_sha256,
+                first_analyzer.clone(),
+                now,
+            )
+            .await
+            .unwrap()
+        {
+            TeacherGpuTickWrite::Launch(write) => write,
+            _ => panic!("first bounded teacher tick must launch"),
+        };
+        assert_eq!(launch.call_count, 1);
+        assert_eq!(store.teacher_decision_count(&scope).await.unwrap(), 1);
+
+        let teacher_run_id = decode_hex_digest(&launch.teacher_run_id).unwrap();
+        let started_at = now + TimeDelta::seconds(1);
+        store
+            .begin_teacher_gpu_run(&scope, &teacher_run_id, first_analyzer.clone(), started_at)
+            .await
+            .unwrap();
+        let terminalized_at = started_at + TimeDelta::seconds(62);
+        store
+            .terminalize_teacher_gpu_run(&scope, &teacher_run_id, first_analyzer, terminalized_at)
+            .await
+            .unwrap();
+
+        let mut rotated_analyzer = test_gpu_snapshot_analyzer(60, 2, 1);
+        rotated_analyzer.deployment_sha256 = [9; 32];
+        let rotated_binding = rotated_analyzer.provider_binding_sha256().unwrap();
+        assert_ne!(first_binding, rotated_binding);
+        let (rotated_authorization, rotated_authorization_sha256) =
+            test_snapshot_authorization_with_limit(
+                &scope,
+                &rotated_analyzer,
+                1,
+                now + TimeDelta::days(1),
+            );
+        assert!(matches!(
+            store
+                .claim_teacher_gpu_run(
+                    &scope,
+                    rotated_authorization,
+                    rotated_authorization_sha256,
+                    rotated_analyzer,
+                    terminalized_at + TimeDelta::seconds(1),
+                )
+                .await
+                .unwrap(),
+            TeacherGpuTickWrite::Hold
+        ));
+        assert_eq!(store.teacher_decision_count(&scope).await.unwrap(), 1);
+
+        let status = store
+            .status(
+                &scope,
+                &rotated_binding,
+                1,
+                terminalized_at + TimeDelta::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.generation.max_decisions, 1);
+        assert_eq!(status.generation.claimed_decisions, 1);
+        assert_eq!(status.generation.remaining_decisions, 0);
+    }
+
     #[actix_web::test]
     async fn gpu_slots_fan_out_to_cap_and_restart_does_not_expand_the_backlog() {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -23258,7 +23590,12 @@ mod tests {
             .len();
         assert_eq!(active_after_cap, 3, "cap may prepare only one bounded seed");
         let capped_status = restarted
-            .status(&scope, &provider_binding, now + TimeDelta::seconds(2))
+            .status(
+                &scope,
+                &provider_binding,
+                TEACHER_MAX_DECISIONS,
+                now + TimeDelta::seconds(2),
+            )
             .await
             .unwrap();
         assert_eq!(capped_status.generation.active_teacher_gpu_runs, 2);
@@ -23370,11 +23707,12 @@ mod tests {
                     &authorization_sha256,
                     &analyzer,
                     60,
+                    0,
                     now,
                 )
                 .await
                 .unwrap(),
-            TeacherGpuClaimPreparation::Ready(_)
+            TeacherGpuClaimPreparation::Ready { .. }
         ));
         let slot = new_teacher_gpu_slot(
             &scope,
@@ -23602,7 +23940,12 @@ mod tests {
         assert!(matches!(winner, TeacherGpuCallExecution::NotStarted { .. }));
 
         let first_status = store
-            .status(&scope, &provider_binding, terminalized_at)
+            .status(
+                &scope,
+                &provider_binding,
+                TEACHER_MAX_DECISIONS,
+                terminalized_at,
+            )
             .await
             .unwrap();
         assert_eq!(first_status.generation.active_teacher_jobs, 0);
@@ -23685,7 +24028,12 @@ mod tests {
         assert_eq!(second_terminal.ambiguous_calls, 1);
         assert_eq!(second_terminal.not_started_calls, 0);
         let second_status = store
-            .status(&scope, &provider_binding, second_terminalized_at)
+            .status(
+                &scope,
+                &provider_binding,
+                TEACHER_MAX_DECISIONS,
+                second_terminalized_at,
+            )
             .await
             .unwrap();
         assert_eq!(second_status.generation.active_teacher_jobs, 1);
@@ -24135,6 +24483,7 @@ mod tests {
             "test-v1".to_owned(),
             "authorized".to_owned(),
             provider_binding,
+            TEACHER_MAX_DECISIONS,
             retention_until,
         )
         .unwrap();
@@ -24277,7 +24626,12 @@ mod tests {
             Some(second_hour)
         );
         let status = store
-            .status(&scope, &provider_binding, after_abandoned_expiry)
+            .status(
+                &scope,
+                &provider_binding,
+                TEACHER_MAX_DECISIONS,
+                after_abandoned_expiry,
+            )
             .await
             .unwrap();
         assert_eq!(status.generation.active_teacher_jobs, 1);
@@ -24289,6 +24643,7 @@ mod tests {
             .status(
                 &scope,
                 &provider_binding,
+                TEACHER_MAX_DECISIONS,
                 retention_until + TimeDelta::seconds(1),
             )
             .await
@@ -24378,6 +24733,7 @@ mod tests {
                 "stale-v1".to_owned(),
                 "authorized".to_owned(),
                 [6; 32],
+                TEACHER_MAX_DECISIONS,
                 now + TimeDelta::days(1),
             )
             .unwrap();
@@ -24411,6 +24767,7 @@ mod tests {
             "test-v1".to_owned(),
             "authorized".to_owned(),
             current_provider,
+            TEACHER_MAX_DECISIONS,
             now + TimeDelta::days(1),
         )
         .unwrap();
@@ -24450,7 +24807,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let status = store.status(&scope, &current_provider, now).await.unwrap();
+        let status = store
+            .status(&scope, &current_provider, TEACHER_MAX_DECISIONS, now)
+            .await
+            .unwrap();
         assert_eq!(status.generation.active_teacher_jobs, 0);
         assert_eq!(status.generation.active_ambiguous_teacher_jobs, 0);
     }
@@ -24977,7 +25337,10 @@ mod tests {
         assert_eq!(shard.values.route_eligible, 1);
         assert_eq!(shard.values.route_not_selected, 1);
         assert_eq!(shard.values.baseline, 1);
-        let status = records.status(&scope, &[7; 32], now).await.unwrap();
+        let status = records
+            .status(&scope, &[7; 32], TEACHER_MAX_DECISIONS, now)
+            .await
+            .unwrap();
         assert_eq!(status.capture.shards, 1);
         assert_eq!(status.capture.failed_shards, 0);
         assert_eq!(status.capture.values.observed, 1);
@@ -25278,7 +25641,12 @@ mod tests {
             .unwrap();
 
         let status = store
-            .status(&scope, &[7_u8; 32], now + TimeDelta::hours(2))
+            .status(
+                &scope,
+                &[7_u8; 32],
+                TEACHER_MAX_DECISIONS,
+                now + TimeDelta::hours(2),
+            )
             .await
             .unwrap();
         let status = serde_json::to_string(&status).unwrap();

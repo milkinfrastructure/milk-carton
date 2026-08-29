@@ -32,7 +32,7 @@ use super::{
     authenticate_traffic_key, build_route_runtime, build_server, candidate_health_failure,
     capture_sample_selected, config_scope, configured_traffic_keys, decode_lowercase_sha256,
     is_json_content_type, parse_openai_compatible_endpoint, start_records,
-    start_records_with_timeout, tick_once_with_records, validate_config_identity,
+    start_records_with_timeout, status_once, tick_once_with_records, validate_config_identity,
     validate_teacher_config,
 };
 use crate::records::{
@@ -254,6 +254,11 @@ fn gpu_teacher_file_config_requires_shared_r2_storage() {
         account_id: "a".repeat(32),
         bucket: "test-control".to_owned(),
     };
+    gpu.teacher.as_mut().unwrap().max_decisions = 0;
+    assert!(validate_teacher_config(&gpu).is_err());
+    gpu.teacher.as_mut().unwrap().max_decisions = 4_097;
+    assert!(validate_teacher_config(&gpu).is_err());
+    gpu.teacher.as_mut().unwrap().max_decisions = 1;
     validate_teacher_config(&gpu).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
@@ -425,6 +430,50 @@ async fn due_expiry_returns_before_teacher_readiness() {
     let output = tick_once_with_records(&config, now, records).await.unwrap();
     assert!(output.starts_with(r#"{"schema_version":"dragontales.expiry-receipt.v1""#));
     assert!(!output.contains("teacher-required"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[actix_web::test]
+async fn status_contract_exposes_workload_teacher_decision_limit() {
+    #[derive(Deserialize)]
+    struct GenerationContract {
+        max_decisions: u32,
+        claimed_decisions: u32,
+        remaining_decisions: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct RecordsContract {
+        schema_version: String,
+        generation: GenerationContract,
+    }
+
+    #[derive(Deserialize)]
+    struct StatusContract {
+        schema_version: String,
+        records: RecordsContract,
+    }
+
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("dragontales-status-contract-{}", Uuid::now_v7()));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let mut config = config(4_096, 1);
+    config.stores = local_stores(&root);
+    config.teacher.as_mut().unwrap().max_decisions = 7;
+
+    let raw = status_once(&config, Utc::now().with_nanosecond(0).unwrap())
+        .await
+        .unwrap();
+    let status: StatusContract = serde_json::from_str(&raw).unwrap();
+    assert_eq!(status.schema_version, "dragontales.status.v2");
+    assert_eq!(
+        status.records.schema_version,
+        "dragontales.status-records.v5"
+    );
+    assert_eq!(status.records.generation.max_decisions, 7);
+    assert_eq!(status.records.generation.claimed_decisions, 0);
+    assert_eq!(status.records.generation.remaining_decisions, 7);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -626,6 +675,7 @@ fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
             terms_sha256: "2".repeat(64),
             authorization_id: "test-authorization".into(),
             authorization_not_after: chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
+            max_decisions: 4_096,
             max_projected_bytes: 1_048_576,
             max_input_tokens: 1_048_576,
             max_output_tokens: 4_096,
