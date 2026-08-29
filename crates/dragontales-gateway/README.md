@@ -38,7 +38,7 @@ Build with the pinned Rust toolchain:
 cargo +1.95.0 build --locked --release --package dragontales-gateway
 ```
 
-Copy `deploy/dragontales-config.example.json`, replace the traffic and outcome key hashes, choose a stable non-secret traffic cohort ID, and set three distinct owner-only Local roots. `traffic_keys` contains 1 to 64 strict `{api_key_sha256, capture_allowed, cohort_id}` mappings. Set `capture_allowed: true` only for genuine user traffic with capture rights; production smoke and synthetic test keys must use `false`. Generate one request key without printing it:
+Copy `deploy/dragontales-config.example.json`, replace the traffic and outcome key hashes, choose a stable non-secret traffic cohort ID, and set three distinct owner-only Local roots. `traffic_keys` contains 1 to 64 strict `{api_key_sha256, capture_allowed, cohort_id}` mappings. Set `capture_allowed: true` only for inputs admitted to that exact eval: genuine user traffic with capture rights, or the isolated generated-mechanics campaign that cannot qualify real traffic. Deployment, canary, and ordinary synthetic test keys use `false`. Generate one request key without printing it:
 
 ```sh
 install -d -m 0700 "$PWD/.dragontales-secrets"

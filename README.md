@@ -102,9 +102,21 @@ See [`crates/dragontales-gateway/README.md`](crates/dragontales-gateway/README.m
 
 ### Cloud-mechanics proof
 
-The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=10`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. Milk stops scheduling new paid work at $850 of cumulative spend, and $1,000 is the hard ceiling.
+The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=20`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. The first Baseten-selected 20-call job must pass the exact admitted teacher profile before another provider create is authorized. Milk stops scheduling new paid work at $850 of cumulative spend, and $1,000 is the hard ceiling.
 
 This check proves the deployment, capture, provider, training, short canary, fallback, signed-zero, teardown, and zero-compute mechanics. Because its traffic is generated, it cannot production-qualify the release or admit the resulting candidate for real application traffic.
+
+Run the pinned official-SDK driver with an owner-only credential for the dedicated capture-enabled mechanics key:
+
+```sh
+node tools/openai-production-smoke.mjs \
+  https://api.dragontales.milkinfrastructure.com/v1 \
+  /absolute/path/to/mechanics-credential.json \
+  <expected-gateway-config-sha256> \
+  --generated-mechanics
+```
+
+The driver caps each response at 128 tokens, verifies the deployed config digest and capture health before and after the run, and verifies the exact SDK body bytes, assigned partition, and baseline route revision for every request. Its canonical receipt retains only aggregate hashes, counts, timing, and success state; durable R2 readback remains a separate required gate.
 
 ## Production qualification
 
@@ -116,7 +128,7 @@ The hosted release is production-qualified only after one cloud run proves the c
 4. The deterministic winner passes authenticated canary and baseline-fallback checks.
 5. A signed zero route becomes active and Baseten and Modal are both observed at zero compute.
 
-A one-request paid teacher run qualifies only the teacher/provider path, not the product.
+A passing 20-call teacher job qualifies only that teacher/provider path, not the product.
 
 ## Development
 
