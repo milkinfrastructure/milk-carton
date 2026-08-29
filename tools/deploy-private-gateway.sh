@@ -599,7 +599,8 @@ def validate_gateway_config_file(path, repository):
         or within(path.resolve(strict=True), repository)
     ):
         raise DeployFailure("gateway config file must be owner-only mode 0600 outside the checkout")
-    return parse_gateway_config(read_regular(path, "gateway config", 65536))
+    raw = read_regular(path, "gateway config", 65536)
+    return raw, parse_gateway_config(raw)
 
 
 def validate_bootstrap_secrets(path, repository):
@@ -631,7 +632,7 @@ def validate_bootstrap_secrets(path, repository):
         raise DeployFailure("bootstrap secrets file is invalid")
     gateway_config_raw = secrets_value["DRAGONTALES_CONFIG_JSON"].encode("utf-8")
     gateway_config = parse_gateway_config(gateway_config_raw)
-    return canonical_json(secrets_value), gateway_config
+    return canonical_json(secrets_value), gateway_config_raw, gateway_config
 
 
 def validate_smoke_credential(path, gateway_config):
@@ -743,7 +744,7 @@ def main():
         application_id = None
         requested_evidence = Path(sys.argv[4])
         credential_file = Path(sys.argv[5])
-        bootstrap_secret_input, gateway_config = validate_bootstrap_secrets(
+        bootstrap_secret_input, gateway_config_raw, gateway_config = validate_bootstrap_secrets(
             Path(sys.argv[6]), repository,
         )
     else:
@@ -751,7 +752,9 @@ def main():
         application_id = sys.argv[3]
         requested_evidence = Path(sys.argv[4])
         credential_file = Path(sys.argv[5])
-        gateway_config = validate_gateway_config_file(Path(sys.argv[6]), repository)
+        gateway_config_raw, gateway_config = validate_gateway_config_file(
+            Path(sys.argv[6]), repository,
+        )
         bootstrap_secret_input = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
         raise DeployFailure("deploy evidence directory must be a new absolute path")
@@ -775,6 +778,7 @@ def main():
     smoke_key_sha256, smoke_cohort_sha256 = validate_smoke_credential(
         credential_file, gateway_config,
     )
+    gateway_config_sha256 = digest(gateway_config_raw)
 
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}
     forbidden = re.compile(
@@ -834,6 +838,7 @@ def main():
     previous = None
     previous_worker = None
     temporary_config = None
+    deployment_secrets = None
     scratch = Path(tempfile.mkdtemp(prefix="milk-gateway-deploy."))
     docker_config = scratch / "docker-config"
     docker_config.mkdir(mode=0o700)
@@ -956,7 +961,7 @@ def main():
         })
         return succeeded
 
-    def probe_health(phase, attempt):
+    def probe_health(phase, attempt, expected_config_sha256):
         body_path = scratch / f"health-{phase}-{attempt}.json"
         result = runner.run(
             f"{phase}-health-{attempt:02d}",
@@ -970,6 +975,7 @@ def main():
         )
         http_status = None
         healthy = False
+        active_config_sha256 = None
         try:
             status_text = result.stdout.decode("ascii", errors="strict")
             if re.fullmatch(r"[0-9]{3}", status_text):
@@ -977,7 +983,17 @@ def main():
             if result.returncode == 0 and http_status == 200 and body_path.is_file():
                 body = read_regular(body_path, "health response", 65536)
                 value = parse_json(body, "health response", 65536)
-                healthy = isinstance(value, dict) and value.get("status") == "ok"
+                candidate_config_sha256 = value.get("config_sha256") if isinstance(value, dict) else None
+                if isinstance(candidate_config_sha256, str) and SHA256.fullmatch(candidate_config_sha256):
+                    active_config_sha256 = candidate_config_sha256
+                healthy = (
+                    isinstance(value, dict)
+                    and value.get("status") == "ok"
+                    and (
+                        expected_config_sha256 is None
+                        or active_config_sha256 == expected_config_sha256
+                    )
+                )
         except (ContractFailure, UnicodeError):
             healthy = False
         finally:
@@ -985,12 +1001,14 @@ def main():
                 body_path.unlink()
             except FileNotFoundError:
                 pass
-        return http_status, healthy
+        return http_status, healthy, active_config_sha256
 
-    def poll(phase, expected_image, expected_worker, worker_must_differ):
+    def poll(phase, expected_image, expected_worker, worker_must_differ,
+             expected_config_sha256):
         last = {
             "http_status": None,
             "health_ready": False,
+            "config_sha256": None,
             "worker_ready": False,
             "image_ready": False,
             "instances_ready": False,
@@ -998,7 +1016,11 @@ def main():
             "application_version": None,
         }
         for attempt in range(1, POLL_ATTEMPTS + 1):
-            last["http_status"], last["health_ready"] = probe_health(phase, attempt)
+            (
+                last["http_status"],
+                last["health_ready"],
+                last["config_sha256"],
+            ) = probe_health(phase, attempt, expected_config_sha256)
             try:
                 status = wrangler(
                     f"{phase}-worker-status-{attempt:02d}",
@@ -1051,7 +1073,12 @@ def main():
                     "phase": phase,
                     "attempts": attempt,
                     "http_status": last["http_status"],
-                    "health_contract": "status-ok",
+                    "health_contract": (
+                        "status-ok-config-sha256"
+                        if expected_config_sha256 is not None
+                        else "status-ok"
+                    ),
+                    "config_sha256": last["config_sha256"],
                     "content_retained": False,
                     "active_instances": last["active_instances"],
                     "application_version": last["application_version"],
@@ -1070,7 +1097,12 @@ def main():
             "phase": phase,
             "attempts": POLL_ATTEMPTS,
             "http_status": last["http_status"],
-            "health_contract": "status-ok",
+            "health_contract": (
+                "status-ok-config-sha256"
+                if expected_config_sha256 is not None
+                else "status-ok"
+            ),
+            "config_sha256": last["config_sha256"],
             "content_retained": False,
             "active_instances": last["active_instances"],
             "application_version": last["application_version"],
@@ -1178,6 +1210,7 @@ def main():
             "admission_sha256": admitted["admission_sha256"],
             "admitted_image_reference": admitted["image_reference"],
             "admitted_child_reference": admitted["child_reference"],
+            "gateway_config_sha256": gateway_config_sha256,
             "target_image": remote_image,
             "rollout": "immediate",
             "started_at": started_at,
@@ -1331,6 +1364,16 @@ def main():
             remote_image,
             repository / "deploy/cloudflare/worker.js",
         )
+        deploy_arguments = [
+            "deploy", "--strict", "--containers-rollout", "immediate",
+            "--message", f"milk private gateway {operation_id}",
+        ]
+        if not bootstrap:
+            deployment_secrets = scratch / "deploy-secrets.json"
+            write_private(deployment_secrets, canonical_json({
+                "DRAGONTALES_CONFIG_JSON": gateway_config_raw.decode("utf-8"),
+            }))
+            deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
         rechecked_head = runner.run(
             "git-predeploy-head",
             [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
@@ -1356,9 +1399,12 @@ def main():
             raise ContractFailure("source authority changed before deployment")
         deploy_started = True
         wrangler(
-            "deploy-worker-and-container", "deploy", "--strict", "--containers-rollout", "immediate",
-            "--message", f"milk private gateway {operation_id}", timeout=900, config=temporary_config,
+            "deploy-worker-and-container", *deploy_arguments, timeout=900,
+            sensitive=not bootstrap, config=temporary_config,
         )
+        if deployment_secrets is not None:
+            deployment_secrets.unlink()
+            deployment_secrets = None
 
         if bootstrap:
             stage = "bootstrap-application-discovery"
@@ -1412,6 +1458,7 @@ def main():
         stage = "live-acceptance"
         current_worker, current_image, current_app_version = poll(
             "bootstrap" if bootstrap else "deploy", remote_image, previous_worker, True,
+            gateway_config_sha256,
         )
         stage = "official-sdk-smoke"
         sdk_result = runner.run(
@@ -1462,6 +1509,7 @@ def main():
             "application_id": application_id,
             "application_version": current_app_version,
             "image": current_image,
+            "gateway_config_sha256": gateway_config_sha256,
             "rollout": "immediate",
             "accepted": True,
         })
@@ -1501,6 +1549,7 @@ def main():
                 rollback_command_succeeded = True
                 _, _, rollback_app_version = poll(
                     "rollback", previous["image"], previous["worker_version_id"], False,
+                    None,
                 )
                 rollback_accepted = True
                 outcome = "deployment_failed_rolled_back"
@@ -1521,6 +1570,8 @@ def main():
                 evidence.write("rollback.json", rollback_observation)
             if temporary_config is not None:
                 temporary_config.unlink(missing_ok=True)
+            if deployment_secrets is not None:
+                deployment_secrets.unlink(missing_ok=True)
             if scratch is not None and scratch.exists():
                 shutil.rmtree(scratch)
             cloudflare_environment.pop("CLOUDFLARE_API_TOKEN", None)

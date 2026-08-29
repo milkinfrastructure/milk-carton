@@ -92,7 +92,7 @@ target/release/dragontales-gateway --config "$PWD/dragontales.json" status
 
 ## Production deployment
 
-Production deploys an admitted `linux/amd64` image to a Cloudflare Worker and Container. The deployer copies the exact image layers into Cloudflare's registry, installs the eight Worker secrets, checks one healthy instance, and runs the official OpenAI SDK smoke. A failed update rolls back automatically.
+Production deploys an admitted `linux/amd64` image to a Cloudflare Worker and Container. The non-bootstrap deploy includes the reviewed `DRAGONTALES_CONFIG_JSON` in the same versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update rolls the Worker version and config binding back together.
 
 The CPU-only gateway release is 12.02 MiB compressed and contains no shell, package manager, Python, Node, GPU runtime, or model weights.
 

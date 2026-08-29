@@ -255,7 +255,11 @@ if name == "sleep":
 if name == "curl":
     output = Path(args[args.index("--output") + 1])
     failed = state["mode"] in {"health_fail", "rollback_fail"} and state["deployment"] == "deployed"
-    output.write_text('{"status":"degraded","provider":"uncontrolled"}' if failed else '{"status":"ok","provider":"uncontrolled"}')
+    output.write_text(json.dumps({
+        "config_sha256": state["active_config_sha256"],
+        "provider": "uncontrolled",
+        "status": "degraded" if failed else "ok",
+    }, sort_keys=True, separators=(",", ":")))
     print("503" if failed else "200", end="")
     done()
 
@@ -305,6 +309,9 @@ if name == "wrangler":
             done(1)
         supplied = json.loads(sys.stdin.read())
         state["installed_secret_names"] = sorted(supplied)
+        state["active_config_sha256"] = hashlib.sha256(
+            supplied["DRAGONTALES_CONFIG_JSON"].encode()
+        ).hexdigest()
     elif values[:2] == ["deployments", "status"]:
         version = state["previous_worker"] if state["deployment"] in {"initial", "rollback"} else state["current_worker"]
         print(json.dumps({"id": "deployment", "source": "api", "strategy": "percentage", "versions": [{"percentage": 100, "version_id": version}]}))
@@ -356,6 +363,23 @@ if name == "wrangler":
         config = json.loads(config_path.read_text())
         state["deploy_config"] = config
         state["target_image"] = config["containers"][0]["image"]
+        if not state.get("bootstrap", False):
+            if "--secrets-file" not in values:
+                done(2)
+            secrets_path = Path(values[values.index("--secrets-file") + 1])
+            if secrets_path.stat().st_mode & 0o777 != 0o600:
+                done(2)
+            supplied = json.loads(secrets_path.read_text())
+            if set(supplied) != {"DRAGONTALES_CONFIG_JSON"}:
+                done(2)
+            state["deployed_secret_names"] = sorted(supplied)
+            state["active_config_sha256"] = hashlib.sha256(
+                supplied["DRAGONTALES_CONFIG_JSON"].encode()
+            ).hexdigest()
+            if state["mode"] == "config_mismatch":
+                state["active_config_sha256"] = "0" * 64
+        elif "--secrets-file" in values:
+            done(2)
         state["deployment"] = "partial" if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"} else "deployed"
         if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"}:
             done(1)
@@ -363,6 +387,7 @@ if name == "wrangler":
         if state["mode"] == "rollback_fail":
             done(1)
         state["deployment"] = "rollback"
+        state["active_config_sha256"] = state["previous_config_sha256"]
     elif values[:2] == ["containers", "instances"]:
         version = 9 if state["deployment"] == "rollback" else 8
         print(json.dumps([{
@@ -402,6 +427,8 @@ class Fixture:
             "previous_worker": PREVIOUS_WORKER,
             "current_worker": CURRENT_WORKER,
             "previous_image": PREVIOUS_IMAGE,
+            "previous_config_sha256": "9" * 64,
+            "active_config_sha256": "9" * 64,
             "deployment": "initial",
             "remote_manifest": remote_manifest,
             "child_sha": child_sha,
@@ -521,6 +548,10 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertIn("--strict", deploy["arguments"])
         self.assertIn("--containers-rollout", deploy["arguments"])
         self.assertIn("immediate", deploy["arguments"])
+        self.assertIn("--secrets-file", deploy["arguments"])
+        self.assertEqual(state["deployed_secret_names"], ["DRAGONTALES_CONFIG_JSON"])
+        gateway_config_sha256 = sha256(fixture.gateway_config.read_bytes())
+        self.assertEqual(state["active_config_sha256"], gateway_config_sha256)
         deployed_config = state["deploy_config"]
         self.assertEqual(
             deployed_config["main"],
@@ -562,6 +593,11 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         )
         self.assertIs(sdk_smoke["authenticated"], True)
         self.assertIs(sdk_smoke["content_retained"], False)
+        current = json.loads((fixture.evidence / "current.json").read_text())
+        self.assertEqual(current["gateway_config_sha256"], gateway_config_sha256)
+        live_smoke = json.loads((fixture.evidence / "smoke-deploy.json").read_text())
+        self.assertEqual(live_smoke["config_sha256"], gateway_config_sha256)
+        self.assertEqual(live_smoke["health_contract"], "status-ok-config-sha256")
         manifest = json.loads(manifest_raw)
         for item in manifest["files"]:
             raw = (fixture.evidence / item["path"]).read_bytes()
@@ -629,6 +665,19 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(fixture.terminal()["failure_stage"], "official-sdk-smoke")
         self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
 
+    def test_live_config_digest_mismatch_rolls_back(self):
+        fixture = Fixture("config_mismatch")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fixture.state["deployment"], "rollback")
+        self.assertEqual(
+            fixture.state["active_config_sha256"],
+            fixture.state["previous_config_sha256"],
+        )
+        self.assertEqual(fixture.terminal()["failure_stage"], "live-acceptance")
+        self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
+
     def test_failed_rollback_is_a_distinct_terminal_failure(self):
         fixture = Fixture("rollback_fail")
         self.addCleanup(fixture.close)
@@ -676,6 +725,8 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         )
         self.assertLess(deploy_index, bulk_index)
         self.assertLess(bulk_index, acceptance_index)
+        deploy = commands[deploy_index]
+        self.assertNotIn("--secrets-file", deploy["arguments"])
         self.assertFalse(any("delete" in item["arguments"] for item in commands))
 
         intent = json.loads((fixture.evidence / "intent.json").read_text())

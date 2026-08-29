@@ -27,11 +27,11 @@ use uuid::Uuid;
 
 use super::{
     CANDIDATE_API_KEY_SHA256_HEADER, CANDIDATE_CREDENTIAL_PATH, CANDIDATE_CREDENTIAL_STATE_HEADER,
-    CaptureMode, Command, FileConfig, Gateway, ObjectStoreConfig, OpenAiCompatibleEndpoint,
-    OutcomeKind, StoreAccessPlan, StoresConfig, TeacherConfig, TraceRecorder, TrafficKeyConfig,
-    authenticate_traffic_key, build_route_runtime, build_server, candidate_health_failure,
-    capture_sample_selected, config_scope, configured_traffic_keys, decode_lowercase_sha256,
-    is_json_content_type, parse_openai_compatible_endpoint, start_records,
+    CONFIG_SHA256_HEADER, CaptureMode, Command, FileConfig, Gateway, ObjectStoreConfig,
+    OpenAiCompatibleEndpoint, OutcomeKind, StoreAccessPlan, StoresConfig, TeacherConfig,
+    TraceRecorder, TrafficKeyConfig, authenticate_traffic_key, build_route_runtime, build_server,
+    candidate_health_failure, capture_sample_selected, config_scope, configured_traffic_keys,
+    decode_lowercase_sha256, is_json_content_type, parse_openai_compatible_endpoint, start_records,
     start_records_with_timeout, status_once, tick_once_with_records, validate_config_identity,
     validate_teacher_config,
 };
@@ -565,6 +565,7 @@ struct StoredBodyProbe {
 #[derive(Deserialize)]
 struct HealthProbe {
     status: String,
+    config_sha256: String,
     capture: String,
     candidate: String,
     writer_alive: bool,
@@ -987,7 +988,7 @@ async fn candidate_credential_check_proves_loaded_absent_and_mismatch_without_ke
 }
 
 #[actix_web::test]
-async fn health_reports_capture_degradation_without_identity_or_content() {
+async fn health_reports_config_identity_without_credential_content() {
     let mut gateway_config = config(1_024, 1);
     gateway_config.capture_mode = CaptureMode::WholeBodyAuthorized;
     gateway_config.capture_basis_points = 10_000;
@@ -1001,6 +1002,17 @@ async fn health_reports_capture_degradation_without_identity_or_content() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let expected_config_sha256 = format!("{:x}", Sha256::digest(b"dragontales-test-config"));
+    assert_eq!(
+        response
+            .headers()
+            .get(CONFIG_SHA256_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected_config_sha256.as_str()
+    );
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
     let bytes = response.bytes().await.unwrap();
     assert!(
         !bytes
@@ -1014,6 +1026,7 @@ async fn health_reports_capture_degradation_without_identity_or_content() {
     );
     let health: HealthProbe = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(health.status, "degraded");
+    assert_eq!(health.config_sha256, expected_config_sha256);
     assert_eq!(health.capture, "unavailable");
     assert_eq!(health.candidate, "disabled");
     assert!(!health.writer_alive);

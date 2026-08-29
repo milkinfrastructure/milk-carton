@@ -19,11 +19,14 @@ assert not (root / "prepare-context.sh").exists()
 assert package["scripts"]["deploy"] == "../../tools/deploy-private-gateway.sh"
 assert "official-sdk-smoke" in deploy_script
 assert "automatic-rollback" in deploy_script
+assert 'deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])' in deploy_script
+assert '"DRAGONTALES_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
+assert "expected_config_sha256" in deploy_script
 assert 'import OpenAI from "openai"' in production_smoke
 assert "maxRetries: 0" in production_smoke
 assert "99.5% monthly" in operator_notes
 assert "staging run forces that one instance to restart" in operator_notes
-assert "controlled restart itself remains a manual release gate" in operator_notes
+assert "versioned Worker deploy" in operator_notes
 
 assert config["workers_dev"] is False
 assert config["preview_urls"] is False

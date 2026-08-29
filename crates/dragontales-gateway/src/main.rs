@@ -54,6 +54,7 @@ use route::{
 const CHAT_PATH: &str = "/v1/chat/completions";
 const OUTCOME_PATH: &str = "/v1/dragontales/outcomes";
 const CANDIDATE_CREDENTIAL_PATH: &str = "/healthz/candidate-credential";
+const CONFIG_SHA256_HEADER: &str = "x-dragontales-config-sha256";
 const OUTCOME_KEY_HEADER: &str = "x-dragontales-key";
 const TRACE_ID_HEADER: &str = "x-dragontales-trace-id";
 const CAPTURE_INTENT_HEADER: &str = "x-dragontales-capture-intent";
@@ -421,6 +422,7 @@ struct CaptureConfig {
 struct Gateway {
     client: reqwest::Client,
     upstream: Url,
+    config_sha256: [u8; 32],
     route_runtime: Arc<RwLock<Arc<RouteRuntime>>>,
     candidate_api_key_sha256: Option<[u8; 32]>,
     traffic_keys: Arc<[TrafficKey]>,
@@ -463,6 +465,7 @@ struct RouteRuntime {
 impl Gateway {
     fn production(
         config: &FileConfig,
+        config_sha256: [u8; 32],
         records: Option<Records>,
         candidate_api_key: Option<&str>,
     ) -> Result<Self> {
@@ -471,8 +474,9 @@ impl Gateway {
             config.baseline.allow_loopback_http,
         )?;
         let openai_api_key = required_env(OPENAI_API_KEY_ENV)?;
-        Self::with_route(
+        Self::with_route_config_identity(
             config,
+            config_sha256,
             upstream,
             records,
             RoutePolicy::baseline(),
@@ -493,8 +497,29 @@ impl Gateway {
         )
     }
 
+    #[cfg(test)]
     fn with_route(
         config: &FileConfig,
+        upstream: Url,
+        records: Option<Records>,
+        route: RoutePolicy,
+        openai_api_key: Option<&str>,
+        candidate_api_key: Option<&str>,
+    ) -> Result<Self> {
+        Self::with_route_config_identity(
+            config,
+            Sha256::digest(b"dragontales-test-config").into(),
+            upstream,
+            records,
+            route,
+            openai_api_key,
+            candidate_api_key,
+        )
+    }
+
+    fn with_route_config_identity(
+        config: &FileConfig,
+        config_sha256: [u8; 32],
         upstream: Url,
         records: Option<Records>,
         route: RoutePolicy,
@@ -600,6 +625,7 @@ impl Gateway {
         Ok(Self {
             client,
             upstream,
+            config_sha256,
             route_runtime: Arc::new(RwLock::new(route_runtime)),
             candidate_api_key_sha256,
             traffic_keys: traffic_keys.into(),
@@ -722,6 +748,7 @@ struct ErrorBody<'a> {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    config_sha256: String,
     capture: &'static str,
     candidate: &'static str,
     writer_alive: bool,
@@ -962,13 +989,15 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let config_json = std::env::var_os(CONFIG_JSON_ENV);
-    let config = load_selected_config(
+    let selected_config = load_selected_config(
         cli.config.as_deref(),
         config_json
             .as_deref()
             .map(std::ffi::OsStr::as_encoded_bytes),
         cli.command.as_ref(),
     )?;
+    let config = selected_config.value;
+    let config_sha256 = selected_config.sha256;
     let command = cli.command.unwrap_or(Command::Serve);
     let store_access = StoreAccessPlan::for_command(&command);
     match command {
@@ -998,8 +1027,12 @@ async fn main() -> Result<()> {
                 }
             };
             let candidate_api_key = optional_env(CANDIDATE_API_KEY_ENV)?;
-            let gateway =
-                Gateway::production(&config, records.clone(), candidate_api_key.as_deref())?;
+            let gateway = Gateway::production(
+                &config,
+                config_sha256,
+                records.clone(),
+                candidate_api_key.as_deref(),
+            )?;
             if config.route.is_some()
                 && let Some(records) = &records
             {
@@ -2024,7 +2057,13 @@ async fn open_store_partition(
     Ok(Some((objects, access)))
 }
 
-fn load_config(path: &Path, command: Option<&Command>) -> Result<FileConfig> {
+#[derive(Debug)]
+struct SelectedConfig {
+    value: FileConfig,
+    sha256: [u8; 32],
+}
+
+fn load_config(path: &Path, command: Option<&Command>) -> Result<SelectedConfig> {
     let deployment = command_uses_deployment_config(command);
     let mut input = if deployment {
         OperatorInput::open_serve(path, MAX_CONFIG_BYTES, "gateway config")?
@@ -2034,7 +2073,7 @@ fn load_config(path: &Path, command: Option<&Command>) -> Result<FileConfig> {
     let bytes = input.reread_unchanged()?;
     let config = parse_config(&bytes, &format!("config {}", path.display()), command)?;
     if deployment {
-        validate_serve_config_owner(&config, input.owner)?;
+        validate_serve_config_owner(&config.value, input.owner)?;
     }
     Ok(config)
 }
@@ -2043,7 +2082,7 @@ fn load_selected_config(
     path: Option<&Path>,
     config_json: Option<&[u8]>,
     command: Option<&Command>,
-) -> Result<FileConfig> {
+) -> Result<SelectedConfig> {
     match (path, config_json) {
         (Some(_), Some(_)) => {
             bail!("gateway config path and {CONFIG_JSON_ENV} are mutually exclusive")
@@ -2062,11 +2101,18 @@ fn load_selected_config(
     }
 }
 
-fn parse_config(bytes: &[u8], description: &str, command: Option<&Command>) -> Result<FileConfig> {
+fn parse_config(
+    bytes: &[u8],
+    description: &str,
+    command: Option<&Command>,
+) -> Result<SelectedConfig> {
     let config = serde_json::from_slice(bytes).with_context(|| format!("invalid {description}"))?;
     validate_config_identity(&config)?;
     validate_config_for_command(&config, command)?;
-    Ok(config)
+    Ok(SelectedConfig {
+        value: config,
+        sha256: Sha256::digest(bytes).into(),
+    })
 }
 
 fn validate_serve_config_owner(config: &FileConfig, owner: InputOwner) -> Result<()> {
@@ -2871,8 +2917,11 @@ async fn health(gateway: web::Data<Gateway>) -> HttpResponse {
     } else {
         StatusCode::OK
     })
+    .insert_header((header::CACHE_CONTROL, "no-store"))
+    .insert_header((CONFIG_SHA256_HEADER, bytes_hex(&gateway.config_sha256)))
     .json(HealthResponse {
         status: if degraded { "degraded" } else { "ok" },
+        config_sha256: bytes_hex(&gateway.config_sha256),
         capture,
         candidate,
         writer_alive: stats.writer_alive,
@@ -4481,7 +4530,8 @@ mod cli_tests {
             .unwrap();
         let config_json = local_example_config(&directory);
         let config_bytes = config_json.as_bytes();
-        load_selected_config(None, Some(config_bytes), None).unwrap();
+        let selected = load_selected_config(None, Some(config_bytes), None).unwrap();
+        assert_eq!(selected.sha256, Sha256::digest(config_bytes).as_slice());
         load_selected_config(None, Some(config_bytes), Some(&Command::Serve)).unwrap();
 
         let both = load_selected_config(
