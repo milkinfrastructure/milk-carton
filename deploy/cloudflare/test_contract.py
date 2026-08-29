@@ -58,7 +58,7 @@ assert config["routes"] == [
 assert config["containers"] == [
     {
         "class_name": "MilkCarton",
-        "image": "MILK_CARTON_ADMITTED_IMAGE_REQUIRED",
+        "image": "registry.invalid/milk-carton:admitted-image-required",
         "instance_type": "lite",
         "max_instances": 1,
     }

@@ -1078,7 +1078,10 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         config_raw = (ROOT / "deploy/cloudflare/wrangler.jsonc").read_text()
         config = json.loads(config_raw)
         self.assertEqual(config["main"], ".milk-private-deploy-script-required")
-        self.assertEqual(config["containers"][0]["image"], "MILK_CARTON_ADMITTED_IMAGE_REQUIRED")
+        self.assertEqual(
+            config["containers"][0]["image"],
+            "registry.invalid/milk-carton:admitted-image-required",
+        )
         self.assertEqual(
             config["routes"],
             [{"pattern": "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED", "custom_domain": True}],
