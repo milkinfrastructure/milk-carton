@@ -1092,8 +1092,8 @@ def main():
         commit = runner.run(
             "git-head", [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
         ).stdout.decode().strip()
-        if SHA1.fullmatch(commit) is None or commit != admitted["source_commit"]:
-            raise ContractFailure("release commit is not the deploy checkout HEAD")
+        if SHA1.fullmatch(commit) is None:
+            raise ContractFailure("deploy checkout HEAD is invalid")
         dirty = runner.run(
             "git-clean", [commands["git"], "status", "--porcelain=v1", "--untracked-files=all"],
         ).stdout
@@ -1108,11 +1108,36 @@ def main():
         }:
             raise ContractFailure("origin is not milkinfrastructure/milk-gateway")
         remote_head = runner.run(
-            "git-published-head", [commands["git"], "ls-remote", "--exit-code", "origin", "HEAD"],
+            "git-published-main",
+            [
+                commands["git"], "ls-remote", "--exit-code", "origin",
+                "refs/heads/main",
+            ],
             timeout=60,
         ).stdout.decode().split()
-        if remote_head != [commit, "HEAD"]:
-            raise ContractFailure("local HEAD is not the published origin HEAD")
+        if (
+            len(remote_head) != 2
+            or SHA1.fullmatch(remote_head[0]) is None
+            or remote_head[1] != "refs/heads/main"
+            or remote_head[0] != commit
+        ):
+            raise ContractFailure("deploy checkout is not published origin main")
+        published_main_commit = remote_head[0]
+        runner.run(
+            "git-fetch-published-main",
+            [
+                commands["git"], "fetch", "--quiet", "--no-tags", "origin",
+                "refs/heads/main",
+            ],
+            timeout=60,
+        )
+        runner.run(
+            "git-published-main-ancestor",
+            [
+                commands["git"], "merge-base", "--is-ancestor",
+                admitted["source_commit"], commit,
+            ],
+        )
 
         stage = "tool-authority"
         version_raw = runner.run("wrangler-version", [commands["wrangler"], "--version"]).stdout.decode()
@@ -1146,7 +1171,8 @@ def main():
             "bootstrap": bootstrap,
             "account_id": account_id,
             "source_repository": SOURCE_REPOSITORY,
-            "source_commit": commit,
+            "source_commit": admitted["source_commit"],
+            "deployment_source_commit": commit,
             "release_sha256": admitted["release_sha256"],
             "build_ops_log_reference_sha256": admitted["build_ops_log_reference_sha256"],
             "admission_sha256": admitted["admission_sha256"],
@@ -1314,11 +1340,19 @@ def main():
             [commands["git"], "status", "--porcelain=v1", "--untracked-files=all"],
         ).stdout
         rechecked_remote = runner.run(
-            "git-predeploy-published-head",
-            [commands["git"], "ls-remote", "--exit-code", "origin", "HEAD"],
+            "git-predeploy-published-main",
+            [
+                commands["git"], "ls-remote", "--exit-code", "origin",
+                "refs/heads/main",
+            ],
             timeout=60,
         ).stdout.decode().split()
-        if rechecked_head != commit or rechecked_status or rechecked_remote != [commit, "HEAD"]:
+        if (
+            rechecked_head != commit
+            or rechecked_status
+            or rechecked_remote
+            != [published_main_commit, "refs/heads/main"]
+        ):
             raise ContractFailure("source authority changed before deployment")
         deploy_started = True
         wrangler(

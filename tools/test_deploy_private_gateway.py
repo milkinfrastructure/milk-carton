@@ -210,8 +210,12 @@ if name == "git":
     elif args[:3] == ["remote", "get-url", "origin"]:
         print("https://github.com/milkinfrastructure/milk-gateway.git")
     elif args[:3] == ["ls-remote", "--exit-code", "origin"]:
-        commit = "9" * 40 if state["mode"] == "unpublished" else state["commit"]
-        print(commit + "\tHEAD")
+        print(state["commit"] + "\trefs/heads/main")
+    elif args[:4] == ["fetch", "--quiet", "--no-tags", "origin"]:
+        pass
+    elif args[:2] == ["merge-base", "--is-ancestor"]:
+        if state["mode"] == "unpublished":
+            done(1)
     else:
         done(2)
     done()
@@ -390,7 +394,7 @@ class Fixture:
         self.state_path = self.root / "state.json"
         self.state_path.write_text(json.dumps({
             "mode": mode,
-            "commit": COMMIT,
+            "commit": "2" * 40 if mode == "published_ancestor" else COMMIT,
             "account": ACCOUNT,
             "application": APPLICATION,
             "application_name": APPLICATION_NAME,
@@ -563,6 +567,32 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             raw = (fixture.evidence / item["path"]).read_bytes()
             self.assertEqual(item["bytes"], len(raw))
             self.assertEqual(item["sha256"], sha256(raw))
+
+    def test_published_release_ancestor_remains_deployable(self):
+        fixture = Fixture("published_ancestor")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        commands = fixture.state["commands"]
+        self.assertTrue(any(
+            item["command"] == "git"
+            and item["arguments"][:2] == ["merge-base", "--is-ancestor"]
+            for item in commands
+        ))
+        intent = json.loads((fixture.evidence / "intent.json").read_text())
+        self.assertEqual(intent["source_commit"], COMMIT)
+        self.assertEqual(intent["deployment_source_commit"], "2" * 40)
+
+    def test_release_not_reachable_from_published_main_fails_closed(self):
+        fixture = Fixture("unpublished")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fixture.terminal()["failure_stage"], "source-authority")
+        self.assertFalse(any(
+            item["command"] in {"gh", "docker", "wrangler", "curl"}
+            for item in fixture.state["commands"]
+        ))
 
     def test_remote_copy_mismatch_fails_before_deploy(self):
         fixture = Fixture("remote_mismatch")
