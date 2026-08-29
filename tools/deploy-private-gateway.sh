@@ -123,6 +123,11 @@ def canonical_json(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def clear_sensitive_bytes(value):
+    if value is not None:
+        value[:] = b"\0" * len(value)
+
+
 def validate_api_base_url(value):
     try:
         parsed = urllib.parse.urlsplit(value)
@@ -699,7 +704,7 @@ def validate_gateway_config_file(path, repository):
     return raw, parse_gateway_config(raw)
 
 
-def validate_bootstrap_secrets(path, repository):
+def validate_bootstrap_secrets(path, repository, materialize=False):
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise DeployFailure("bootstrap secrets must be an absolute regular file")
     metadata = path.stat()
@@ -731,7 +736,8 @@ def validate_bootstrap_secrets(path, repository):
         raise DeployFailure("bootstrap secrets file is invalid")
     gateway_config_raw = secrets_value["MILK_CARTON_CONFIG_JSON"].encode("utf-8")
     gateway_config = parse_gateway_config(gateway_config_raw)
-    return canonical_json(secrets_value), set(secrets_value), gateway_config_raw, gateway_config
+    secret_input = bytearray(canonical_json(secrets_value)) if materialize else None
+    return secret_input, digest(raw), set(secrets_value), gateway_config_raw, gateway_config
 
 
 def validate_smoke_credential(path, gateway_config):
@@ -865,17 +871,22 @@ def main():
     from github_registry import read_token, write_docker_config
     registry_stream = os.fdopen(3, "rb", closefd=False) if registry_token_stdin else None
     github_token = bytearray(read_token(registry_token_file, repository, registry_stream))
+    bootstrap_secret_input = None
+    bootstrap_secrets_path = None
+    bootstrap_secrets_sha256 = None
     if bootstrap:
         release_directory = Path(arguments[1]).resolve(strict=True)
         application_id = None
         requested_evidence = Path(arguments[2])
         credential_file = Path(arguments[3])
+        bootstrap_secrets_path = Path(arguments[4])
         (
-            bootstrap_secret_input,
+            _,
+            bootstrap_secrets_sha256,
             expected_bootstrap_secret_names,
             gateway_config_raw,
             gateway_config,
-        ) = validate_bootstrap_secrets(Path(arguments[4]), repository)
+        ) = validate_bootstrap_secrets(bootstrap_secrets_path, repository)
     else:
         release_directory = Path(arguments[0]).resolve(strict=True)
         application_id = arguments[1]
@@ -884,7 +895,6 @@ def main():
         gateway_config_raw, gateway_config = validate_gateway_config_file(
             Path(arguments[4]), repository,
         )
-        bootstrap_secret_input = None
         expected_bootstrap_secret_names = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
         raise DeployFailure("deploy evidence directory must be a new absolute path")
@@ -1402,6 +1412,30 @@ def main():
                 "image_retained": True,
             })
 
+        if bootstrap:
+            stage = "bootstrap-secret-materialization"
+            (
+                bootstrap_secret_input,
+                rechecked_bootstrap_secrets_sha256,
+                rechecked_bootstrap_secret_names,
+                rechecked_gateway_config_raw,
+                _,
+            ) = validate_bootstrap_secrets(
+                bootstrap_secrets_path, repository, materialize=True,
+            )
+            try:
+                if (
+                    rechecked_bootstrap_secrets_sha256 != bootstrap_secrets_sha256
+                    or rechecked_bootstrap_secret_names != expected_bootstrap_secret_names
+                    or rechecked_gateway_config_raw != gateway_config_raw
+                ):
+                    raise ContractFailure("bootstrap secrets changed after validation")
+                deployment_secrets = scratch / "deploy-secrets.json"
+                write_private(deployment_secrets, bootstrap_secret_input)
+            finally:
+                clear_sensitive_bytes(bootstrap_secret_input)
+                bootstrap_secret_input = None
+
         stage = "ghcr-auth"
         try:
             write_docker_config(docker_config, bytes(github_token))
@@ -1502,7 +1536,9 @@ def main():
             write_private(deployment_secrets, canonical_json({
                 "MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8"),
             }))
-            deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
+        if deployment_secrets is None:
+            raise ContractFailure("deployment secrets were not materialized")
+        deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
         rechecked_head = runner.run(
             "git-predeploy-head",
             [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
@@ -1527,13 +1563,15 @@ def main():
         ):
             raise ContractFailure("source authority changed before deployment")
         deploy_started = True
-        wrangler(
-            "deploy-worker-and-container", *deploy_arguments, timeout=900,
-            sensitive=not bootstrap, config=temporary_config,
-        )
-        if deployment_secrets is not None:
-            deployment_secrets.unlink()
-            deployment_secrets = None
+        try:
+            wrangler(
+                "deploy-worker-and-container", *deploy_arguments, timeout=900,
+                sensitive=True, config=temporary_config,
+            )
+        finally:
+            if deployment_secrets is not None:
+                deployment_secrets.unlink(missing_ok=True)
+                deployment_secrets = None
 
         if bootstrap:
             stage = "bootstrap-application-discovery"
@@ -1560,12 +1598,7 @@ def main():
             if created_image != remote_image:
                 raise ContractFailure("bootstrap container does not use the admitted image")
 
-            stage = "bootstrap-secrets"
-            wrangler(
-                "bootstrap-secret-bulk", "secret", "bulk", "--name", WORKER,
-                timeout=300, sensitive=True, input_bytes=bootstrap_secret_input,
-            )
-            bootstrap_secret_input = None
+            stage = "bootstrap-secret-verification"
             installed_secrets = parse_secret_names(wrangler(
                 "bootstrap-secret-list", "secret", "list", "--name", WORKER,
                 "--format", "json", sensitive=True,
@@ -1670,6 +1703,7 @@ def main():
         failure_stage = stage
         outcome = "predeploy_failed"
         rollback_observation = None
+        clear_sensitive_bytes(bootstrap_secret_input)
         bootstrap_secret_input = None
         if deploy_started and bootstrap:
             outcome = "bootstrap_cleanup_failed"

@@ -25,6 +25,7 @@ assert 'PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1
 assert "validate_deployment_baseline_binding" in deploy_script
 assert 'deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])' in deploy_script
 assert '"MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
+assert '"bootstrap-secret-bulk"' not in deploy_script
 assert "expected_config_sha256" in deploy_script
 assert 'CUSTOM_DOMAIN_SENTINEL = "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED"' in deploy_script
 assert 'config["routes"][0]["pattern"] = api_hostname' in deploy_script
