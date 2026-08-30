@@ -47,7 +47,8 @@ use route::{
     RouteDecision, RouteEndpoint, RoutePolicy, RoutePublication, RouteRequest, RouteScope,
     RouteStartupConfig, RouteTarget, WINNER_CANARY_BASIS_POINTS, WINNER_CANARY_VALID_FOR_SECONDS,
     WINNER_ZERO_VALID_FOR_SECONDS, WinnerRouteAdvanceAction, WinnerRoutePhase,
-    advance_winner_route, prepare_operator_route_manifest, prepare_route_manifest,
+    advance_winner_route, parse_operator_route_proposal, prepare_operator_route_manifest,
+    prepare_operator_zero_route_manifest, prepare_route_manifest,
 };
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -201,6 +202,8 @@ enum Command {
     PrepareRouteProposal {
         #[arg(long)]
         proposal: PathBuf,
+        #[arg(long)]
+        zero: bool,
         #[arg(long)]
         manifest: PathBuf,
     },
@@ -357,6 +360,7 @@ impl StoreAccessPlan {
                 ..Self::default()
             },
             Command::PrepareRouteProposal { .. } => Self {
+                control: Some(ReadOnly),
                 routes: Some(ReadOnly),
                 ..Self::default()
             },
@@ -1596,7 +1600,11 @@ async fn main() -> Result<()> {
             println!("{}", publication.revision_hex());
             Ok(())
         }
-        Command::PrepareRouteProposal { proposal, manifest } => {
+        Command::PrepareRouteProposal {
+            proposal,
+            zero,
+            manifest,
+        } => {
             let route_config = config
                 .route
                 .as_ref()
@@ -1626,17 +1634,38 @@ async fn main() -> Result<()> {
                 None => None,
             };
             let proposal_bytes = proposal.reread_unchanged()?;
-            let route_secret = optional_env(ROUTE_SECRET_ENV)?;
-            let candidate_api_key = optional_env(CANDIDATE_API_KEY_ENV)?;
-            let (manifest_bytes, publication) = prepare_operator_route_manifest(
-                route_config,
-                &route_scope,
-                &proposal_bytes,
-                route_secret.as_deref(),
-                candidate_api_key.as_deref(),
-                previous.as_ref(),
-                Utc::now(),
-            )?;
+            let parsed_proposal =
+                parse_operator_route_proposal(route_config, &route_scope, &proposal_bytes)?;
+            records
+                .verify_operator_route_preflight(
+                    &config_scope(&config),
+                    &parsed_proposal,
+                    &proposal_bytes,
+                )
+                .await?;
+            let (manifest_bytes, publication) = if zero {
+                prepare_operator_zero_route_manifest(
+                    route_config,
+                    &route_scope,
+                    &proposal_bytes,
+                    previous
+                        .as_ref()
+                        .context("operator zero route requires a verified live route")?,
+                    Utc::now(),
+                )?
+            } else {
+                let route_secret = optional_env(ROUTE_SECRET_ENV)?;
+                let candidate_api_key = optional_env(CANDIDATE_API_KEY_ENV)?;
+                prepare_operator_route_manifest(
+                    route_config,
+                    &route_scope,
+                    &proposal_bytes,
+                    route_secret.as_deref(),
+                    candidate_api_key.as_deref(),
+                    previous.as_ref(),
+                    Utc::now(),
+                )?
+            };
             records
                 .verify_route_publication(&config_scope(&config), &publication, previous.as_ref())
                 .await?;
@@ -4841,11 +4870,12 @@ mod cli_tests {
         assert_eq!(
             StoreAccessPlan::for_command(&Command::PrepareRouteProposal {
                 proposal: "/tmp/proposal".into(),
+                zero: false,
                 manifest: "/tmp/manifest".into(),
             }),
             StoreAccessPlan {
                 capture: None,
-                control: None,
+                control: Some(ReadOnly),
                 routes: Some(ReadOnly),
             }
         );

@@ -33,10 +33,12 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::route::{
-    BaselineReason, ED25519_SIGNATURE_BYTES, MAX_ROUTE_LIVE_BYTES, MAX_ROUTE_MANIFEST_BYTES,
-    RouteLivePointer, RoutePublication, RouteScope, VerifiedRouteWinner, WinnerAdmissionReceipt,
-    WinnerDeploymentAuthority, WinnerProviderPolicy, WinnerVariant,
-    validate_distinct_runtime_image_references, validate_runtime_image_reference,
+    BaselineReason, ED25519_SIGNATURE_BYTES, HarnessCandidateScoreBinding, HarnessProfile,
+    HarnessScoreTargetBinding, HarnessTeacherBinding, MAX_ROUTE_LIVE_BYTES,
+    MAX_ROUTE_MANIFEST_BYTES, OperatorRouteProposal, RouteLivePointer, RoutePublication,
+    RouteScope, VerifiedRouteWinner, WinnerAdmissionReceipt, WinnerDeploymentAuthority,
+    WinnerProviderPolicy, WinnerVariant, validate_distinct_runtime_image_references,
+    validate_runtime_image_reference,
 };
 
 const TRACE_QUEUE_RECORDS: usize = 1_024;
@@ -71,6 +73,7 @@ pub(crate) const MAX_PROVIDER_TEARDOWN_RESULT_BYTES: usize = 16 * 1_024;
 const MAX_GPU_LAUNCH_INTENT_BYTES: usize =
     MAX_STUDENT_CLAIM_BYTES + MAX_STUDENT_RESULT_BYTES + MAX_GPU_LAUNCH_OUTBOX_BYTES + 64 * 1_024;
 const MAX_TICK_LEASE_BYTES: usize = 2 * 1_024;
+const MAX_HARNESS_ARTIFACT_BYTES: usize = 1_024 * 1_024;
 const MAX_STUDENT_ARTIFACT_REFERENCE_BYTES: usize = 16 * 1_024 * 1_024;
 pub(crate) const MAX_STUDENT_ARTIFACT_FILES: usize = 4_096;
 pub(crate) const MAX_STUDENT_ARTIFACT_BYTES: u64 = 16 * 1_024 * 1_024 * 1_024 * 1_024;
@@ -147,6 +150,261 @@ static TRACE_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 #[serde(deny_unknown_fields)]
 pub(crate) struct Scope {
     pub(crate) scope_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvidenceReference {
+    key: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessSourceManifest {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    windows: Vec<String>,
+    stats: Vec<HarnessEvidenceReference>,
+    traces: Vec<HarnessEvidenceReference>,
+    code_version: String,
+    decoded_trace_bytes: u64,
+    sampling_policy: Option<Box<RawValue>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessSummaryVersion {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    structural: Box<RawValue>,
+    classifier_job_id: Option<String>,
+    classifier_result_sha256: Option<String>,
+    semantic: Box<RawValue>,
+    code_version: String,
+    parent_version_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HarnessStructuralBinding {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    source_manifest_sha256: String,
+    source: Box<RawValue>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessReadinessChecks {
+    minimum_independent_sessions: bool,
+    minimum_classified_sessions: bool,
+    independence_verified: bool,
+    pairing_at_least_99_percent: bool,
+    parse_at_least_99_5_percent: bool,
+    unknown_items_at_most_1_percent: bool,
+    duplicates_at_most_0_1_percent: bool,
+    other_plus_abstain_at_most_15_percent: bool,
+    represented_classes_meet_minimum: bool,
+    representative_eval_capacity: bool,
+    production_text_reference_capacity: bool,
+    closed_watermark_without_capture_gap: bool,
+    eval_generation_budget_available: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessRepresentedClass {
+    operation: String,
+    sessions: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessReadiness {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    summary_sha256: String,
+    ready: bool,
+    statistically_qualified: bool,
+    minimum_independent_sessions: u64,
+    minimum_represented_class_sessions: u64,
+    checks: HarnessReadinessChecks,
+    represented_classes: Vec<HarnessRepresentedClass>,
+    class_failures: Vec<String>,
+    eval_eligible_cases: u64,
+    unsupported_eval_categories: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvalCase {
+    suite: String,
+    source_trace_sha256: String,
+    oracle: String,
+    operation: String,
+    selection_reason: String,
+    input: String,
+    expected: String,
+    case_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvalRevision {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    series_id: String,
+    summary_sha256: String,
+    readiness_sha256: String,
+    generation_job_id: String,
+    provider_request_id: String,
+    token_usage: HarnessTokenUsage,
+    cost_microusd: u64,
+    cases: Vec<HarnessEvalCase>,
+    code_version: String,
+    parent_version_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvalVerdict {
+    case_id: String,
+    accepted: bool,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvalRejection {
+    case_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvalValidationOutput {
+    schema_version: String,
+    accepted: bool,
+    case_count: u64,
+    accepted_cases: u64,
+    verdicts: Vec<HarnessEvalVerdict>,
+    rejections: Vec<HarnessEvalRejection>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessEvalValidationRevision {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    series_id: String,
+    eval_sha256: String,
+    validation_job_id: String,
+    provider_result_sha256: String,
+    accepted: bool,
+    output: HarnessEvalValidationOutput,
+    harness_revision: String,
+    config_sha256: String,
+    prompt_sha256: String,
+    teacher: HarnessTeacherBinding,
+    token_usage: HarnessTokenUsage,
+    cost_microusd: u64,
+    code_version: String,
+    parent_version_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessScoreCase {
+    case_id: String,
+    reference_similarity_basis_points: u16,
+    latency_ms: Option<u64>,
+    error_class: Option<String>,
+    provider_request_id_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessScoreTargetResult {
+    target: String,
+    reference_metric: String,
+    reference_pass_threshold_basis_points: u16,
+    attempted: u64,
+    reference_passes: u64,
+    reference_pass_basis_points: u16,
+    errors: u64,
+    error_basis_points: u16,
+    p95_latency_ms: Option<u64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    calculated_cost_microusd: u64,
+    cases: Vec<HarnessScoreCase>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessScoreChecks {
+    candidate_reference_pass_rate: bool,
+    reference_pass_delta: bool,
+    candidate_errors: bool,
+    candidate_p95_latency: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessCandidateScoreResult {
+    schema_version: String,
+    job_id: String,
+    outcome: String,
+    qualified: bool,
+    checks: HarnessScoreChecks,
+    incumbent: HarnessScoreTargetResult,
+    candidate: HarnessScoreTargetResult,
+    provider_calls: u64,
+    provider_tokens: u64,
+    calculated_cost_microusd: u64,
+    accounted_cost_microusd: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessCandidateScoreRevision {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    series_id: String,
+    eval_sha256: String,
+    eval_validation_sha256: String,
+    score_job_id: String,
+    provider_result_sha256: String,
+    qualified: bool,
+    result: HarnessCandidateScoreResult,
+    harness_revision: String,
+    config_sha256: String,
+    code_version: String,
+    parent_version_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessCurrentPointer {
+    schema_version: String,
+    kind: String,
+    version_sha256: String,
+    version_key: String,
+    parent_version_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -4281,6 +4539,17 @@ impl Records {
                 (pointer, manifest.to_vec(), signature.to_vec())
             })
         })
+    }
+
+    pub(crate) async fn verify_operator_route_preflight(
+        &self,
+        scope: &Scope,
+        proposal: &OperatorRouteProposal,
+        proposal_bytes: &[u8],
+    ) -> Result<()> {
+        self.store
+            .verify_operator_route_preflight(scope, proposal, proposal_bytes)
+            .await
     }
 
     pub(crate) async fn load_route_publication(
@@ -10058,6 +10327,17 @@ impl RecordStore {
             if publication.has_candidate != (publication.candidate_basis_points > 0) {
                 bail!("operator route candidate differs from its basis points");
             }
+            if !publication.has_candidate {
+                let previous = previous
+                    .context("operator zero route requires its prior committed candidate route")?;
+                if !previous.is_operator_proposal()
+                    || !previous.has_candidate
+                    || previous.candidate_basis_points == 0
+                    || publication.student_result_sha256 != previous.student_result_sha256
+                {
+                    bail!("operator zero route differs from its exact proposal predecessor");
+                }
+            }
             return if publication.has_candidate {
                 self.verify_route_cohort_binding(scope, publication).await
             } else {
@@ -10934,6 +11214,399 @@ impl RecordStore {
             .context("zero-basis-point route is missing its durable student retirement")?;
         if retirement.zero_route_revision != publication.revision_hex() {
             bail!("zero-basis-point route differs from its durable student retirement");
+        }
+        Ok(())
+    }
+
+    async fn load_harness_artifact<T: DeserializeOwned + Serialize>(
+        &self,
+        key: &str,
+        expected_sha256: &str,
+        description: &str,
+    ) -> Result<(T, Bytes)> {
+        let expected = decode_hex_digest(expected_sha256)?;
+        let bytes = self.load_bytes(key, MAX_HARNESS_ARTIFACT_BYTES).await?;
+        if Sha256::digest(&bytes).as_slice() != expected {
+            bail!("{description} bytes differ from their content address");
+        }
+        let value =
+            parse_harness_canonical_json_line(&bytes, MAX_HARNESS_ARTIFACT_BYTES, description)?;
+        Ok((value, bytes))
+    }
+
+    async fn verify_operator_route_preflight(
+        &self,
+        scope: &Scope,
+        proposal: &OperatorRouteProposal,
+        proposal_bytes: &[u8],
+    ) -> Result<()> {
+        if proposal.scope_id != scope.scope_id {
+            bail!("route proposal preflight scope differs");
+        }
+        let prefix = scope_prefix(scope);
+        let series = &proposal.series_id;
+        let proposal_sha256 = hex_digest(&Sha256::digest(proposal_bytes).into());
+        let proposal_key = format!("{prefix}/route-proposals/versions/{proposal_sha256}.json");
+        let (stored_proposal, stored_proposal_bytes): (OperatorRouteProposal, _) = self
+            .load_harness_artifact(&proposal_key, &proposal_sha256, "operator route proposal")
+            .await?;
+        if stored_proposal != *proposal || stored_proposal_bytes.as_ref() != proposal_bytes {
+            bail!("operator route proposal differs from its stored content address");
+        }
+        let current_key = format!("{prefix}/route-proposals/current.json");
+        let current_bytes = self
+            .load_bytes(&current_key, MAX_HARNESS_ARTIFACT_BYTES)
+            .await?;
+        let current: HarnessCurrentPointer = parse_harness_canonical_json_line(
+            &current_bytes,
+            MAX_HARNESS_ARTIFACT_BYTES,
+            "route proposal current pointer",
+        )?;
+        if current.schema_version != "milk.current-pointer.v1"
+            || current.kind != "route_proposal"
+            || current.version_sha256 != proposal_sha256
+            || current.version_key != proposal_key
+            || !valid_optional_harness_digest(current.parent_version_sha256.as_deref())
+        {
+            bail!("operator route proposal is not the current qualified proposal");
+        }
+
+        let source_key = format!(
+            "{prefix}/pending-source/versions/{}.json",
+            proposal.source_manifest_sha256
+        );
+        let summary_key = format!(
+            "{prefix}/summaries/versions/{}.json",
+            proposal.summary_sha256
+        );
+        let readiness_key = format!(
+            "{prefix}/readiness/versions/{}.json",
+            proposal.readiness_sha256
+        );
+        let eval_key = format!(
+            "{prefix}/evals/{series}/versions/{}.json",
+            proposal.eval_sha256
+        );
+        let validation_key = format!(
+            "{prefix}/eval-validations/{series}/versions/{}.json",
+            proposal.eval_validation_sha256
+        );
+        let score_key = format!(
+            "{prefix}/candidate-scores/{series}/versions/{}.json",
+            proposal.candidate_score_sha256
+        );
+        let (source, source_bytes): (HarnessSourceManifest, _) = self
+            .load_harness_artifact(
+                &source_key,
+                &proposal.source_manifest_sha256,
+                "harness source manifest",
+            )
+            .await?;
+        let (summary, _): (HarnessSummaryVersion, _) = self
+            .load_harness_artifact(&summary_key, &proposal.summary_sha256, "harness summary")
+            .await?;
+        let (readiness, _): (HarnessReadiness, _) = self
+            .load_harness_artifact(
+                &readiness_key,
+                &proposal.readiness_sha256,
+                "harness readiness",
+            )
+            .await?;
+        let (eval, _): (HarnessEvalRevision, _) = self
+            .load_harness_artifact(&eval_key, &proposal.eval_sha256, "harness eval")
+            .await?;
+        let (validation, _): (HarnessEvalValidationRevision, _) = self
+            .load_harness_artifact(
+                &validation_key,
+                &proposal.eval_validation_sha256,
+                "harness eval validation",
+            )
+            .await?;
+        let (score, _): (HarnessCandidateScoreRevision, _) = self
+            .load_harness_artifact(
+                &score_key,
+                &proposal.candidate_score_sha256,
+                "harness candidate score",
+            )
+            .await?;
+
+        let structural: HarnessStructuralBinding =
+            serde_json::from_str(summary.structural.get())
+                .context("harness structural summary is not typed JSON")?;
+        let source_body = source_bytes
+            .strip_suffix(b"\n")
+            .context("harness source manifest has no canonical LF")?;
+        let same_identity = source.scope_id == scope.scope_id
+            && source.profile == proposal.profile
+            && source.code_version == proposal.code_version
+            && summary.scope_id == scope.scope_id
+            && summary.profile == proposal.profile
+            && summary.code_version == proposal.code_version
+            && structural.schema_version == "milk.structural-summary.v1"
+            && structural.scope_id == scope.scope_id
+            && structural.profile == proposal.profile
+            && structural.source_manifest_sha256 == proposal.source_manifest_sha256
+            && structural.source.get().as_bytes() == source_body
+            && readiness.scope_id == scope.scope_id
+            && readiness.profile == proposal.profile
+            && readiness.summary_sha256 == proposal.summary_sha256
+            && eval.scope_id == scope.scope_id
+            && eval.profile == proposal.profile
+            && eval.series_id == *series
+            && eval.summary_sha256 == proposal.summary_sha256
+            && eval.readiness_sha256 == proposal.readiness_sha256
+            && eval.code_version == proposal.code_version
+            && validation.scope_id == scope.scope_id
+            && validation.profile == proposal.profile
+            && validation.series_id == *series
+            && validation.eval_sha256 == proposal.eval_sha256
+            && validation.harness_revision == proposal.provenance.harness_revision
+            && validation.config_sha256 == proposal.provenance.config_sha256
+            && validation.code_version == proposal.code_version
+            && score.scope_id == scope.scope_id
+            && score.profile == proposal.profile
+            && score.series_id == *series
+            && score.eval_sha256 == proposal.eval_sha256
+            && score.eval_validation_sha256 == proposal.eval_validation_sha256
+            && score.harness_revision == proposal.provenance.harness_revision
+            && score.config_sha256 == proposal.provenance.config_sha256
+            && score.code_version == proposal.code_version;
+        if source.schema_version != "milk.summary-source-manifest.v1"
+            || summary.schema_version != "milk.summary-version.v1"
+            || readiness.schema_version != "milk.readiness.v1"
+            || eval.schema_version != "milk.eval-revision.v1"
+            || validation.schema_version != "milk.eval-validation-revision.v1"
+            || score.schema_version != "milk.candidate-score-revision.v1"
+            || !same_identity
+            || !valid_optional_harness_digest(summary.parent_version_sha256.as_deref())
+            || !valid_optional_harness_digest(eval.parent_version_sha256.as_deref())
+            || !valid_optional_harness_digest(validation.parent_version_sha256.as_deref())
+            || !valid_optional_harness_digest(score.parent_version_sha256.as_deref())
+        {
+            bail!("harness route evidence identity or linkage is invalid");
+        }
+        for reference in source.stats.iter().chain(&source.traces) {
+            if !reference.key.starts_with(&format!("{prefix}/"))
+                || !valid_lowercase_hex(&reference.sha256, 64)
+            {
+                bail!("harness source reference is outside its scope or invalid");
+            }
+        }
+
+        let checks = readiness.checks;
+        let all_ready = [
+            checks.minimum_independent_sessions,
+            checks.minimum_classified_sessions,
+            checks.independence_verified,
+            checks.pairing_at_least_99_percent,
+            checks.parse_at_least_99_5_percent,
+            checks.unknown_items_at_most_1_percent,
+            checks.duplicates_at_most_0_1_percent,
+            checks.other_plus_abstain_at_most_15_percent,
+            checks.represented_classes_meet_minimum,
+            checks.representative_eval_capacity,
+            checks.production_text_reference_capacity,
+            checks.closed_watermark_without_capture_gap,
+            checks.eval_generation_budget_available,
+        ]
+        .into_iter()
+        .all(|passed| passed);
+        if !readiness.ready
+            || !all_ready
+            || readiness.statistically_qualified
+                != matches!(proposal.profile, HarnessProfile::Production)
+            || readiness.represented_classes.is_empty()
+            || !readiness.class_failures.is_empty()
+        {
+            bail!("harness readiness did not pass every deterministic gate");
+        }
+
+        if eval.cases.is_empty()
+            || validation.output.schema_version != "milk.eval-validation-output.v1"
+            || !validation.accepted
+            || !validation.output.accepted
+            || validation.output.case_count != eval.cases.len() as u64
+            || validation.output.accepted_cases != validation.output.case_count
+            || validation.output.verdicts.len() != eval.cases.len()
+            || !validation.output.rejections.is_empty()
+            || validation
+                .output
+                .verdicts
+                .iter()
+                .zip(&eval.cases)
+                .any(|(verdict, case)| {
+                    !verdict.accepted
+                        || verdict.reason != "accepted"
+                        || verdict.case_id != case.case_id
+                })
+            || validation.validation_job_id != proposal.provenance.job_ids.eval_validation
+            || validation.provider_result_sha256
+                != proposal.provenance.teacher_result_sha256s.eval_validation
+            || validation.prompt_sha256 != proposal.provenance.prompt_sha256s.eval_validation
+            || validation.teacher != proposal.provenance.teacher
+            || eval.generation_job_id != proposal.provenance.job_ids.eval_generation
+            || summary.classifier_job_id.as_deref()
+                != Some(proposal.provenance.job_ids.classifier.as_str())
+            || summary.classifier_result_sha256.as_deref()
+                != Some(
+                    proposal
+                        .provenance
+                        .teacher_result_sha256s
+                        .classifier
+                        .as_str(),
+                )
+        {
+            bail!("harness eval validation chain is not accepted or linked");
+        }
+
+        self.verify_candidate_score_preflight(proposal, &eval, &validation, &score)?;
+        Ok(())
+    }
+
+    fn verify_candidate_score_preflight(
+        &self,
+        proposal: &OperatorRouteProposal,
+        eval: &HarnessEvalRevision,
+        validation: &HarnessEvalValidationRevision,
+        score: &HarnessCandidateScoreRevision,
+    ) -> Result<()> {
+        let binding = &proposal.provenance.candidate_score;
+        let result = &score.result;
+        validate_harness_teacher(&proposal.provenance.teacher)?;
+        validate_harness_candidate_score(binding)?;
+        let candidate_url = format!("{}chat/completions", proposal.api_base_url);
+        let result_payload = harness_canonical_json_line(result)?;
+        let result_sha256 = hex_digest(&Sha256::digest(&result_payload).into());
+        let calls = result
+            .incumbent
+            .attempted
+            .checked_add(result.candidate.attempted)
+            .context("candidate score call count overflow")?;
+        let tokens = result
+            .incumbent
+            .input_tokens
+            .checked_add(result.incumbent.output_tokens)
+            .and_then(|value| value.checked_add(result.candidate.input_tokens))
+            .and_then(|value| value.checked_add(result.candidate.output_tokens))
+            .context("candidate score token count overflow")?;
+        let cost = result
+            .incumbent
+            .calculated_cost_microusd
+            .checked_add(result.candidate.calculated_cost_microusd)
+            .context("candidate score cost overflow")?;
+        let expected_checks = HarnessScoreChecks {
+            candidate_reference_pass_rate: result.candidate.reference_pass_basis_points
+                >= binding.minimum_candidate_reference_pass_basis_points,
+            reference_pass_delta: i64::from(result.candidate.reference_pass_basis_points)
+                - i64::from(result.incumbent.reference_pass_basis_points)
+                >= i64::from(binding.minimum_reference_pass_delta_basis_points),
+            candidate_errors: result.candidate.error_basis_points
+                <= binding.maximum_candidate_error_basis_points,
+            candidate_p95_latency: result
+                .candidate
+                .p95_latency_ms
+                .is_some_and(|latency| latency <= binding.maximum_candidate_p95_latency_ms),
+        };
+        let qualified = [
+            expected_checks.candidate_reference_pass_rate,
+            expected_checks.reference_pass_delta,
+            expected_checks.candidate_errors,
+            expected_checks.candidate_p95_latency,
+        ]
+        .into_iter()
+        .all(|passed| passed);
+        if score.score_job_id != proposal.provenance.job_ids.candidate_score
+            || score.provider_result_sha256 != result_sha256
+            || !score.qualified
+            || result.schema_version != "milk.candidate-score-job-result.v1"
+            || result.job_id != score.score_job_id
+            || result.outcome != "succeeded"
+            || !result.qualified
+            || result.checks != expected_checks
+            || !qualified
+            || result.provider_calls != calls
+            || result.provider_tokens != tokens
+            || result.calculated_cost_microusd != cost
+            || result.accounted_cost_microusd != cost
+            || binding.candidate.api_url != candidate_url
+            || binding.candidate.model != proposal.model
+            || binding.max_calls_per_run != binding.held_out_cases.saturating_mul(2)
+            || result.incumbent.attempted != binding.held_out_cases
+            || result.candidate.attempted != binding.held_out_cases
+            || result.incumbent.cases.len() as u64 != binding.held_out_cases
+            || result.candidate.cases.len() as u64 != binding.held_out_cases
+            || result.incumbent.target != "incumbent"
+            || result.candidate.target != "candidate"
+            || result.incumbent.reference_metric != "normalized_token_f1_v1"
+            || result.candidate.reference_metric != "normalized_token_f1_v1"
+            || result.incumbent.reference_pass_threshold_basis_points
+                != binding.case_reference_similarity_basis_points
+            || result.candidate.reference_pass_threshold_basis_points
+                != binding.case_reference_similarity_basis_points
+            || result.provider_calls > binding.max_calls_per_run
+            || result.provider_tokens > binding.max_total_tokens_per_run
+            || result
+                .incumbent
+                .cases
+                .iter()
+                .chain(&result.candidate.cases)
+                .any(|case| !eval.cases.iter().any(|eval| eval.case_id == case.case_id))
+        {
+            bail!("harness candidate score is not qualified or candidate-bound");
+        }
+
+        let incumbent_cost = harness_score_target_cost(&result.incumbent, &binding.incumbent)?;
+        let candidate_cost = harness_score_target_cost(&result.candidate, &binding.candidate)?;
+        let eval_cost = harness_token_cost(
+            eval.token_usage.input_tokens,
+            proposal.provenance.teacher.input_rate_microusd_per_million,
+        )?
+        .checked_add(harness_token_cost(
+            eval.token_usage.output_tokens,
+            proposal.provenance.teacher.output_rate_microusd_per_million,
+        )?)
+        .context("harness eval cost overflow")?;
+        let validation_cost = harness_token_cost(
+            validation.token_usage.input_tokens,
+            proposal.provenance.teacher.input_rate_microusd_per_million,
+        )?
+        .checked_add(harness_token_cost(
+            validation.token_usage.output_tokens,
+            proposal.provenance.teacher.output_rate_microusd_per_million,
+        )?)
+        .context("harness validation cost overflow")?;
+        let known_cost = eval_cost
+            .checked_add(validation_cost)
+            .and_then(|value| value.checked_add(incumbent_cost))
+            .and_then(|value| value.checked_add(candidate_cost))
+            .context("harness known cost overflow")?;
+        let known_tokens = eval
+            .token_usage
+            .input_tokens
+            .checked_add(eval.token_usage.output_tokens)
+            .and_then(|value| value.checked_add(validation.token_usage.input_tokens))
+            .and_then(|value| value.checked_add(validation.token_usage.output_tokens))
+            .and_then(|value| value.checked_add(result.provider_tokens))
+            .context("harness known token count overflow")?;
+        let teacher = &proposal.provenance.teacher;
+        let maximum_tokens = teacher
+            .max_input_tokens
+            .checked_add(teacher.max_output_tokens)
+            .and_then(|value| value.checked_mul(3))
+            .and_then(|value| value.checked_add(binding.max_total_tokens_per_run))
+            .context("harness maximum token count overflow")?;
+        if eval.cost_microusd != eval_cost
+            || validation.cost_microusd != validation_cost
+            || cost != incumbent_cost.saturating_add(candidate_cost)
+            || eval.token_usage.input_tokens > teacher.max_input_tokens
+            || validation.token_usage.input_tokens > teacher.max_input_tokens
+            || eval.token_usage.output_tokens > teacher.max_output_tokens
+            || validation.token_usage.output_tokens > teacher.max_output_tokens
+            || proposal.provenance.accounted_cost_microusd < known_cost
+            || proposal.provenance.provider_tokens < known_tokens
+            || proposal.provenance.provider_tokens > maximum_tokens
+        {
+            bail!("harness route proposal budget or token accounting is invalid");
         }
         Ok(())
     }
@@ -12964,6 +13637,121 @@ fn valid_lowercase_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_optional_harness_digest(value: Option<&str>) -> bool {
+    value.is_none_or(|value| valid_lowercase_hex(value, 64))
+}
+
+fn valid_harness_model(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\r' | '\n'))
+}
+
+fn validate_harness_score_target(binding: &HarnessScoreTargetBinding) -> Result<()> {
+    let endpoint = Url::parse(&binding.api_url).context("harness score endpoint is invalid")?;
+    if endpoint.scheme() != "https"
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !endpoint.path().ends_with("/v1/chat/completions")
+        || !valid_harness_model(&binding.model)
+        || binding.input_rate_microusd_per_million > 1_000_000_000
+        || binding.output_rate_microusd_per_million > 1_000_000_000
+    {
+        bail!("harness score target binding is invalid");
+    }
+    Ok(())
+}
+
+fn validate_harness_teacher(binding: &HarnessTeacherBinding) -> Result<()> {
+    let endpoint = Url::parse(&binding.api_url).context("harness teacher endpoint is invalid")?;
+    if endpoint.scheme() != "https"
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+        || !valid_harness_model(&binding.model)
+        || !matches!(binding.reasoning_effort.as_str(), "low" | "high" | "max")
+        || !(1..=120).contains(&binding.timeout_seconds)
+        || !(128..=100_000).contains(&binding.max_input_tokens)
+        || !(64..=16_384).contains(&binding.max_output_tokens)
+        || binding.input_rate_microusd_per_million > 1_000_000_000
+        || binding.output_rate_microusd_per_million > 1_000_000_000
+    {
+        bail!("harness teacher binding is invalid");
+    }
+    Ok(())
+}
+
+fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> Result<()> {
+    validate_harness_score_target(&binding.incumbent)?;
+    validate_harness_score_target(&binding.candidate)?;
+    let expected_calls = binding
+        .held_out_cases
+        .checked_mul(2)
+        .context("harness candidate score call bound overflow")?;
+    let reserved_tokens = expected_calls
+        .checked_mul(
+            binding
+                .max_input_tokens_per_call
+                .checked_add(binding.max_output_tokens_per_call)
+                .context("harness candidate score token bound overflow")?,
+        )
+        .context("harness candidate score token bound overflow")?;
+    if !(1..=32).contains(&binding.held_out_cases)
+        || !(1..=120).contains(&binding.timeout_seconds)
+        || binding.max_calls_per_run != expected_calls
+        || !(128..=100_000).contains(&binding.max_input_tokens_per_call)
+        || !(16..=16_384).contains(&binding.max_output_tokens_per_call)
+        || !(binding.max_calls_per_run..=1_000_000).contains(&binding.max_total_tokens_per_run)
+        || binding.max_total_tokens_per_run < reserved_tokens
+        || !(9_000..=10_000).contains(&binding.case_reference_similarity_basis_points)
+        || !(1..=10_000).contains(&binding.minimum_candidate_reference_pass_basis_points)
+        || !(-10_000..=10_000).contains(&binding.minimum_reference_pass_delta_basis_points)
+        || binding.maximum_candidate_error_basis_points > 10_000
+        || !(1..=120_000).contains(&binding.maximum_candidate_p95_latency_ms)
+    {
+        bail!("harness candidate score binding is invalid");
+    }
+    Ok(())
+}
+
+fn harness_token_cost(tokens: u64, rate_microusd_per_million: u64) -> Result<u64> {
+    tokens
+        .checked_mul(rate_microusd_per_million)
+        .and_then(|value| value.checked_add(999_999))
+        .map(|value| value / 1_000_000)
+        .context("harness token cost overflow")
+}
+
+fn harness_score_target_cost(
+    target: &HarnessScoreTargetResult,
+    binding: &HarnessScoreTargetBinding,
+) -> Result<u64> {
+    validate_harness_score_target(binding)?;
+    let minimum = harness_token_cost(target.input_tokens, binding.input_rate_microusd_per_million)?
+        .checked_add(harness_token_cost(
+            target.output_tokens,
+            binding.output_rate_microusd_per_million,
+        )?)
+        .context("harness score target cost overflow")?;
+    // Harness bills each call with integer ceiling. Only aggregate tokens are
+    // retained, so each token category can add at most attempted - 1 microusd
+    // beyond the ceiling of its aggregate.
+    let rounding_allowance = target.attempted.saturating_sub(1).saturating_mul(2);
+    let maximum = minimum
+        .checked_add(rounding_allowance)
+        .context("harness score target cost overflow")?;
+    if !(minimum..=maximum).contains(&target.calculated_cost_microusd) {
+        bail!("harness score target cost is inconsistent with its token accounting");
+    }
+    Ok(target.calculated_cost_microusd)
 }
 
 fn scope_prefix(scope: &Scope) -> String {
@@ -17039,6 +17827,31 @@ fn canonical_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn harness_canonical_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(&serde_json::to_value(value)?)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn parse_harness_canonical_json_line<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    max_bytes: usize,
+    description: &str,
+) -> Result<T> {
+    if bytes.len() > max_bytes {
+        bail!("{description} exceeds {max_bytes} bytes");
+    }
+    let body = bytes
+        .strip_suffix(b"\n")
+        .with_context(|| format!("{description} must be canonical compact JSON plus one LF"))?;
+    let value: T = serde_json::from_slice(body)
+        .with_context(|| format!("{description} must be strict typed JSON"))?;
+    if serde_json::to_vec(&serde_json::to_value(&value)?)? != body {
+        bail!("{description} must use Harness canonical sorted JSON plus one LF");
+    }
+    Ok(value)
+}
+
 fn valid_analysis_identifier(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
@@ -17375,6 +18188,427 @@ mod tests {
             max_trace_bytes: 2 * 1_024 * 1_024,
             max_artifact_bytes: MAX_STUDENT_INPUT_BYTES,
             writer_id: Uuid::now_v7(),
+        }
+    }
+
+    async fn put_harness_value(
+        store: &RecordStore,
+        key: String,
+        value: &serde_json::Value,
+    ) -> String {
+        let bytes = harness_canonical_json_line(value).unwrap();
+        let sha256 = hex_digest(&Sha256::digest(&bytes).into());
+        store
+            .objects
+            .put(&ObjectPath::from(key), Bytes::from(bytes).into())
+            .await
+            .unwrap();
+        sha256
+    }
+
+    struct HarnessPreflightFixture {
+        store: RecordStore,
+        scope: Scope,
+        proposal: OperatorRouteProposal,
+        proposal_bytes: Vec<u8>,
+        current_key: String,
+    }
+
+    async fn harness_preflight_fixture(
+        validation_accepted: bool,
+        score_qualified: bool,
+    ) -> HarnessPreflightFixture {
+        let store = gpu_launch_test_store(Arc::new(InMemory::new()));
+        let scope = Scope {
+            scope_id: Uuid::from_u128(2),
+        };
+        let prefix = scope_prefix(&scope);
+        let digest = |byte: u8| hex_digest(&[byte; 32]);
+        let harness_revision = "7e1cc25a881ceeb3aad0ee085281e8d991eb85f6";
+        let config_sha256 = digest(0x31);
+        let classifier_job_id = digest(0x41);
+        let eval_job_id = digest(0x42);
+        let validation_job_id = digest(0x43);
+        let score_job_id = digest(0x44);
+        let classifier_result_sha256 = digest(0x51);
+        let eval_validation_result_sha256 = digest(0x53);
+        let series = "mechanics-v1";
+        let teacher = serde_json::json!({
+            "api_url": "https://teacher.example/v1/responses",
+            "input_rate_microusd_per_million": 1,
+            "max_input_tokens": 128,
+            "max_output_tokens": 64,
+            "model": "teacher-model",
+            "output_rate_microusd_per_million": 1,
+            "reasoning_effort": "high",
+            "timeout_seconds": 60
+        });
+        let score_binding = serde_json::json!({
+            "candidate": {
+                "api_url": "https://candidate.example/v1/chat/completions",
+                "input_rate_microusd_per_million": 1,
+                "model": "candidate-model",
+                "output_rate_microusd_per_million": 1
+            },
+            "case_reference_similarity_basis_points": 9000,
+            "held_out_cases": 1,
+            "incumbent": {
+                "api_url": "https://incumbent.example/v1/chat/completions",
+                "input_rate_microusd_per_million": 1,
+                "model": "incumbent-model",
+                "output_rate_microusd_per_million": 1
+            },
+            "max_calls_per_run": 2,
+            "max_input_tokens_per_call": 128,
+            "max_output_tokens_per_call": 16,
+            "max_total_tokens_per_run": 288,
+            "maximum_candidate_error_basis_points": 0,
+            "maximum_candidate_p95_latency_ms": 30000,
+            "minimum_candidate_reference_pass_basis_points": 9000,
+            "minimum_reference_pass_delta_basis_points": 0,
+            "timeout_seconds": 60
+        });
+        let source = serde_json::json!({
+            "code_version": "milk.harness-run-once.v2",
+            "decoded_trace_bytes": 128,
+            "profile": "mechanics",
+            "sampling_policy": null,
+            "schema_version": "milk.summary-source-manifest.v1",
+            "scope_id": scope.scope_id,
+            "stats": [{"key": format!("{prefix}/stats/closed.json"), "sha256": digest(0x61)}],
+            "traces": [{"key": format!("{prefix}/traffic/closed.json.zst"), "sha256": digest(0x62)}],
+            "windows": ["2026-08-29T12:00:00Z"]
+        });
+        let source_bytes = harness_canonical_json_line(&source).unwrap();
+        let source_sha256 = hex_digest(&Sha256::digest(&source_bytes).into());
+        put_harness_value(
+            &store,
+            format!("{prefix}/pending-source/versions/{source_sha256}.json"),
+            &source,
+        )
+        .await;
+
+        let summary = serde_json::json!({
+            "classifier_job_id": classifier_job_id,
+            "classifier_result_sha256": classifier_result_sha256,
+            "code_version": "milk.harness-run-once.v2",
+            "parent_version_sha256": null,
+            "profile": "mechanics",
+            "schema_version": "milk.summary-version.v1",
+            "scope_id": scope.scope_id,
+            "semantic": {},
+            "structural": {
+                "profile": "mechanics",
+                "schema_version": "milk.structural-summary.v1",
+                "scope_id": scope.scope_id,
+                "source": source,
+                "source_manifest_sha256": source_sha256
+            }
+        });
+        let summary_bytes = harness_canonical_json_line(&summary).unwrap();
+        let summary_sha256 = hex_digest(&Sha256::digest(&summary_bytes).into());
+        put_harness_value(
+            &store,
+            format!("{prefix}/summaries/versions/{summary_sha256}.json"),
+            &summary,
+        )
+        .await;
+
+        let readiness = serde_json::json!({
+            "checks": {
+                "closed_watermark_without_capture_gap": true,
+                "duplicates_at_most_0_1_percent": true,
+                "eval_generation_budget_available": true,
+                "independence_verified": true,
+                "minimum_classified_sessions": true,
+                "minimum_independent_sessions": true,
+                "other_plus_abstain_at_most_15_percent": true,
+                "pairing_at_least_99_percent": true,
+                "parse_at_least_99_5_percent": true,
+                "production_text_reference_capacity": true,
+                "representative_eval_capacity": true,
+                "represented_classes_meet_minimum": true,
+                "unknown_items_at_most_1_percent": true
+            },
+            "class_failures": [],
+            "eval_eligible_cases": 1,
+            "minimum_independent_sessions": 100,
+            "minimum_represented_class_sessions": 1,
+            "profile": "mechanics",
+            "ready": true,
+            "represented_classes": [{"operation": "generation", "sessions": 100}],
+            "schema_version": "milk.readiness.v1",
+            "scope_id": scope.scope_id,
+            "statistically_qualified": false,
+            "summary_sha256": summary_sha256,
+            "unsupported_eval_categories": {}
+        });
+        let readiness_bytes = harness_canonical_json_line(&readiness).unwrap();
+        let readiness_sha256 = hex_digest(&Sha256::digest(&readiness_bytes).into());
+        put_harness_value(
+            &store,
+            format!("{prefix}/readiness/versions/{readiness_sha256}.json"),
+            &readiness,
+        )
+        .await;
+
+        let case_id = digest(0x71);
+        let eval = serde_json::json!({
+            "cases": [{
+                "case_id": case_id,
+                "expected": "four",
+                "input": "What is two plus two?",
+                "operation": "generation",
+                "oracle": "reference",
+                "selection_reason": "representative_mix",
+                "source_trace_sha256": digest(0x62),
+                "suite": "representative"
+            }],
+            "code_version": "milk.harness-run-once.v2",
+            "cost_microusd": 2,
+            "generation_job_id": eval_job_id,
+            "parent_version_sha256": null,
+            "profile": "mechanics",
+            "provider_request_id": "eval-request",
+            "readiness_sha256": readiness_sha256,
+            "schema_version": "milk.eval-revision.v1",
+            "scope_id": scope.scope_id,
+            "series_id": series,
+            "summary_sha256": summary_sha256,
+            "token_usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let eval_bytes = harness_canonical_json_line(&eval).unwrap();
+        let eval_sha256 = hex_digest(&Sha256::digest(&eval_bytes).into());
+        put_harness_value(
+            &store,
+            format!("{prefix}/evals/{series}/versions/{eval_sha256}.json"),
+            &eval,
+        )
+        .await;
+
+        let validation = serde_json::json!({
+            "accepted": validation_accepted,
+            "code_version": "milk.harness-run-once.v2",
+            "config_sha256": config_sha256,
+            "cost_microusd": 2,
+            "eval_sha256": eval_sha256,
+            "harness_revision": harness_revision,
+            "output": {
+                "accepted": validation_accepted,
+                "accepted_cases": if validation_accepted { 1 } else { 0 },
+                "case_count": 1,
+                "rejections": if validation_accepted { serde_json::json!([]) } else { serde_json::json!([{"case_id": case_id, "reason": "incorrect"}]) },
+                "schema_version": "milk.eval-validation-output.v1",
+                "verdicts": [{"accepted": validation_accepted, "case_id": case_id, "reason": if validation_accepted { "accepted" } else { "incorrect" }}]
+            },
+            "parent_version_sha256": null,
+            "profile": "mechanics",
+            "prompt_sha256": digest(0x32),
+            "provider_result_sha256": eval_validation_result_sha256,
+            "schema_version": "milk.eval-validation-revision.v1",
+            "scope_id": scope.scope_id,
+            "series_id": series,
+            "teacher": teacher,
+            "token_usage": {"input_tokens": 1, "output_tokens": 1},
+            "validation_job_id": validation_job_id
+        });
+        let validation_bytes = harness_canonical_json_line(&validation).unwrap();
+        let validation_sha256 = hex_digest(&Sha256::digest(&validation_bytes).into());
+        put_harness_value(
+            &store,
+            format!("{prefix}/eval-validations/{series}/versions/{validation_sha256}.json"),
+            &validation,
+        )
+        .await;
+
+        let target = |name: &str, latency: u64| {
+            serde_json::json!({
+                "attempted": 1,
+                "calculated_cost_microusd": 2,
+                "cases": [{
+                    "case_id": case_id,
+                    "error_class": null,
+                    "latency_ms": latency,
+                    "provider_request_id_sha256": digest(0x81),
+                    "reference_similarity_basis_points": 10000
+                }],
+                "error_basis_points": 0,
+                "errors": 0,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "p95_latency_ms": latency,
+                "reference_metric": "normalized_token_f1_v1",
+                "reference_pass_basis_points": 10000,
+                "reference_pass_threshold_basis_points": 9000,
+                "reference_passes": 1,
+                "target": name
+            })
+        };
+        let score_result = serde_json::json!({
+            "accounted_cost_microusd": 4,
+            "calculated_cost_microusd": 4,
+            "candidate": target("candidate", 10),
+            "checks": {
+                "candidate_errors": score_qualified,
+                "candidate_p95_latency": score_qualified,
+                "candidate_reference_pass_rate": score_qualified,
+                "reference_pass_delta": score_qualified
+            },
+            "incumbent": target("incumbent", 10),
+            "job_id": score_job_id,
+            "outcome": "succeeded",
+            "provider_calls": 2,
+            "provider_tokens": 4,
+            "qualified": score_qualified,
+            "schema_version": "milk.candidate-score-job-result.v1"
+        });
+        let score_result_sha256 =
+            hex_digest(&Sha256::digest(harness_canonical_json_line(&score_result).unwrap()).into());
+        let score = serde_json::json!({
+            "code_version": "milk.harness-run-once.v2",
+            "config_sha256": config_sha256,
+            "eval_sha256": eval_sha256,
+            "eval_validation_sha256": validation_sha256,
+            "harness_revision": harness_revision,
+            "parent_version_sha256": null,
+            "profile": "mechanics",
+            "provider_result_sha256": score_result_sha256,
+            "qualified": score_qualified,
+            "result": score_result,
+            "schema_version": "milk.candidate-score-revision.v1",
+            "scope_id": scope.scope_id,
+            "score_job_id": score_job_id,
+            "series_id": series
+        });
+        let score_bytes = harness_canonical_json_line(&score).unwrap();
+        let score_sha256 = hex_digest(&Sha256::digest(&score_bytes).into());
+        put_harness_value(
+            &store,
+            format!("{prefix}/candidate-scores/{series}/versions/{score_sha256}.json"),
+            &score,
+        )
+        .await;
+
+        let proposal_value = serde_json::json!({
+            "api_base_url": "https://candidate.example/v1/",
+            "candidate_basis_points": 100,
+            "candidate_id": "candidate-mechanics-v1",
+            "candidate_score_sha256": score_sha256,
+            "code_version": "milk.harness-run-once.v2",
+            "eval_sha256": eval_sha256,
+            "eval_validation_sha256": validation_sha256,
+            "model": "candidate-model",
+            "profile": "mechanics",
+            "provenance": {
+                "accounted_cost_microusd": 10,
+                "budget": {"absolute_spend_microusd": 25000000, "starting_spend_microusd": 0, "stop_new_spend_microusd": 25000000},
+                "candidate_score": score_binding,
+                "config_sha256": config_sha256,
+                "harness_revision": harness_revision,
+                "job_ids": {"candidate_score": score_job_id, "classifier": classifier_job_id, "eval_generation": eval_job_id, "eval_validation": validation_job_id},
+                "prompt_sha256s": {"classifier": digest(0x30), "eval_generation": digest(0x31), "eval_validation": digest(0x32)},
+                "provider_tokens": 10,
+                "taxonomy_version": "milk.semantic-taxonomy.v1",
+                "teacher": teacher,
+                "teacher_result_sha256s": {"classifier": classifier_result_sha256, "eval_generation": digest(0x52), "eval_validation": eval_validation_result_sha256}
+            },
+            "readiness_sha256": readiness_sha256,
+            "schema_version": "milk.unsigned-route-proposal.v2",
+            "scope_id": scope.scope_id,
+            "series_id": series,
+            "source_manifest_sha256": source_sha256,
+            "summary_sha256": summary_sha256
+        });
+        let proposal_bytes = harness_canonical_json_line(&proposal_value).unwrap();
+        let proposal_sha256 = hex_digest(&Sha256::digest(&proposal_bytes).into());
+        let proposal_key = format!("{prefix}/route-proposals/versions/{proposal_sha256}.json");
+        put_harness_value(&store, proposal_key.clone(), &proposal_value).await;
+        let current_key = format!("{prefix}/route-proposals/current.json");
+        put_harness_value(
+            &store,
+            current_key.clone(),
+            &serde_json::json!({
+                "kind": "route_proposal",
+                "parent_version_sha256": null,
+                "schema_version": "milk.current-pointer.v1",
+                "version_key": proposal_key,
+                "version_sha256": proposal_sha256
+            }),
+        )
+        .await;
+        HarnessPreflightFixture {
+            store,
+            scope,
+            proposal: serde_json::from_slice(&proposal_bytes).unwrap(),
+            proposal_bytes,
+            current_key,
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_route_preflight_rechecks_the_complete_harness_chain() {
+        let fixture = harness_preflight_fixture(true, true).await;
+        fixture
+            .store
+            .verify_operator_route_preflight(
+                &fixture.scope,
+                &fixture.proposal,
+                &fixture.proposal_bytes,
+            )
+            .await
+            .unwrap();
+
+        fixture
+            .store
+            .objects
+            .put(
+                &ObjectPath::from(fixture.current_key),
+                Bytes::from(
+                    harness_canonical_json_line(&serde_json::json!({
+                        "kind": "route_proposal_blocked",
+                        "parent_version_sha256": null,
+                        "schema_version": "milk.current-pointer.v1",
+                        "version_key": "milk/v1/scopes/blocked.json",
+                        "version_sha256": "00".repeat(32)
+                    }))
+                    .unwrap(),
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .verify_operator_route_preflight(
+                    &fixture.scope,
+                    &fixture.proposal,
+                    &fixture.proposal_bytes,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("current qualified proposal")
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_route_preflight_rejects_unaccepted_or_unqualified_evidence() {
+        for fixture in [
+            harness_preflight_fixture(false, true).await,
+            harness_preflight_fixture(true, false).await,
+        ] {
+            assert!(
+                fixture
+                    .store
+                    .verify_operator_route_preflight(
+                        &fixture.scope,
+                        &fixture.proposal,
+                        &fixture.proposal_bytes,
+                    )
+                    .await
+                    .is_err()
+            );
         }
     }
 
