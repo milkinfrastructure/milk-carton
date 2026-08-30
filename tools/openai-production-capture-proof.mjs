@@ -104,6 +104,7 @@ export async function runCaptureProof(options) {
   const {
     endpoint, credential, listScope, readStats, fetch = globalThis.fetch,
     interval, timing, invalidRequest = isolated401, workload = runProductionPath,
+    waitBeforeBaseline = () => sleep(75_000),
     waitAfter401 = () => sleep(65_000), waitForStats = () => sleep(5_000),
   } = options;
   targetScopeId = scope(targetScopeId);
@@ -114,6 +115,7 @@ export async function runCaptureProof(options) {
   const snapshot = async () => new Map(await Promise.all(scopes.map(async (id) => (
     [id, normalize(await listScope(id), prefix(id))]
   ))));
+  await waitBeforeBaseline();
   const before = await snapshot();
   assert.equal(await invalidRequest(endpoint, credential.model, fetch), 401);
   await waitAfter401();
