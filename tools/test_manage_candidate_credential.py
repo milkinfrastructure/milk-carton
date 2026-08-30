@@ -237,7 +237,10 @@ if name == "wrangler":
             "version": state["application_version"],
         }))
     elif args[:2] == ["containers", "instances"]:
-        print(json.dumps([{"id": "gateway", "state": "running", "version": state["application_version"]}]))
+        print(json.dumps([{
+            "id": "opaque-cloudflare-instance-id", "name": "gateway",
+            "state": "running", "version": state["application_version"],
+        }]))
     elif args[:2] == ["secret", "list"]:
         values = [{"name": "MILK_CARTON_CONTAINER_ADMIN_KEY", "type": "secret_text"}]
         if state["candidate_installed"]:
@@ -500,7 +503,7 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.assertEqual(stderr, b"candidate credential operation failed\n")
         self.assertFalse(wrong.state["candidate_installed"])
 
-    def test_baseten_remove_requires_the_latest_exact_gateway_release(self):
+    def test_baseten_remove_survives_restart_and_rejects_forged_release(self):
         stale = Fixture()
         self.addCleanup(stale.close)
         code, installed_raw, _stdout, _stderr = stale.transact(candidate_frame())
@@ -510,10 +513,10 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         code, response, stdout, stderr = stale.transact(
             remove_request(json.loads(installed_raw))
         )
-        self.assertEqual((code, response, stdout), (1, b"", b""))
-        self.assertEqual(stderr, b"candidate credential operation failed\n")
-        self.assertTrue(stale.state["candidate_installed"])
-        self.assertEqual(stale.state["container_last_change"], 1200)
+        self.assertEqual((code, stdout, stderr), (0, b"", b""))
+        self.assertEqual(json.loads(response)["state"], "absent")
+        self.assertFalse(stale.state["candidate_installed"])
+        self.assertEqual(stale.state["container_last_change"], 1300)
 
         forged = Fixture()
         self.addCleanup(forged.close)

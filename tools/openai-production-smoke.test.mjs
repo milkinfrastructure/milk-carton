@@ -39,12 +39,13 @@ const productionProofSha256 =
   "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66";
 assert.deepEqual(ROUTE_PROOF, {
   candidate_session_search_limit: 256,
+  fallback_launch_delay_ms: 10,
   model: PRODUCTION_PROOF.model,
-  saturation_max_completion_tokens: 3_840,
+  saturation_max_completion_tokens: 64,
   short_max_completion_tokens: 256,
 });
 const routeProofSha256 =
-  "fe0e5278fda4eae56fdcf9e3642122ef2ccadbfdf3acaafaaad0cfa00a4a2c40";
+  "1e6ad1bf01b7c6b0bfefeaa81e391677092ccdec7af82f6a0b5e41aa71634987";
 const revision = digest("1");
 const data = {
   choices: [{ finish_reason: "stop", message: { content: "OK", role: "assistant" } }],
@@ -251,11 +252,11 @@ for (const invalidClient of [
 }
 
 assert.deepEqual(saturationRequest(credential), {
-  max_completion_tokens: 3_840,
+  max_completion_tokens: 64,
   messages: [
     {
       role: "user",
-      content: "Write OK on 4096 separate lines. Do not summarize or stop early.",
+      content: "Write OK on 32 separate lines. Do not summarize or stop early.",
     },
   ],
   model: credential.model,
@@ -318,7 +319,7 @@ assert.equal(saturation.baseline_request_count, 1);
 assert.equal(saturation.candidate_request_count, 1);
 assert.equal(saturation.candidate_session_index, receipt.candidate_session_index);
 assert.equal(saturation.selection_probe_count, 0);
-assert.equal(saturation.max_completion_tokens, 3_840);
+assert.equal(saturation.max_completion_tokens, 64);
 assert.equal(saturation.proof_contract_sha256, receipt.proof_contract_sha256);
 assert.equal(saturation.candidate_route_target, "candidate");
 assert.equal(saturation.fallback_route_target, "openai");

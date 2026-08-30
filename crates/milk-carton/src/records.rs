@@ -13740,7 +13740,10 @@ fn validate_harness_teacher(binding: &HarnessTeacherBinding) -> Result<()> {
         || endpoint.password().is_some()
         || endpoint.fragment().is_some()
         || !valid_harness_model(&binding.model)
-        || !matches!(binding.reasoning_effort.as_str(), "low" | "high" | "max")
+        || !matches!(
+            binding.reasoning_effort.as_str(),
+            "none" | "low" | "high" | "max"
+        )
         || !(1..=120).contains(&binding.timeout_seconds)
         || !(128..=100_000).contains(&binding.max_input_tokens)
         || !(64..=16_384).contains(&binding.max_output_tokens)
@@ -13769,6 +13772,7 @@ fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> R
         .context("harness candidate score token bound overflow")?;
     if !(1..=32).contains(&binding.held_out_cases)
         || !(1..=120).contains(&binding.timeout_seconds)
+        || !(1..=60_000).contains(&binding.minimum_request_interval_ms)
         || binding.max_calls_per_run != expected_calls
         || !(128..=100_000).contains(&binding.max_input_tokens_per_call)
         || !(16..=16_384).contains(&binding.max_output_tokens_per_call)
@@ -18329,6 +18333,7 @@ mod tests {
             "maximum_candidate_p95_latency_ms": 30000,
             "minimum_candidate_reference_pass_basis_points": 9000,
             "minimum_reference_pass_delta_basis_points": 0,
+            "minimum_request_interval_ms": 1000,
             "timeout_seconds": 60
         });
         let source = serde_json::json!({

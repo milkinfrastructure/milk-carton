@@ -26,7 +26,7 @@ const MECHANICS_PHASES = [
 ];
 const MECHANICS_MAX_CANDIDATES = 10_000;
 const MECHANICS_ROUTE_REVISION = "openai-baseline-v1";
-const SATURATION_LINE_COUNT = 4_096;
+const SATURATION_LINE_COUNT = 32;
 export const PRODUCTION_PROOF = Object.freeze({
   baseline_requests: 322,
   candidate_requests: 2,
@@ -43,8 +43,9 @@ export const PRODUCTION_PROOF = Object.freeze({
 });
 export const ROUTE_PROOF = Object.freeze({
   candidate_session_search_limit: 256,
+  fallback_launch_delay_ms: 10,
   model: PRODUCTION_PROOF.model,
-  saturation_max_completion_tokens: PRODUCTION_PROOF.saturation_max_completion_tokens,
+  saturation_max_completion_tokens: 64,
   short_max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
 });
 
@@ -243,12 +244,21 @@ function candidateIdentity(response) {
   return { artifactSha256, candidateSha256, deploymentSha256 };
 }
 
-export async function findCandidateSession(client, credential, expectedRouteRevision) {
+export async function findCandidateSession(
+  client,
+  credential,
+  expectedRouteRevision,
+  candidateSessionIndex = null,
+) {
   assert.match(expectedRouteRevision, SHA256);
   const request = candidateSelectionRequest(credential);
+  const firstIndex = candidateSessionIndex ?? 0;
+  const lastIndex = candidateSessionIndex === null
+    ? ROUTE_PROOF.candidate_session_search_limit
+    : candidateSessionIndex + 1;
   for (
-    let index = 0;
-    index < ROUTE_PROOF.candidate_session_search_limit;
+    let index = firstIndex;
+    index < lastIndex;
     index += 1
   ) {
     const sessionId = candidateSessionId(expectedRouteRevision, index);
@@ -264,11 +274,11 @@ export async function findCandidateSession(client, credential, expectedRouteRevi
     assert.ok(target === "openai" || target === "candidate");
     if (target === "candidate") {
       return {
-        baselineRequests: index,
+        baselineRequests: candidateSessionIndex === null ? index : 0,
         candidateIdentity: candidateIdentity(response),
         candidateRequests: 1,
         index,
-        sdkRequests: index + 1,
+        sdkRequests: candidateSessionIndex === null ? index + 1 : 1,
         sessionId,
       };
     }
@@ -279,7 +289,7 @@ export async function findCandidateSession(client, credential, expectedRouteRevi
 export function saturationRequest(credential) {
   assertProofModel(credential.model);
   const request = {
-    max_completion_tokens: PRODUCTION_PROOF.saturation_max_completion_tokens,
+    max_completion_tokens: ROUTE_PROOF.saturation_max_completion_tokens,
     messages: [
       {
         role: "user",
@@ -335,12 +345,19 @@ export async function runBaselineSmoke(client, endpoint, credential) {
   };
 }
 
-export async function runCandidateSmoke(client, endpoint, credential, expectedRouteRevision) {
+export async function runCandidateSmoke(
+  client,
+  endpoint,
+  credential,
+  expectedRouteRevision,
+  candidateSessionIndex = null,
+) {
   assert.match(expectedRouteRevision, SHA256);
   const selection = await findCandidateSession(
     client,
     credential,
     expectedRouteRevision,
+    candidateSessionIndex,
   );
   const request = candidateRequest(credential);
   const { data, response } = await client.chat.completions
@@ -480,7 +497,11 @@ export async function runSaturationFallbackSmoke(
   let candidate;
   let fallback;
   try {
-    candidate = await client.chat.completions.create(request, options).withResponse();
+    const candidateRequest = client.chat.completions.create(request, options).withResponse();
+    await new Promise((resolve) =>
+      setTimeout(resolve, ROUTE_PROOF.fallback_launch_delay_ms));
+    const fallbackRequest = client.chat.completions.create(request, options).withResponse();
+    [candidate, fallback] = await Promise.all([candidateRequest, fallbackRequest]);
     assert.equal(candidate.response.status, 200);
     assert.equal(
       candidate.response.headers.get("x-milk-route-revision"),
@@ -501,7 +522,6 @@ export async function runSaturationFallbackSmoke(
     assert.match(deploymentSha256 ?? "", SHA256);
     assert.equal(typeof candidate.data?.controller?.abort, "function");
 
-    fallback = await client.chat.completions.create(request, options).withResponse();
     assert.equal(fallback.response.status, 200);
     assert.equal(
       fallback.response.headers.get("x-milk-route-revision"),
@@ -523,8 +543,9 @@ export async function runSaturationFallbackSmoke(
       deployment_sha256: deploymentSha256,
       endpoint_sha256: sha256(endpoint.href),
       fallback_http_status: fallback.response.status,
+      fallback_launch_delay_ms: ROUTE_PROOF.fallback_launch_delay_ms,
       fallback_route_target: "openai",
-      max_completion_tokens: PRODUCTION_PROOF.saturation_max_completion_tokens,
+      max_completion_tokens: ROUTE_PROOF.saturation_max_completion_tokens,
       model: PRODUCTION_PROOF.model,
       proof_contract_sha256: ROUTE_PROOF_SHA256,
       proof_step: "saturation_fallback",
@@ -737,10 +758,12 @@ async function main() {
     process.argv.length === 6 && process.argv[5] === "--generated-mechanics";
   const saturationFallback =
     process.argv.length >= 6 && process.argv[5] === "--saturation-fallback";
+  const directCandidate =
+    process.argv.length === 7 && process.argv[5] === "--candidate-session";
   const zeroRoute =
     process.argv.length === 6 && process.argv[5] === "--zero-route";
   if (process.argv.length >= 6) {
-    assert.ok(generatedMechanics || saturationFallback || zeroRoute);
+    assert.ok(generatedMechanics || saturationFallback || directCandidate || zeroRoute);
   }
   const candidateSessionIndex = process.argv.length === 7
     ? Number(process.argv[6])
@@ -791,7 +814,13 @@ async function main() {
         candidateSessionIndex,
       )
     : route
-      ? await runCandidateSmoke(client, endpoint, credential, process.argv[4])
+      ? await runCandidateSmoke(
+        client,
+        endpoint,
+        credential,
+        process.argv[4],
+        directCandidate ? candidateSessionIndex : null,
+      )
       : await runBaselineSmoke(client, endpoint, credential);
   process.stdout.write(`${canonical(receipt)}\n`);
 }

@@ -31,7 +31,7 @@ OPERATOR_ROUTE_REMOVE_SCHEMA = "milk.baseten-candidate-key-remove-operator-route
 ACK_SCHEMA = "milk.baseten-candidate-key-delivery-ack.v1"
 RESTART_SCHEMA = "milk.gateway-candidate-container-restart.v1"
 INSPECTION_SCHEMA = "milk.gateway-candidate-container-inspection.v1"
-RELEASE_SCHEMA = "milk.gateway-process-release.v1"
+RELEASE_SCHEMA = "milk.gateway-process-release.v2"
 TEARDOWN_SCHEMA = "milk.provider-teardown-authorization.v1"
 ROUTE_RECEIPT_SCHEMA = "milk.route-publication-receipt.v2"
 ACCOUNT_ID = re.compile(r"[0-9a-f]{32}")
@@ -476,10 +476,11 @@ def parse_instance(raw, application_version):
         len(active) != 1
         or active[0].get("state") != "running"
         or active[0].get("version") != application_version
+        or active[0].get("name") != "gateway"
         or not bounded_text(active[0].get("id"), 128)
     ):
         raise OperationFailure("container instance is not singular and running")
-    return active[0]["id"]
+    return active[0]["name"]
 
 
 def parse_secret_names(raw):
@@ -649,7 +650,6 @@ def process_release_sha256(worker, application_id, application_version, image, r
         "application_version": application_version,
         "container_image": image,
         "container_instance": restart["container_instance"],
-        "container_last_change": restart["container_last_change"],
         "schema_version": RELEASE_SCHEMA,
         "worker_version_id": worker,
     })).hexdigest()
