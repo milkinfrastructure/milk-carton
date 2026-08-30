@@ -27,6 +27,7 @@ WRANGLER_VERSION = "4.126.0"
 DELIVERY_SCHEMA = "milk.baseten-candidate-key-delivery.v1"
 VERIFY_SCHEMA = "milk.baseten-candidate-key-delivery-verify.v1"
 REMOVE_SCHEMA = "milk.baseten-candidate-key-remove.v1"
+OPERATOR_ROUTE_REMOVE_SCHEMA = "milk.baseten-candidate-key-remove-operator-route.v1"
 ACK_SCHEMA = "milk.baseten-candidate-key-delivery-ack.v1"
 RESTART_SCHEMA = "milk.gateway-candidate-container-restart.v1"
 INSPECTION_SCHEMA = "milk.gateway-candidate-container-inspection.v1"
@@ -49,6 +50,8 @@ MAX_DELIVERY = 4096
 MAX_ACK = 4096
 POLL_ATTEMPTS = 12
 POLL_SECONDS = 2
+OPERATOR_CANARY_BASIS_POINTS = 100
+ZERO_SHA256 = "0" * 64
 
 
 class OperationFailure(Exception):
@@ -238,6 +241,76 @@ def ordered_route_receipt(value):
     return receipt
 
 
+def operator_route_receipt_prefix(receipt):
+    revision = receipt["route_revision"]
+    manifest_suffix = f"/routes/versions/{revision}.json"
+    manifest_key = receipt["manifest_object_key"]
+    if not manifest_key.endswith(manifest_suffix):
+        raise OperationFailure("operator route receipt manifest is invalid")
+    prefix = manifest_key.removesuffix(manifest_suffix)
+    scope_id = prefix.removeprefix("milk/v1/scopes/")
+    signature_prefix = f"{prefix}/routes/signatures/{revision}/"
+    signature_key = receipt["signature_object_key"]
+    signature_sha256 = (
+        signature_key.removeprefix(signature_prefix).removesuffix(".ed25519")
+    )
+    if (
+        prefix != f"milk/v1/scopes/{scope_id}"
+        or UUID.fullmatch(scope_id or "") is None
+        or not signature_key.startswith(signature_prefix)
+        or not signature_key.endswith(".ed25519")
+        or SHA256.fullmatch(signature_sha256) is None
+        or receipt["live_pointer_object_key"] != f"{prefix}/routes/current.json"
+        or receipt["state"] != "active"
+    ):
+        raise OperationFailure("operator route receipt object identity is invalid")
+    return prefix
+
+
+def parse_operator_route_remove(value):
+    require_exact_keys(
+        value,
+        BASE_KEYS | {
+            "schema_version", "gateway_release_id", "gateway_release_sha256",
+            "proposal_sha256", "candidate_sha256", "canary_route_receipt",
+            "zero_route_receipt",
+        },
+        "operator route remove request",
+    )
+    if (
+        value["schema_version"] != OPERATOR_ROUTE_REMOVE_SCHEMA
+        or UUID.fullmatch(value["gateway_release_id"] or "") is None
+        or SHA256.fullmatch(value["gateway_release_sha256"] or "") is None
+        or SHA256.fullmatch(value["proposal_sha256"] or "") is None
+        or SHA256.fullmatch(value["candidate_sha256"] or "") is None
+        or value["proposal_sha256"] == ZERO_SHA256
+        or value["candidate_sha256"] == ZERO_SHA256
+    ):
+        raise OperationFailure("invalid operator route remove request")
+    canary = ordered_route_receipt(value["canary_route_receipt"])
+    zero = ordered_route_receipt(value["zero_route_receipt"])
+    if (
+        operator_route_receipt_prefix(canary) != operator_route_receipt_prefix(zero)
+        or canary["candidate_basis_points"] != OPERATOR_CANARY_BASIS_POINTS
+        or zero["candidate_basis_points"] != 0
+        or zero["previous_route_revision"] != canary["route_revision"]
+        or zero["route_revision"] == canary["route_revision"]
+        or canary["student_result_sha256"] != value["proposal_sha256"]
+        or zero["student_result_sha256"] != value["proposal_sha256"]
+        or canary["student_job_id"] != value["candidate_sha256"]
+        or canary["model_manifest_sha256"] == ZERO_SHA256
+        or canary["dev_receipt_sha256"] != ZERO_SHA256
+        or zero["student_job_id"] != ZERO_SHA256
+        or zero["model_manifest_sha256"] != ZERO_SHA256
+        or zero["dev_receipt_sha256"] != ZERO_SHA256
+    ):
+        raise OperationFailure("invalid operator route receipt sequence")
+    metadata = validate_base(value)
+    metadata["gateway_release_id"] = value["gateway_release_id"]
+    metadata["gateway_release_sha256"] = value["gateway_release_sha256"]
+    return metadata
+
+
 def ordered_trigger(value):
     if not isinstance(value, dict):
         raise OperationFailure("invalid teardown trigger")
@@ -386,7 +459,6 @@ def parse_application(raw, application_id, account_id):
         or value.get("id") != application_id
         or value.get("account_id") != account_id
         or value.get("name") != APPLICATION_NAME
-        or value.get("jobs") is not False
         or not valid_positive_integer(value.get("version"))
         or not isinstance(value.get("configuration"), dict)
         or not isinstance(value["configuration"].get("image"), str)
@@ -427,6 +499,21 @@ def parse_secret_names(raw):
     if len(names) != len(set(names)) or ADMIN_SECRET not in names:
         raise OperationFailure("container admin secret is not installed")
     return set(names)
+
+
+def parse_wrangler_oauth_identity(raw, account_id):
+    value = parse_json(raw, "Wrangler OAuth identity")
+    accounts = value.get("accounts") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("loggedIn") is not True
+        or not isinstance(accounts, list)
+        or not any(
+            isinstance(account, dict) and account.get("id") == account_id
+            for account in accounts
+        )
+    ):
+        raise OperationFailure("Wrangler OAuth account does not match")
 
 
 class Runner:
@@ -737,6 +824,7 @@ def parse_arguments():
     baseten.add_argument("--expected-application-version", type=int, required=True)
     baseten.add_argument("--expected-container-image", required=True)
     baseten.add_argument("--expected-worker-version-id", required=True)
+    baseten.add_argument("--wrangler-oauth", action="store_true")
     arguments = parser.parse_args()
     if (
         UUID.fullmatch(arguments.application_id or "") is None
@@ -749,7 +837,7 @@ def parse_arguments():
     return arguments
 
 
-def command_environment(scratch):
+def command_environment(scratch, wrangler_oauth):
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN"}
     forbidden = re.compile(
         r"^(AWS_|AZURE_|GCP_|S3_|BASETEN_|MODAL_|OPENAI_|R2_|TEACHER_|WANDB_|MILK_CARTON_|DOCKER_|BUILDX_|BUILDKIT_).*"
@@ -763,18 +851,34 @@ def command_environment(scratch):
             raise OperationFailure("ambient credential is forbidden")
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     token = os.environ.get("CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN", "")
-    if ACCOUNT_ID.fullmatch(account_id) is None or not 32 <= len(token) <= 8192:
+    if (
+        ACCOUNT_ID.fullmatch(account_id) is None
+        or (wrangler_oauth and "CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN" in os.environ)
+        or (not wrangler_oauth and not 32 <= len(token) <= 8192)
+    ):
         raise OperationFailure("dedicated Cloudflare credentials are required")
     path = os.environ.get("PATH", "")
     if not path:
         raise OperationFailure("PATH is unavailable")
-    return account_id, {
+    environment = {
         "CI": "1", "CLOUDFLARE_ACCOUNT_ID": account_id,
-        "CLOUDFLARE_API_TOKEN": token, "HOME": str(scratch), "PATH": path,
+        "PATH": path,
         "TMPDIR": str(scratch), "WRANGLER_LOG_SANITIZE": "true",
         "WRANGLER_SEND_METRICS": "false", "WRANGLER_WRITE_LOGS": "false",
-        "XDG_CACHE_HOME": str(scratch), "XDG_CONFIG_HOME": str(scratch),
+        "XDG_CACHE_HOME": str(scratch),
     }
+    if wrangler_oauth:
+        home = os.environ.get("HOME", "")
+        if not home:
+            raise OperationFailure("Wrangler OAuth requires HOME")
+        environment["HOME"] = home
+    else:
+        environment.update({
+            "CLOUDFLARE_API_TOKEN": token,
+            "HOME": str(scratch),
+            "XDG_CONFIG_HOME": str(scratch),
+        })
+    return account_id, environment
 
 
 def resolve_commands(path):
@@ -791,6 +895,14 @@ def verify_pinned_wrangler(runner):
     version = runner.wrangler("--version").decode("ascii", "strict").strip()
     if version != WRANGLER_VERSION:
         raise OperationFailure("Wrangler version is not pinned")
+
+
+def verify_wrangler_oauth(runner, account_id):
+    raw = runner.wrangler(
+        "whoami", "--json", "--config",
+        str(runner.repository / "deploy/cloudflare/wrangler.jsonc"),
+    )
+    parse_wrangler_oauth_identity(raw, account_id)
 
 
 def validate_peer(connection):
@@ -867,6 +979,14 @@ def handle_request(request, arguments, runner, account_id, admin_key):
         return verify(parse_verify(request), arguments, runner, account_id, admin_key)
     if schema == REMOVE_SCHEMA:
         return remove(parse_remove(request), arguments, runner, account_id, admin_key)
+    if schema == OPERATOR_ROUTE_REMOVE_SCHEMA:
+        return remove(
+            parse_operator_route_remove(request),
+            arguments,
+            runner,
+            account_id,
+            admin_key,
+        )
     raise OperationFailure("unsupported candidate request")
 
 
@@ -932,12 +1052,16 @@ def main():
         admin_key = read_admin_key(arguments.admin_key_fd)
         with tempfile.TemporaryDirectory(prefix="milk-candidate-credential.") as scratch_name:
             scratch = Path(scratch_name)
-            account_id, environment = command_environment(scratch)
+            account_id, environment = command_environment(
+                scratch, arguments.wrangler_oauth
+            )
             runner = Runner(
                 resolve_commands(environment["PATH"]), environment,
                 Path(__file__).resolve().parent.parent,
             )
             verify_pinned_wrangler(runner)
+            if arguments.wrangler_oauth:
+                verify_wrangler_oauth(runner, account_id)
             serve_once(arguments.socket_path, arguments, runner, account_id, admin_key)
         return 0
     except (OperationFailure, UnicodeError, ValueError, OSError):

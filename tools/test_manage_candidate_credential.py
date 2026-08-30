@@ -24,6 +24,8 @@ ADMIN_KEY = "milk_admin_" + "A" * 48
 CANDIDATE_KEY = "bt_candidate_test_secret_123456789"
 CANDIDATE_SHA = hashlib.sha256(CANDIDATE_KEY.encode()).hexdigest()
 CLOUDFLARE_TOKEN = "D" * 40
+ZERO_SHA256 = "0" * 64
+ROUTE_SCOPE_PREFIX = "milk/v1/scopes/10000000-0000-0000-0000-000000000001"
 
 
 def canonical(value):
@@ -82,6 +84,65 @@ def route_receipt(revision, basis_points, previous_revision=None):
     }
 
 
+def operator_route_receipt(
+    revision,
+    basis_points,
+    proposal_sha256,
+    candidate_sha256,
+    previous_revision=None,
+):
+    candidate = basis_points != 0
+    return {
+        "schema_version": "milk.route-publication-receipt.v2",
+        "route_revision": revision,
+        "student_job_id": candidate_sha256 if candidate else ZERO_SHA256,
+        "student_result_sha256": proposal_sha256,
+        "model_manifest_sha256": "6" * 64 if candidate else ZERO_SHA256,
+        "dev_receipt_sha256": ZERO_SHA256,
+        "previous_route_revision": previous_revision,
+        "candidate_basis_points": basis_points,
+        "manifest_object_key": f"{ROUTE_SCOPE_PREFIX}/routes/versions/{revision}.json",
+        "signature_object_key": (
+            f"{ROUTE_SCOPE_PREFIX}/routes/signatures/{revision}/{'a' * 64}.ed25519"
+        ),
+        "live_pointer_object_key": f"{ROUTE_SCOPE_PREFIX}/routes/current.json",
+        "state": "active",
+    }
+
+
+def operator_route_remove_request(installed_ack):
+    proposal_sha256 = "5" * 64
+    candidate_sha256 = "1" * 64
+    canary_revision = "8" * 64
+    zero_revision = "9" * 64
+    return {
+        "candidate_key_sha256": installed_ack["candidate_key_sha256"],
+        "candidate_sha256": candidate_sha256,
+        "canary_route_receipt": operator_route_receipt(
+            canary_revision, 100, proposal_sha256, candidate_sha256
+        ),
+        "gateway_release_id": installed_ack["gateway_release_id"],
+        "gateway_release_sha256": installed_ack["gateway_release_sha256"],
+        "key_name": installed_ack["key_name"],
+        "key_prefix": installed_ack["key_prefix"],
+        "model_id": installed_ack["model_id"],
+        "payload_bytes": installed_ack["payload_bytes"],
+        "payload_sha256": installed_ack["payload_sha256"],
+        "proposal_sha256": proposal_sha256,
+        "provider": installed_ack["provider"],
+        "run_id": installed_ack["run_id"],
+        "schema_version": "milk.baseten-candidate-key-remove-operator-route.v1",
+        "team_name": installed_ack["team_name"],
+        "zero_route_receipt": operator_route_receipt(
+            zero_revision,
+            0,
+            proposal_sha256,
+            candidate_sha256,
+            canary_revision,
+        ),
+    }
+
+
 def remove_request(installed_ack, trigger=None):
     trigger = trigger or {
         "kind": "service_expired",
@@ -136,6 +197,7 @@ from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 state_path = Path(sys.argv[0]).resolve().parent.parent / "state.json"
+oauth = (state_path.parent / "wrangler-oauth").is_file()
 state = json.loads(state_path.read_text())
 state.setdefault("commands", []).append({"command": name, "arguments": args})
 
@@ -146,8 +208,12 @@ def done(code=0):
 def transition():
     state["worker"] = state["future_workers"].pop(0)
 
-if os.environ.get("CLOUDFLARE_API_TOKEN") != "D" * 40:
-    done(90)
+if oauth:
+    if "CLOUDFLARE_API_TOKEN" in os.environ:
+        done(90)
+else:
+    if os.environ.get("CLOUDFLARE_API_TOKEN") != "D" * 40:
+        done(90)
 if "CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN" in os.environ:
     done(91)
 if os.environ.get("WRANGLER_WRITE_LOGS") != "false":
@@ -159,13 +225,16 @@ if name == "sleep":
 if name == "wrangler":
     if args == ["--version"]:
         print("4.125.0" if state["mode"] == "wrong_wrangler" else "4.126.0")
+    elif args[:2] == ["whoami", "--json"]:
+        account = "f" * 32 if state["mode"] == "wrong_oauth_account" else state["account"]
+        print(json.dumps({"accounts": [{"id": account}], "loggedIn": True}))
     elif args[:2] == ["deployments", "status"]:
         print(json.dumps({"versions": [{"percentage": 100, "version_id": state["worker"]}]}))
     elif args[:2] == ["containers", "info"]:
         print(json.dumps({
             "account_id": state["account"], "configuration": {"image": state["image"]},
-            "id": state["application"], "jobs": False,
-            "name": "milk-carton-milkcarton", "version": state["application_version"],
+            "id": state["application"], "name": "milk-carton-milkcarton",
+            "version": state["application_version"],
         }))
     elif args[:2] == ["containers", "instances"]:
         print(json.dumps([{"id": "gateway", "state": "running", "version": state["application_version"]}]))
@@ -262,9 +331,12 @@ done(2)
 
 
 class Fixture:
-    def __init__(self, mode="success", candidate_installed=False, worker=PREVIOUS_WORKER):
+    def __init__(self, mode="success", candidate_installed=False, worker=PREVIOUS_WORKER, oauth=False):
         self.temporary = tempfile.TemporaryDirectory(prefix="milk-candidate-helper-test.")
         self.root = Path(self.temporary.name)
+        self.oauth = oauth
+        if oauth:
+            (self.root / "wrangler-oauth").touch(mode=0o600)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         fake = self.bin / "fake-command"
@@ -312,9 +384,14 @@ class Fixture:
             os.close(write_descriptor)
         environment = {
             "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
-            "CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN": CLOUDFLARE_TOKEN,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
         }
+        arguments = []
+        if self.oauth:
+            environment["HOME"] = str(self.root / "oauth-home")
+            arguments.append("--wrangler-oauth")
+        else:
+            environment["CLOUDFLARE_CANDIDATE_SECRET_API_TOKEN"] = CLOUDFLARE_TOKEN
         process = subprocess.Popen(
             [
                 sys.executable, str(SCRIPT),
@@ -326,6 +403,7 @@ class Fixture:
                 "--expected-application-version", "7",
                 "--expected-container-image", IMAGE,
                 "--expected-worker-version-id", PREVIOUS_WORKER,
+                *arguments,
             ],
             cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             pass_fds=(read_descriptor,),
@@ -407,6 +485,21 @@ class CandidateCredentialHelperTests(unittest.TestCase):
             self.assertNotIn(CANDIDATE_KEY, arguments)
             self.assertNotIn(ADMIN_KEY, arguments)
 
+    def test_wrangler_oauth_is_account_bound_before_install(self):
+        fixture = Fixture(oauth=True)
+        self.addCleanup(fixture.close)
+        code, response, stdout, stderr = fixture.transact(candidate_frame())
+        self.assertEqual((code, stdout, stderr), (0, b"", b""))
+        self.assertEqual(json.loads(response)["state"], "installed")
+        self.assertEqual(fixture.state["commands"][1]["arguments"][:2], ["whoami", "--json"])
+
+        wrong = Fixture(mode="wrong_oauth_account", oauth=True)
+        self.addCleanup(wrong.close)
+        code, response, stdout, stderr = wrong.transact(candidate_frame())
+        self.assertEqual((code, response, stdout), (1, b"", b""))
+        self.assertEqual(stderr, b"candidate credential operation failed\n")
+        self.assertFalse(wrong.state["candidate_installed"])
+
     def test_baseten_remove_requires_the_latest_exact_gateway_release(self):
         stale = Fixture()
         self.addCleanup(stale.close)
@@ -486,6 +579,51 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.assertEqual((response, stdout), (b"", b""))
         self.assertEqual(stderr, b"candidate credential operation failed\n")
         self.assertTrue(fixture.state["candidate_installed"])
+
+    def test_operator_route_zero_removes_the_exact_installed_release(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        code, installed_raw, _stdout, _stderr = fixture.transact(candidate_frame())
+        self.assertEqual(code, 0)
+        request = operator_route_remove_request(json.loads(installed_raw))
+        code, removed_raw, stdout, stderr = fixture.transact(canonical(request))
+        self.assertEqual((code, stdout, stderr), (0, b"", b""))
+        self.assertEqual(json.loads(removed_raw)["state"], "absent")
+        self.assertFalse(fixture.state["candidate_installed"])
+
+    def test_operator_route_zero_rejects_mixed_or_legacy_route_receipts(self):
+        mutations = (
+            lambda request: request["zero_route_receipt"].__setitem__(
+                "previous_route_revision", "f" * 64
+            ),
+            lambda request: request["canary_route_receipt"].__setitem__(
+                "candidate_basis_points", 500
+            ),
+            lambda request: request["zero_route_receipt"].__setitem__(
+                "candidate_basis_points", 1
+            ),
+            lambda request: request["zero_route_receipt"].__setitem__(
+                "student_result_sha256", "e" * 64
+            ),
+            lambda request: request["canary_route_receipt"].__setitem__(
+                "student_job_id", "e" * 64
+            ),
+            lambda request: request["zero_route_receipt"].__setitem__(
+                "student_job_id", request["candidate_sha256"]
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                fixture = Fixture()
+                self.addCleanup(fixture.close)
+                code, installed_raw, _stdout, _stderr = fixture.transact(candidate_frame())
+                self.assertEqual(code, 0)
+                request = operator_route_remove_request(json.loads(installed_raw))
+                mutate(request)
+                code, response, stdout, stderr = fixture.transact(canonical(request))
+                self.assertEqual((code, response, stdout), (1, b"", b""))
+                self.assertEqual(stderr, b"candidate credential operation failed\n")
+                self.assertTrue(fixture.state["candidate_installed"])
 
     def test_recovery_verify_reports_installed_or_absent_without_plaintext(self):
         installed = Fixture(candidate_installed=True, worker=INSTALLED_WORKER)
