@@ -345,7 +345,14 @@ if name == "wrangler":
         print("4.126.0")
         done()
     values = without_global(args)
-    if values[:2] == ["secret", "list"]:
+    if values[:2] == ["whoami", "--json"]:
+        if Path(os.environ["FAKE_EVIDENCE"]).exists() or os.environ.get("CLOUDFLARE_API_TOKEN"):
+            done(96)
+        print(json.dumps({
+            "loggedIn": True,
+            "accounts": [{"id": state.get("whoami_account", state["account"])}],
+        }))
+    elif values[:2] == ["secret", "list"]:
         worker_missing = state.get("bootstrap", False) and state["mode"] != "bootstrap_preexisting_worker" and (
             state["deployment"] == "initial" or state.get("worker_deleted", False)
         )
@@ -537,25 +544,28 @@ class Fixture:
             "FAKE_EVIDENCE": str(self.evidence),
         }
 
-    def run(self, script=SCRIPT, token_stdin=False):
+    def run(self, script=SCRIPT, token_stdin=False, wrangler_oauth=False):
         registry_arguments = ["--registry-token-stdin"] if token_stdin else [
             "--registry-token-file", str(self.registry_token),
         ]
         arguments = [
-            str(script), *registry_arguments,
+            str(script), *( ["--wrangler-oauth"] if wrangler_oauth else [] ), *registry_arguments,
             str(self.release), APPLICATION, str(self.evidence),
             str(self.credential), str(self.gateway_config), API_BASE_URL,
         ]
         if self.bootstrap:
             arguments = [
-                str(script), *registry_arguments,
+                str(script), *( ["--wrangler-oauth"] if wrangler_oauth else [] ), *registry_arguments,
                 "--bootstrap", str(self.release), str(self.evidence),
                 str(self.credential), str(self.bootstrap_secrets), API_BASE_URL,
             ]
+        environment = self.environment.copy()
+        if wrangler_oauth:
+            environment.pop("CLOUDFLARE_API_TOKEN")
         return subprocess.run(
             arguments,
             cwd=ROOT,
-            env=self.environment,
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             input=b"github-test-token\n" if token_stdin else None,
@@ -627,6 +637,54 @@ class DeployPrivateGatewayTests(unittest.TestCase):
             path.read_bytes() for path in fixture.evidence.rglob("*") if path.is_file()
         )
         self.assertNotIn(b"github-test-token", evidence_raw)
+
+    def test_wrangler_oauth_preflight_matches_account_before_evidence_write(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        result = fixture.run(wrangler_oauth=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        commands = fixture.state["commands"]
+        wrangler_commands = [item for item in commands if item["command"] == "wrangler"]
+        self.assertEqual(wrangler_commands[0]["arguments"], ["--version"])
+        whoami = next(
+            item for item in wrangler_commands
+            if item["arguments"][:2] == ["whoami", "--json"]
+        )
+        self.assertEqual(whoami["arguments"][:2], ["whoami", "--json"])
+        preflight = json.loads(
+            (fixture.evidence / "wrangler-oauth-preflight.json").read_text()
+        )
+        self.assertIs(preflight["logged_in"], True)
+        self.assertIs(preflight["account_match"], True)
+        self.assertIs(preflight["content_retained"], False)
+
+    def test_wrangler_oauth_rejects_api_token(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        arguments = [
+            str(SCRIPT), "--wrangler-oauth", "--registry-token-file", str(fixture.registry_token),
+            str(fixture.release), APPLICATION, str(fixture.evidence), str(fixture.credential),
+            str(fixture.gateway_config), API_BASE_URL,
+        ]
+        result = subprocess.run(
+            arguments, cwd=ROOT, env=fixture.environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"mutually exclusive", result.stderr)
+        self.assertFalse(fixture.evidence.exists())
+        self.assertEqual(fixture.state["commands"], [])
+
+    def test_wrangler_oauth_rejects_wrong_account_before_evidence_write(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        state = fixture.state
+        state["whoami_account"] = "b" * 32
+        fixture.state_path.write_text(json.dumps(state))
+        result = fixture.run(wrangler_oauth=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"does not match", result.stderr)
+        self.assertFalse(fixture.evidence.exists())
 
     def test_smoke_model_is_fixed_before_cloud_mutation(self):
         fixture = Fixture()

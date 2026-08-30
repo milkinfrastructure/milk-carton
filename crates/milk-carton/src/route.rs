@@ -11,7 +11,7 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 pub(crate) const ROUTE_SCHEMA_VERSION: &str = "milk.route.v4";
-pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v1";
+pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v2";
 pub(crate) const OPERATOR_ROUTE_SCHEMA_VERSION: &str = "milk.route.v1";
 pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "milk.winner-admission-receipt.v2";
 const ROUTE_LIVE_SCHEMA_VERSION: &str = "milk.route-live.v1";
@@ -49,6 +49,13 @@ const _: () = assert!(
 );
 const MAX_ROUTE_VALIDITY_HOURS: i64 = 24;
 const MAX_PUBLICATION_START_DELAY_MINUTES: i64 = 5;
+const MAX_HARNESS_CANDIDATE_BASIS_POINTS: u16 = 1_000;
+const MAX_HARNESS_SPEND_MICROUSD: u64 = 25_000_000;
+const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v2";
+const HARNESS_TAXONOMY_VERSION: &str = "milk.semantic-taxonomy.v1";
+const NON_PRODUCTION_MECHANICS_SCOPE_ID: u128 = 0xf7f88ff0_5947_440c_a661_e4e35f1d04e0;
+const NON_PRODUCTION_MECHANICS_EVAL_SHA256: &str =
+    "26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -489,16 +496,122 @@ struct OperatorRouteCandidate {
     max_input_request_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HarnessProfile {
+    Mechanics,
+    Production,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OperatorRouteProposal {
-    api_base_url: String,
-    candidate_basis_points: u16,
-    candidate_id: String,
-    eval_sha256: String,
-    model: String,
-    schema_version: String,
-    scope_id: Uuid,
+pub(crate) struct HarnessTeacherBinding {
+    pub(crate) api_url: String,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: String,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) max_input_tokens: u64,
+    pub(crate) max_output_tokens: u64,
+    pub(crate) input_rate_microusd_per_million: u64,
+    pub(crate) output_rate_microusd_per_million: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HarnessScoreTargetBinding {
+    pub(crate) api_url: String,
+    pub(crate) model: String,
+    pub(crate) input_rate_microusd_per_million: u64,
+    pub(crate) output_rate_microusd_per_million: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HarnessCandidateScoreBinding {
+    pub(crate) incumbent: HarnessScoreTargetBinding,
+    pub(crate) candidate: HarnessScoreTargetBinding,
+    pub(crate) held_out_cases: u64,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) max_calls_per_run: u64,
+    pub(crate) max_input_tokens_per_call: u64,
+    pub(crate) max_output_tokens_per_call: u64,
+    pub(crate) max_total_tokens_per_run: u64,
+    pub(crate) case_reference_similarity_basis_points: u16,
+    pub(crate) minimum_candidate_reference_pass_basis_points: u16,
+    pub(crate) minimum_reference_pass_delta_basis_points: i16,
+    pub(crate) maximum_candidate_error_basis_points: u16,
+    pub(crate) maximum_candidate_p95_latency_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HarnessBudgetBinding {
+    pub(crate) starting_spend_microusd: u64,
+    pub(crate) stop_new_spend_microusd: u64,
+    pub(crate) absolute_spend_microusd: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HarnessPromptDigests {
+    pub(crate) classifier: String,
+    pub(crate) eval_generation: String,
+    pub(crate) eval_validation: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HarnessJobIds {
+    pub(crate) classifier: String,
+    pub(crate) eval_generation: String,
+    pub(crate) eval_validation: String,
+    pub(crate) candidate_score: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HarnessTeacherResultDigests {
+    pub(crate) classifier: String,
+    pub(crate) eval_generation: String,
+    pub(crate) eval_validation: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorRouteProvenance {
+    pub(crate) harness_revision: String,
+    pub(crate) config_sha256: String,
+    pub(crate) taxonomy_version: String,
+    pub(crate) prompt_sha256s: HarnessPromptDigests,
+    pub(crate) teacher: HarnessTeacherBinding,
+    pub(crate) candidate_score: HarnessCandidateScoreBinding,
+    pub(crate) budget: HarnessBudgetBinding,
+    pub(crate) job_ids: HarnessJobIds,
+    pub(crate) teacher_result_sha256s: HarnessTeacherResultDigests,
+    pub(crate) provider_tokens: u64,
+    pub(crate) accounted_cost_microusd: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorRouteProposal {
+    pub(crate) schema_version: String,
+    pub(crate) scope_id: Uuid,
+    pub(crate) profile: HarnessProfile,
+    pub(crate) series_id: String,
+    pub(crate) code_version: String,
+    pub(crate) source_manifest_sha256: String,
+    pub(crate) summary_sha256: String,
+    pub(crate) readiness_sha256: String,
+    pub(crate) eval_sha256: String,
+    pub(crate) eval_validation_sha256: String,
+    pub(crate) candidate_score_sha256: String,
+    pub(crate) candidate_id: String,
+    pub(crate) api_base_url: String,
+    pub(crate) model: String,
+    pub(crate) candidate_basis_points: u16,
+    pub(crate) provenance: OperatorRouteProvenance,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -659,6 +772,11 @@ impl RoutePublication {
     pub(crate) const fn is_operator_proposal(&self) -> bool {
         matches!(self.source, RoutePublicationSource::OperatorProposal)
     }
+
+    pub(crate) fn operator_proposal_sha256(&self) -> Option<[u8; 32]> {
+        self.is_operator_proposal()
+            .then_some(self.student_result_sha256)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -735,33 +853,67 @@ pub(crate) fn prepare_operator_route_manifest(
     previous: Option<&RoutePublication>,
     now: DateTime<Utc>,
 ) -> Result<(Vec<u8>, RoutePublication)> {
-    if proposal_bytes.len() > MAX_ROUTE_MANIFEST_BYTES {
-        bail!("route proposal exceeds {MAX_ROUTE_MANIFEST_BYTES} bytes");
+    prepare_operator_route_manifest_inner(
+        config,
+        scope,
+        proposal_bytes,
+        route_secret_hex,
+        candidate_api_key,
+        previous,
+        now,
+        false,
+    )
+}
+
+pub(crate) fn prepare_operator_zero_route_manifest(
+    config: &RouteStartupConfig,
+    scope: &RouteScope,
+    proposal_bytes: &[u8],
+    previous: &RoutePublication,
+    now: DateTime<Utc>,
+) -> Result<(Vec<u8>, RoutePublication)> {
+    prepare_operator_route_manifest_inner(
+        config,
+        scope,
+        proposal_bytes,
+        None,
+        None,
+        Some(previous),
+        now,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_operator_route_manifest_inner(
+    config: &RouteStartupConfig,
+    scope: &RouteScope,
+    proposal_bytes: &[u8],
+    route_secret_hex: Option<&str>,
+    candidate_api_key: Option<&str>,
+    previous: Option<&RoutePublication>,
+    now: DateTime<Utc>,
+    zero: bool,
+) -> Result<(Vec<u8>, RoutePublication)> {
+    let proposal = parse_operator_route_proposal(config, scope, proposal_bytes)?;
+    let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
+    if zero {
+        let previous = previous.context("operator zero route requires a live predecessor")?;
+        if proposal.candidate_basis_points == 0
+            || !previous.is_operator_proposal()
+            || !previous.has_candidate
+            || previous.candidate_basis_points == 0
+            || previous.student_result_sha256 != proposal_sha256
+        {
+            bail!("operator zero route requires the live candidate route for this exact proposal");
+        }
     }
-    let proposal: OperatorRouteProposal = serde_json::from_slice(proposal_bytes)
-        .context("route proposal is not strict typed JSON")?;
-    let mut canonical_proposal = serde_json::to_vec(&serde_json::to_value(&proposal)?)?;
-    canonical_proposal.push(b'\n');
-    if canonical_proposal != proposal_bytes {
-        bail!("route proposal must be canonical key-sorted compact JSON plus one LF");
-    }
-    if proposal.schema_version != OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION {
-        bail!("route proposal has an unsupported schema version");
-    }
-    if proposal.scope_id != scope.scope_id {
-        bail!("route proposal scope does not match startup configuration");
-    }
-    if proposal.candidate_basis_points > 10_000 {
-        bail!("candidate_basis_points cannot exceed 10000");
-    }
-    decode_lowercase_hex_32(&proposal.eval_sha256, "route proposal eval SHA-256")?;
-    if !valid_bounded_ascii(&proposal.candidate_id, MAX_EXECUTION_ID_BYTES)
-        || !valid_model_alias(&proposal.model)
-    {
-        bail!("route proposal candidate identity is invalid");
-    }
-    validate_candidate_api_base_url(&proposal.api_base_url, config.allow_private_candidate_http)?;
-    let candidate = if proposal.candidate_basis_points == 0 {
+    let candidate_basis_points = if zero {
+        0
+    } else {
+        proposal.candidate_basis_points
+    };
+    let candidate = if candidate_basis_points == 0 {
         None
     } else {
         let candidate_api_key =
@@ -806,9 +958,9 @@ pub(crate) fn prepare_operator_route_manifest(
     let manifest = serde_json::to_vec(&OperatorRouteManifest {
         schema_version: OPERATOR_ROUTE_SCHEMA_VERSION.to_owned(),
         scope: scope.clone(),
-        proposal_sha256: hex_digest(&Sha256::digest(proposal_bytes).into()),
+        proposal_sha256: hex_digest(&proposal_sha256),
         candidate,
-        candidate_basis_points: proposal.candidate_basis_points,
+        candidate_basis_points,
         previous_route_revision: previous.map(RoutePublication::revision_hex),
         route_secret_sha256,
         not_before,
@@ -817,6 +969,158 @@ pub(crate) fn prepare_operator_route_manifest(
     })?;
     let publication = RoutePublication::parse_for_publication(config, scope, &manifest, None, now)?;
     Ok((manifest, publication))
+}
+
+pub(crate) fn parse_operator_route_proposal(
+    config: &RouteStartupConfig,
+    scope: &RouteScope,
+    proposal_bytes: &[u8],
+) -> Result<OperatorRouteProposal> {
+    if proposal_bytes.len() > MAX_ROUTE_MANIFEST_BYTES {
+        bail!("route proposal exceeds {MAX_ROUTE_MANIFEST_BYTES} bytes");
+    }
+    let proposal: OperatorRouteProposal = serde_json::from_slice(proposal_bytes)
+        .context("route proposal is not strict typed JSON")?;
+    let mut canonical_proposal = serde_json::to_vec(&serde_json::to_value(&proposal)?)?;
+    canonical_proposal.push(b'\n');
+    if canonical_proposal != proposal_bytes {
+        bail!("route proposal must be canonical key-sorted compact JSON plus one LF");
+    }
+    if proposal.schema_version != OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION {
+        bail!("route proposal has an unsupported schema version");
+    }
+    if proposal.scope_id != scope.scope_id {
+        bail!("route proposal scope does not match startup configuration");
+    }
+    if proposal.candidate_basis_points > MAX_HARNESS_CANDIDATE_BASIS_POINTS {
+        bail!("candidate_basis_points cannot exceed 1000");
+    }
+    for (value, description) in [
+        (&proposal.source_manifest_sha256, "source manifest SHA-256"),
+        (&proposal.summary_sha256, "summary SHA-256"),
+        (&proposal.readiness_sha256, "readiness SHA-256"),
+        (&proposal.eval_sha256, "eval SHA-256"),
+        (&proposal.eval_validation_sha256, "eval validation SHA-256"),
+        (&proposal.candidate_score_sha256, "candidate score SHA-256"),
+        (&proposal.provenance.config_sha256, "harness config SHA-256"),
+        (
+            &proposal.provenance.prompt_sha256s.classifier,
+            "classifier prompt SHA-256",
+        ),
+        (
+            &proposal.provenance.prompt_sha256s.eval_generation,
+            "eval generation prompt SHA-256",
+        ),
+        (
+            &proposal.provenance.prompt_sha256s.eval_validation,
+            "eval validation prompt SHA-256",
+        ),
+        (&proposal.provenance.job_ids.classifier, "classifier job ID"),
+        (
+            &proposal.provenance.job_ids.eval_generation,
+            "eval generation job ID",
+        ),
+        (
+            &proposal.provenance.job_ids.eval_validation,
+            "eval validation job ID",
+        ),
+        (
+            &proposal.provenance.job_ids.candidate_score,
+            "candidate score job ID",
+        ),
+        (
+            &proposal.provenance.teacher_result_sha256s.classifier,
+            "classifier result SHA-256",
+        ),
+        (
+            &proposal.provenance.teacher_result_sha256s.eval_generation,
+            "eval generation result SHA-256",
+        ),
+        (
+            &proposal.provenance.teacher_result_sha256s.eval_validation,
+            "eval validation result SHA-256",
+        ),
+    ] {
+        decode_lowercase_hex_32(value, description)?;
+    }
+    reject_non_production_mechanics_route(proposal.scope_id, Some(&proposal.eval_sha256))?;
+    if !valid_harness_identifier(&proposal.series_id)
+        || !valid_harness_identifier(&proposal.candidate_id)
+        || !valid_model_alias(&proposal.model)
+        || proposal.code_version != HARNESS_CODE_VERSION
+        || proposal.provenance.taxonomy_version != HARNESS_TAXONOMY_VERSION
+        || proposal.provenance.harness_revision.len() != 40
+        || !proposal
+            .provenance
+            .harness_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("route proposal harness identity is invalid");
+    }
+    let budget = proposal.provenance.budget;
+    if budget.starting_spend_microusd > budget.stop_new_spend_microusd
+        || budget.stop_new_spend_microusd > budget.absolute_spend_microusd
+        || budget.absolute_spend_microusd > MAX_HARNESS_SPEND_MICROUSD
+        || proposal.provenance.accounted_cost_microusd
+            > budget
+                .absolute_spend_microusd
+                .saturating_sub(budget.starting_spend_microusd)
+    {
+        bail!("route proposal budget is invalid");
+    }
+    validate_candidate_api_base_url(&proposal.api_base_url, config.allow_private_candidate_http)?;
+    Ok(proposal)
+}
+
+pub(crate) fn verify_operator_manifest_proposal_binding(
+    config: &RouteStartupConfig,
+    scope: &RouteScope,
+    manifest_bytes: &[u8],
+    proposal_bytes: &[u8],
+) -> Result<()> {
+    let proposal = parse_operator_route_proposal(config, scope, proposal_bytes)?;
+    let manifest: OperatorRouteManifest = serde_json::from_slice(manifest_bytes)
+        .context("operator route manifest is not strict typed JSON")?;
+    if serde_json::to_vec(&manifest)? != manifest_bytes {
+        bail!("route manifest is not canonical JSON");
+    }
+    validate_operator_manifest(config, scope, &manifest)?;
+    let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
+    if manifest.proposal_sha256 != hex_digest(&proposal_sha256) {
+        bail!("signed route does not reference the exact stored proposal");
+    }
+
+    let expected_validity = if let Some(candidate) = &manifest.candidate {
+        if manifest.candidate_basis_points != proposal.candidate_basis_points
+            || proposal.candidate_basis_points == 0
+            || candidate.eval_sha256 != proposal.eval_sha256
+            || candidate.candidate_id != proposal.candidate_id
+            || candidate.api_base_url != proposal.api_base_url
+            || candidate.model != proposal.model
+            || candidate.supported_capabilities != [RouteCapability::Stream]
+            || candidate.reasoning_effort.is_some()
+        {
+            bail!("signed candidate route differs from its stored proposal");
+        }
+        WINNER_CANARY_VALID_FOR_SECONDS
+    } else {
+        if proposal.candidate_basis_points == 0
+            || manifest.candidate_basis_points != 0
+            || manifest.previous_route_revision.is_none()
+        {
+            bail!("signed zero route differs from its candidate proposal lineage");
+        }
+        WINNER_ZERO_VALID_FOR_SECONDS
+    };
+    if manifest.not_before.nanosecond() != 0
+        || manifest.not_after.nanosecond() != 0
+        || manifest.not_after - manifest.not_before
+            != TimeDelta::seconds(i64::from(expected_validity))
+    {
+        bail!("signed operator route validity differs from the bounded prepared route");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1739,6 +2043,13 @@ fn validate_operator_manifest(
     if &manifest.scope != expected_scope {
         bail!("operator route manifest scope does not match startup configuration");
     }
+    reject_non_production_mechanics_route(
+        manifest.scope.scope_id,
+        manifest
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.eval_sha256.as_str()),
+    )?;
     if config.signing_key_id.is_empty()
         || config.signing_key_id.len() > MAX_KEY_ID_BYTES
         || manifest.signing_key_id != config.signing_key_id
@@ -1773,6 +2084,16 @@ fn validate_operator_manifest(
         (Some(_), 0) => bail!("zero-basis-point route must not contain a candidate"),
         (Some(_), _) => bail!("candidate_basis_points cannot exceed 10000"),
     }
+}
+
+fn reject_non_production_mechanics_route(scope_id: Uuid, eval_sha256: Option<&str>) -> Result<()> {
+    if scope_id.as_u128() == NON_PRODUCTION_MECHANICS_SCOPE_ID {
+        bail!("non-production mechanics scope is not route-admissible");
+    }
+    if eval_sha256.is_some_and(|value| value == NON_PRODUCTION_MECHANICS_EVAL_SHA256) {
+        bail!("non-production mechanics eval is not route-admissible");
+    }
+    Ok(())
 }
 
 fn validate_operator_candidate(
@@ -1959,6 +2280,17 @@ fn valid_model_alias(value: &str) -> bool {
 
 fn valid_bounded_ascii(value: &str, maximum: usize) -> bool {
     (1..=maximum).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn valid_harness_identifier(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 pub(crate) fn validate_candidate_api_base_url(
@@ -2226,6 +2558,92 @@ mod tests {
         (winner, admission)
     }
 
+    fn operator_proposal(scope: &RouteScope, eval_sha256: &str, basis_points: u16) -> Vec<u8> {
+        let proposal = OperatorRouteProposal {
+            schema_version: OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION.to_owned(),
+            scope_id: scope.scope_id,
+            profile: HarnessProfile::Mechanics,
+            series_id: "mechanics-v1".to_owned(),
+            code_version: HARNESS_CODE_VERSION.to_owned(),
+            source_manifest_sha256: repeated_digest(0xb1),
+            summary_sha256: repeated_digest(0xb2),
+            readiness_sha256: repeated_digest(0xb3),
+            eval_sha256: eval_sha256.to_owned(),
+            eval_validation_sha256: repeated_digest(0xb4),
+            candidate_score_sha256: repeated_digest(0xb5),
+            candidate_id: "candidate-2026-08-29".to_owned(),
+            api_base_url: "https://candidate.example/v1/".to_owned(),
+            model: "customer-model".to_owned(),
+            candidate_basis_points: basis_points,
+            provenance: OperatorRouteProvenance {
+                harness_revision: "1".repeat(40),
+                config_sha256: repeated_digest(0xc1),
+                taxonomy_version: HARNESS_TAXONOMY_VERSION.to_owned(),
+                prompt_sha256s: HarnessPromptDigests {
+                    classifier: repeated_digest(0xc2),
+                    eval_generation: repeated_digest(0xc3),
+                    eval_validation: repeated_digest(0xc4),
+                },
+                teacher: HarnessTeacherBinding {
+                    api_url: "https://teacher.example/v1/responses".to_owned(),
+                    model: "teacher-model".to_owned(),
+                    reasoning_effort: "high".to_owned(),
+                    timeout_seconds: 60,
+                    max_input_tokens: 128,
+                    max_output_tokens: 64,
+                    input_rate_microusd_per_million: 1,
+                    output_rate_microusd_per_million: 1,
+                },
+                candidate_score: HarnessCandidateScoreBinding {
+                    incumbent: HarnessScoreTargetBinding {
+                        api_url: "https://incumbent.example/v1/chat/completions".to_owned(),
+                        model: "incumbent-model".to_owned(),
+                        input_rate_microusd_per_million: 1,
+                        output_rate_microusd_per_million: 1,
+                    },
+                    candidate: HarnessScoreTargetBinding {
+                        api_url: "https://candidate.example/v1/chat/completions".to_owned(),
+                        model: "customer-model".to_owned(),
+                        input_rate_microusd_per_million: 1,
+                        output_rate_microusd_per_million: 1,
+                    },
+                    held_out_cases: 1,
+                    timeout_seconds: 60,
+                    max_calls_per_run: 2,
+                    max_input_tokens_per_call: 128,
+                    max_output_tokens_per_call: 16,
+                    max_total_tokens_per_run: 288,
+                    case_reference_similarity_basis_points: 9_000,
+                    minimum_candidate_reference_pass_basis_points: 9_000,
+                    minimum_reference_pass_delta_basis_points: 0,
+                    maximum_candidate_error_basis_points: 0,
+                    maximum_candidate_p95_latency_ms: 30_000,
+                },
+                budget: HarnessBudgetBinding {
+                    starting_spend_microusd: 0,
+                    stop_new_spend_microusd: MAX_HARNESS_SPEND_MICROUSD,
+                    absolute_spend_microusd: MAX_HARNESS_SPEND_MICROUSD,
+                },
+                job_ids: HarnessJobIds {
+                    classifier: repeated_digest(0xd1),
+                    eval_generation: repeated_digest(0xd2),
+                    eval_validation: repeated_digest(0xd3),
+                    candidate_score: repeated_digest(0xd4),
+                },
+                teacher_result_sha256s: HarnessTeacherResultDigests {
+                    classifier: repeated_digest(0xe1),
+                    eval_generation: repeated_digest(0xe2),
+                    eval_validation: repeated_digest(0xe3),
+                },
+                provider_tokens: 1,
+                accounted_cost_microusd: 1,
+            },
+        };
+        let mut bytes = serde_json::to_vec(&serde_json::to_value(proposal).unwrap()).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
     #[test]
     fn prepare_route_builds_verified_canary_and_exact_rollback() {
         let fixture = Fixture::active(100, r#"["stream"]"#);
@@ -2364,20 +2782,7 @@ mod tests {
         .unwrap();
         generic_config.validate_common(8).unwrap();
         assert!(generic_config.winner_deployment_authority().is_err());
-        let proposal = format!(
-            concat!(
-                "{{\"api_base_url\":\"https://candidate.example/v1/\",",
-                "\"candidate_basis_points\":10000,",
-                "\"candidate_id\":\"candidate-2026-08-29\",",
-                "\"eval_sha256\":\"{}\",",
-                "\"model\":\"customer-model\",",
-                "\"schema_version\":\"milk.unsigned-route-proposal.v1\",",
-                "\"scope_id\":\"{}\"}}\n"
-            ),
-            repeated_digest(0xa1),
-            fixture.scope.scope_id,
-        )
-        .into_bytes();
+        let proposal = operator_proposal(&fixture.scope, &repeated_digest(0xa1), 1_000);
         let (manifest_bytes, publication) = prepare_operator_route_manifest(
             &generic_config,
             &fixture.scope,
@@ -2429,8 +2834,56 @@ mod tests {
         assert_eq!(manifest.schema_version, OPERATOR_ROUTE_SCHEMA_VERSION);
         assert_eq!(manifest.previous_route_revision, None);
         assert_eq!(
-            manifest.candidate.unwrap().supported_capabilities,
+            manifest.candidate.as_ref().unwrap().supported_capabilities,
             [RouteCapability::Stream]
+        );
+        verify_operator_manifest_proposal_binding(
+            &generic_config,
+            &fixture.scope,
+            &manifest_bytes,
+            &proposal,
+        )
+        .unwrap();
+
+        let mut mismatched = manifest.clone();
+        mismatched.candidate.as_mut().unwrap().model = "other-model".to_owned();
+        assert!(
+            verify_operator_manifest_proposal_binding(
+                &generic_config,
+                &fixture.scope,
+                &serde_json::to_vec(&mismatched).unwrap(),
+                &proposal,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("differs from its stored proposal")
+        );
+
+        let mut extended = manifest.clone();
+        extended.candidate.as_mut().unwrap().supported_capabilities =
+            vec![RouteCapability::Stream, RouteCapability::Responses];
+        assert!(
+            verify_operator_manifest_proposal_binding(
+                &generic_config,
+                &fixture.scope,
+                &serde_json::to_vec(&extended).unwrap(),
+                &proposal,
+            )
+            .is_err()
+        );
+
+        let mut long_lived = manifest.clone();
+        long_lived.not_after += TimeDelta::seconds(1);
+        assert!(
+            verify_operator_manifest_proposal_binding(
+                &generic_config,
+                &fixture.scope,
+                &serde_json::to_vec(&long_lived).unwrap(),
+                &proposal,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("validity differs")
         );
 
         let signature = signing_key().sign(&manifest_bytes);
@@ -2447,12 +2900,12 @@ mod tests {
         )
         .unwrap();
         let chat = br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}]}"#;
-        assert_eq!(
+        assert!((0_u64..100).any(|cohort| {
             policy
-                .decide(&request(chat, b"session"), Instant::now())
-                .target,
-            RouteTarget::Candidate
-        );
+                .decide(&request(chat, &cohort.to_be_bytes()), Instant::now())
+                .target
+                == RouteTarget::Candidate
+        }));
         let responses = br#"{"model":"customer-model","input":"hi"}"#;
         assert_eq!(
             policy
@@ -2466,20 +2919,7 @@ mod tests {
     fn unsigned_harness_zero_proposal_emits_signed_baseline_without_candidate() {
         let fixture = Fixture::active(10_000, r#"["stream"]"#);
         let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let proposal = format!(
-            concat!(
-                "{{\"api_base_url\":\"https://candidate.example/v1/\",",
-                "\"candidate_basis_points\":0,",
-                "\"candidate_id\":\"candidate-2026-08-29\",",
-                "\"eval_sha256\":\"{}\",",
-                "\"model\":\"customer-model\",",
-                "\"schema_version\":\"milk.unsigned-route-proposal.v1\",",
-                "\"scope_id\":\"{}\"}}\n"
-            ),
-            repeated_digest(0xa2),
-            fixture.scope.scope_id,
-        )
-        .into_bytes();
+        let proposal = operator_proposal(&fixture.scope, &repeated_digest(0xa2), 0);
         let (manifest_bytes, publication) = prepare_operator_route_manifest(
             &fixture.config,
             &fixture.scope,
@@ -2517,6 +2957,175 @@ mod tests {
                 Instant::now(),
             ),
             BaselineReason::PolicyZero,
+        );
+    }
+
+    #[test]
+    fn operator_zero_route_requires_the_live_candidate_for_the_exact_proposal() {
+        let fixture = Fixture::active(10_000, r#"["stream"]"#);
+        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
+        let proposal = operator_proposal(
+            &fixture.scope,
+            &repeated_digest(0xa5),
+            WINNER_CANARY_BASIS_POINTS,
+        );
+        let (_, canary) = prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal,
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            None,
+            now,
+        )
+        .unwrap();
+        let (zero_bytes, zero) = prepare_operator_zero_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal,
+            &canary,
+            now + TimeDelta::seconds(60),
+        )
+        .unwrap();
+        let zero_manifest: OperatorRouteManifest = serde_json::from_slice(&zero_bytes).unwrap();
+        assert!(!zero.has_candidate);
+        assert_eq!(zero.candidate_basis_points, 0);
+        assert_eq!(zero.previous_route_revision, Some(canary.revision));
+        assert_eq!(zero.student_result_sha256, canary.student_result_sha256);
+        assert!(zero_manifest.candidate.is_none());
+        assert!(zero_manifest.route_secret_sha256.is_none());
+        assert_eq!(
+            zero_manifest.previous_route_revision,
+            Some(canary.revision_hex())
+        );
+        verify_operator_manifest_proposal_binding(
+            &fixture.config,
+            &fixture.scope,
+            &zero_bytes,
+            &proposal,
+        )
+        .unwrap();
+
+        let other = operator_proposal(
+            &fixture.scope,
+            &repeated_digest(0xa6),
+            WINNER_CANARY_BASIS_POINTS,
+        );
+        assert!(
+            prepare_operator_zero_route_manifest(
+                &fixture.config,
+                &fixture.scope,
+                &other,
+                &canary,
+                now + TimeDelta::seconds(60),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exact proposal")
+        );
+        let student = RoutePublication::parse_for_publication(
+            &fixture.config,
+            &fixture.scope,
+            &fixture.manifest,
+            Some(&fixture.signature),
+            now,
+        )
+        .unwrap();
+        assert!(
+            prepare_operator_zero_route_manifest(
+                &fixture.config,
+                &fixture.scope,
+                &proposal,
+                &student,
+                now + TimeDelta::seconds(60),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_production_mechanics_identities_cannot_prepare_or_publish_operator_routes() {
+        let fixture = Fixture::active(10_000, r#"["stream"]"#);
+        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
+        let mechanics_scope = RouteScope {
+            scope_id: "f7f88ff0-5947-440c-a661-e4e35f1d04e0".parse().unwrap(),
+        };
+        let proposal = |scope: &RouteScope, eval_sha256: &str| {
+            operator_proposal(scope, eval_sha256, WINNER_CANARY_BASIS_POINTS)
+        };
+
+        let blocked_scope = prepare_operator_route_manifest(
+            &fixture.config,
+            &mechanics_scope,
+            &proposal(&mechanics_scope, &repeated_digest(0xa3)),
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            blocked_scope
+                .to_string()
+                .contains("mechanics scope is not route-admissible")
+        );
+
+        let blocked_eval = prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal(&fixture.scope, NON_PRODUCTION_MECHANICS_EVAL_SHA256),
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            blocked_eval
+                .to_string()
+                .contains("mechanics eval is not route-admissible")
+        );
+
+        let mut unrelated_eval = NON_PRODUCTION_MECHANICS_EVAL_SHA256.to_owned();
+        unrelated_eval.replace_range(63..64, "8");
+        prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal(&fixture.scope, &unrelated_eval),
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            None,
+            now,
+        )
+        .unwrap();
+
+        let (manifest_bytes, _) = prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal(&fixture.scope, &repeated_digest(0xa4)),
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            None,
+            now,
+        )
+        .unwrap();
+        let mut manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        manifest.candidate.as_mut().unwrap().eval_sha256 =
+            NON_PRODUCTION_MECHANICS_EVAL_SHA256.to_owned();
+        let blocked_manifest = serde_json::to_vec(&manifest).unwrap();
+        let signature = signing_key().sign(&blocked_manifest);
+        let error = RoutePublication::parse_for_publication(
+            &fixture.config,
+            &fixture.scope,
+            &blocked_manifest,
+            Some(signature.as_ref()),
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mechanics eval is not route-admissible")
         );
     }
 

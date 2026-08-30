@@ -34,7 +34,8 @@ use super::{
     decode_lowercase_sha256, generation_status_once, is_json_content_type,
     parse_openai_compatible_api_base_url, parse_openai_compatible_endpoint,
     records_sampling_key_version, sampling_identity, start_records, start_records_with_timeout,
-    status_once, tick_once_with_records, validate_config_identity, validate_teacher_config,
+    status_once, tick_once_with_records, validate_config_for_command, validate_config_identity,
+    validate_teacher_config,
 };
 use crate::records::{
     CAPTURE_SAMPLER_ID, Records, RouteBlockReason, RouteObservation, SamplingIndependence,
@@ -519,43 +520,85 @@ async fn due_expiry_returns_before_teacher_readiness() {
 }
 
 #[actix_web::test]
-async fn status_contract_exposes_eval_teacher_decision_limit() {
+async fn status_contract_is_data_plane_only_and_does_not_require_teacher() {
     #[derive(Deserialize)]
-    struct GenerationContract {
-        max_decisions: u32,
-        claimed_decisions: u32,
-        remaining_decisions: u32,
+    #[serde(deny_unknown_fields)]
+    struct CaptureContract {
+        from_hour: chrono::DateTime<Utc>,
+        through_hour: chrono::DateTime<Utc>,
+        shards: u64,
+        failed_shards: u64,
+        #[serde(rename = "values")]
+        _values: crate::records::StatsValues,
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ExpiryContract {
+        batch_limit: u64,
+        due_batch_markers: u64,
+        grace_deferred_batch_markers: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct RecordsContract {
         schema_version: String,
-        generation: GenerationContract,
+        scope: Scope,
+        capture: CaptureContract,
+        expiry: ExpiryContract,
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RouteContract {
+        configured: bool,
+        state: String,
+        route_revision: Option<String>,
+        student_job_id: Option<String>,
+        candidate_basis_points: Option<u16>,
+        not_after: Option<chrono::DateTime<Utc>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct StatusContract {
         schema_version: String,
         records: RecordsContract,
+        route: RouteContract,
     }
 
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!("milk-carton-status-contract-{}", Uuid::now_v7()));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-    let mut config = config(4_096, 1);
+    let mut config: FileConfig = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/milk-carton-config.example.json"
+    )))
+    .unwrap();
     config.stores = local_stores(&root);
-    config.teacher.as_mut().unwrap().max_decisions = 7;
+    assert!(config.teacher.is_none());
+    validate_config_for_command(&config, Some(&Command::Status)).unwrap();
 
-    let raw = status_once(&config, Utc::now().with_nanosecond(0).unwrap())
-        .await
-        .unwrap();
+    let now = Utc::now().with_nanosecond(0).unwrap();
+    let raw = status_once(&config, now).await.unwrap();
     let status: StatusContract = serde_json::from_str(&raw).unwrap();
-    assert_eq!(status.schema_version, "milk.status.v2");
-    assert_eq!(status.records.schema_version, "milk.status-records.v5");
-    assert_eq!(status.records.generation.max_decisions, 7);
-    assert_eq!(status.records.generation.claimed_decisions, 0);
-    assert_eq!(status.records.generation.remaining_decisions, 7);
+    assert_eq!(status.schema_version, "milk.status.v3");
+    assert_eq!(status.records.schema_version, "milk.status-data-plane.v1");
+    assert_eq!(status.records.scope.scope_id, config.scope_id);
+    assert!(status.records.capture.from_hour <= status.records.capture.through_hour);
+    assert_eq!(status.records.capture.shards, 0);
+    assert_eq!(status.records.capture.failed_shards, 0);
+    assert_eq!(status.records.expiry.batch_limit, 1_000);
+    assert_eq!(status.records.expiry.due_batch_markers, 0);
+    assert_eq!(status.records.expiry.grace_deferred_batch_markers, 0);
+    assert!(!status.route.configured);
+    assert_eq!(status.route.state, "disabled");
+    assert!(status.route.route_revision.is_none());
+    assert!(status.route.student_job_id.is_none());
+    assert!(status.route.candidate_basis_points.is_none());
+    assert!(status.route.not_after.is_none());
     fs::remove_dir_all(root).unwrap();
 }
 

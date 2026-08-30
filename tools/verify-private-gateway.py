@@ -41,6 +41,7 @@ COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 MAX_TOKEN_BYTES = 8_192
 MAX_AUTH_BYTES = 1_048_576
 MAX_BLOB_BYTES = 67_108_864
+MAX_RUNNABLE_LAYER_BYTES = 20 * 1024 * 1024
 
 
 def _object(raw, label):
@@ -490,8 +491,11 @@ def verify(arguments, github_token):
     layers = manifest.get("layers")
     if not isinstance(layers, list):
         raise ValueError("runnable manifest has no layer list")
-    for layer in layers:
-        _descriptor(layer, "runnable layer")
+    compressed_layer_bytes = sum(
+        _descriptor(layer, "runnable layer")[1] for layer in layers
+    )
+    if compressed_layer_bytes > MAX_RUNNABLE_LAYER_BYTES:
+        raise ValueError("runnable image compressed layers exceed 20 MiB")
 
     raw_attestation = _run(*docker_prefix, REPOSITORY + "@" + attestation_digest)
     if _digest(raw_attestation) != attestation_digest or len(raw_attestation) != attestation_size:

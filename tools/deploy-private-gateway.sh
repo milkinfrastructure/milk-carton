@@ -202,6 +202,51 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def validate_wrangler_oauth(command, config, environment, account_id):
+    try:
+        version = subprocess.run(
+            [command, "--version"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            check=False, timeout=60,
+        )
+        versions = re.findall(
+            r"(?<![0-9.])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9.])",
+            version.stdout.decode("utf-8", errors="strict"),
+        )
+        if version.returncode != 0 or versions != [WRANGLER_VERSION]:
+            raise ContractFailure("Wrangler is not pinned to 4.126.0")
+        whoami = subprocess.run(
+            [command, "whoami", "--json", "--config", str(config)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, check=False, timeout=60,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        raise DeployFailure("Wrangler OAuth preflight failed") from error
+    if whoami.returncode != 0:
+        raise DeployFailure("Wrangler OAuth preflight failed")
+    value = parse_json(whoami.stdout, "Wrangler whoami response")
+    accounts = value.get("accounts") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("loggedIn") is not True
+        or not isinstance(accounts, list)
+    ):
+        raise DeployFailure("Wrangler OAuth session is not logged in")
+    if not any(
+        isinstance(account, dict) and account.get("id") == account_id
+        for account in accounts
+    ):
+        raise DeployFailure("Wrangler OAuth account does not match CLOUDFLARE_ACCOUNT_ID")
+    return {
+        "schema_version": "milk.wrangler-oauth-preflight.v1",
+        "command": "wrangler whoami --json",
+        "wrangler_version": WRANGLER_VERSION,
+        "logged_in": True,
+        "account_match": True,
+        "content_retained": False,
+    }
+
+
 def validate_deployment_baseline_binding(current_raw, baseline_raw, expected_sha256):
     current = parse_json(current_raw, "current deployment", 65536)
     baseline = parse_json(baseline_raw, "official OpenAI SDK baseline", 65536)
@@ -850,21 +895,24 @@ def main():
     arguments = sys.argv[2:]
     registry_token_file = None
     registry_token_stdin = False
-    while arguments and arguments[0].startswith("--registry-token-"):
+    wrangler_oauth = False
+    while arguments and arguments[0].startswith("--") and arguments[0] != "--bootstrap":
         option = arguments.pop(0)
-        if option == "--registry-token-file" and arguments and registry_token_file is None and not registry_token_stdin:
+        if option == "--wrangler-oauth" and not wrangler_oauth:
+            wrangler_oauth = True
+        elif option == "--registry-token-file" and arguments and registry_token_file is None and not registry_token_stdin:
             registry_token_file = Path(arguments.pop(0))
         elif option == "--registry-token-stdin" and registry_token_file is None and not registry_token_stdin:
             registry_token_stdin = True
         else:
-            raise DeployFailure("registry credential input must be selected exactly once")
+            raise DeployFailure("unsupported or duplicate deploy option")
     if registry_token_file is None and not registry_token_stdin:
         raise DeployFailure("registry credential input must be selected exactly once")
     bootstrap = len(arguments) == 6 and arguments[0] == "--bootstrap"
     if not bootstrap and len(arguments) != 6:
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
-            "       deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
+            "usage: deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
+            "       deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
         )
     api_base_url, api_hostname, health_url = validate_api_base_url(arguments.pop())
     script = Path(sys.argv[1]).resolve(strict=True)
@@ -935,7 +983,11 @@ def main():
             raise DeployFailure("deploy shell contains an ambient provider, store, registry, or model credential")
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     cloudflare_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    if ACCOUNT_ID.fullmatch(account_id) is None or not 1 <= len(cloudflare_token) <= 8192:
+    if wrangler_oauth and "CLOUDFLARE_API_TOKEN" in os.environ:
+        raise DeployFailure("--wrangler-oauth is mutually exclusive with CLOUDFLARE_API_TOKEN")
+    if ACCOUNT_ID.fullmatch(account_id) is None or (
+        not wrangler_oauth and not 1 <= len(cloudflare_token) <= 8192
+    ):
         raise DeployFailure("exact Cloudflare account credentials are required")
     os.environ.pop("CLOUDFLARE_ACCOUNT_ID", None)
     os.environ.pop("CLOUDFLARE_API_TOKEN", None)
@@ -944,7 +996,9 @@ def main():
     base_environment["WRANGLER_SEND_METRICS"] = "false"
     cloudflare_environment = base_environment.copy()
     cloudflare_environment["CLOUDFLARE_ACCOUNT_ID"] = account_id
-    cloudflare_environment["CLOUDFLARE_API_TOKEN"] = cloudflare_token
+    if not wrangler_oauth:
+        cloudflare_environment["CLOUDFLARE_API_TOKEN"] = cloudflare_token
+        cloudflare_environment.pop("HOME", None)
 
     commands = {}
     for command in ("curl", "docker", "git", "node", "sleep", "wrangler"):
@@ -970,6 +1024,15 @@ def main():
     if buildx_plugin is None:
         raise DeployFailure("docker buildx plugin is unavailable in standard locations")
 
+    base_config_path = repository / "deploy/cloudflare/wrangler.jsonc"
+    oauth_preflight = None
+    if wrangler_oauth:
+        if not base_environment.get("HOME"):
+            raise DeployFailure("Wrangler OAuth requires the actual HOME")
+        oauth_preflight = validate_wrangler_oauth(
+            commands["wrangler"], base_config_path, cloudflare_environment, account_id,
+        )
+
     evidence_directory.mkdir(mode=0o700)
     operation_id = secrets.token_hex(12)
     evidence = Evidence(evidence_directory, operation_id)
@@ -994,7 +1057,8 @@ def main():
     for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signal_number, interrupt)
 
-    base_config_path = repository / "deploy/cloudflare/wrangler.jsonc"
+    if oauth_preflight is not None:
+        evidence.write("wrangler-oauth-preflight.json", oauth_preflight)
 
     def wrangler(action, *arguments, timeout=60, sensitive=False, check=True,
                  input_bytes=None, config=base_config_path):

@@ -45,6 +45,7 @@ jobs:
         run: |
           npm test
           node tools/openai-production-smoke.test.mjs
+          node tools/openai-production-path-workload.test.mjs
           npm --prefix deploy/cloudflare test
           python3 tools/test_manage_candidate_credential.py
           python3 tools/test_private_build.py

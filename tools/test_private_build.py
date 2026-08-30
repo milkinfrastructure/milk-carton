@@ -82,7 +82,14 @@ class GitHubRegistryHelperTests(unittest.TestCase):
 
 
 class VerifierFixture:
-    def __init__(self, root, *, bad_predicate=False, extra_descriptor=False):
+    def __init__(
+        self,
+        root,
+        *,
+        bad_predicate=False,
+        extra_descriptor=False,
+        layer_sizes=(),
+    ):
         self.root = Path(root)
         self.evidence = self.root / "evidence"
         self.docker_config = self.root / "docker-config"
@@ -117,6 +124,14 @@ class VerifierFixture:
             )
             + b"\n"
         )
+        layer_descriptors = [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": "sha256:" + f"{index + 10:064x}",
+                "size": size,
+            }
+            for index, size in enumerate(layer_sizes)
+        ]
         config = {
             "architecture": "amd64",
             "os": "linux",
@@ -129,7 +144,13 @@ class VerifierFixture:
                     "org.opencontainers.image.revision": self.commit,
                 },
             },
-            "rootfs": {"type": "layers", "diff_ids": []},
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": [
+                    "sha256:" + f"{index + 100:064x}"
+                    for index in range(len(layer_sizes))
+                ],
+            },
         }
         self.raw_config = _json(config)
         self.config_digest = _digest(self.raw_config)
@@ -141,7 +162,7 @@ class VerifierFixture:
                 "digest": self.config_digest,
                 "size": len(self.raw_config),
             },
-            "layers": [],
+            "layers": layer_descriptors,
         }
         self.raw_manifest = _json(manifest)
         self.manifest_digest = _digest(self.raw_manifest)
@@ -433,6 +454,25 @@ class PrivateImageVerifierTests(unittest.TestCase):
                 (one.evidence / "admission.json").read_bytes(),
                 (two.evidence / "admission.json").read_bytes(),
             )
+
+    def test_accepts_exact_compressed_layer_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            VerifierFixture(
+                directory,
+                layer_sizes=(VERIFY.MAX_RUNNABLE_LAYER_BYTES,),
+            ).run()
+
+    def test_rejects_sum_above_compressed_layer_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = VerifierFixture(
+                directory,
+                layer_sizes=(
+                    VERIFY.MAX_RUNNABLE_LAYER_BYTES // 2,
+                    VERIFY.MAX_RUNNABLE_LAYER_BYTES // 2 + 1,
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "exceed 20 MiB"):
+                fixture.run()
 
     def test_rejects_raw_blob_digest_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:

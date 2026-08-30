@@ -104,6 +104,24 @@ direct = re.compile(
     r"\s*\.fetch\(\s*request,?\s*\);"
 )
 assert direct.search(worker)
+external_candidate_check_guard = re.compile(
+    r"if\s*\(url\.pathname\s*===\s*CANDIDATE_CHECK_PATH\)\s*\{"
+    r"\s*return\s+new Response\(null,\s*\{"
+    r"\s*status:\s*404,"
+)
+candidate_check_guard = external_candidate_check_guard.search(worker)
+assert candidate_check_guard
+assert candidate_check_guard.start() < direct.search(worker).start()
+assert worker.count("this.containerFetch(") == 1
+internal_candidate_check = worker.split(
+    "async checkCandidateCredential", 1
+)[1].split("async inspectCandidateCredential", 1)[0]
+assert "this.containerFetch(" in internal_candidate_check
+assert "`http://container${CANDIDATE_CHECK_PATH}`" in internal_candidate_check
+public_candidate_guard = worker.split(
+    "if (url.pathname === CANDIDATE_CHECK_PATH)", 1
+)[1].split("if (url.pathname === CANDIDATE_ADMIN_PATH", 1)[0]
+assert "url.search" not in public_candidate_guard
 for buffered_or_mutated in (
     "request.arrayBuffer",
     "request.blob",
