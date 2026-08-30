@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   PRODUCTION_PROOF,
+  ROUTE_PROOF,
   candidateRequest,
   generatedMechanicsPlan,
   runBaselineSmoke,
@@ -22,16 +23,27 @@ const credential = {
 assert.deepEqual(PRODUCTION_PROOF, {
   baseline_requests: 322,
   candidate_requests: 2,
+  generated_concurrency: 1,
   generated_health_timeout_ms: 30_000,
+  generated_minimum_request_interval_ms: 4_250,
   generated_mechanics_requests: 320,
-  generated_request_timeout_ms: 30_000,
+  generated_reasoning_effort: "low",
+  generated_request_timeout_ms: 60_000,
   max_sdk_requests: 324,
   model: "zai-org/GLM-5.3-Flash",
   saturation_max_completion_tokens: 3_840,
-  short_max_completion_tokens: 128,
+  short_max_completion_tokens: 256,
 });
 const productionProofSha256 =
-  "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf";
+  "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66";
+assert.deepEqual(ROUTE_PROOF, {
+  candidate_session_search_limit: 256,
+  model: PRODUCTION_PROOF.model,
+  saturation_max_completion_tokens: 3_840,
+  short_max_completion_tokens: 256,
+});
+const routeProofSha256 =
+  "fe0e5278fda4eae56fdcf9e3642122ef2ccadbfdf3acaafaaad0cfa00a4a2c40";
 const revision = digest("1");
 const data = {
   choices: [{ finish_reason: "stop", message: { content: "OK", role: "assistant" } }],
@@ -41,14 +53,27 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
   return {
     chat: {
       completions: {
-        create(request) {
+        create(request, options) {
+          const selection = request.max_completion_tokens === 1;
           const expected = {
-            max_completion_tokens: 128,
+            max_completion_tokens: selection ? 1 : 256,
             messages: [{ role: "user", content: "Reply with only OK." }],
             model: credential.model,
           };
           if (includeReasoning) expected.reasoning_effort = "high";
           assert.deepEqual(request, expected);
+          if (includeReasoning) {
+            assert.match(
+              options?.headers?.["x-milk-session-id"] ?? "",
+              /^milk-route-proof-[0-9a-f]{16}-[0-9]{3}$/,
+            );
+          }
+          const index = Number(
+            options?.headers?.["x-milk-session-id"]?.slice(-3),
+          );
+          const target = selection && routeTarget === "candidate"
+            ? (index === 2 ? "candidate" : "openai")
+            : routeTarget;
           return {
             async withResponse() {
               return {
@@ -59,7 +84,7 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
                     "x-milk-candidate-sha256": digest("3"),
                     "x-milk-deployment-sha256": digest("4"),
                     "x-milk-route-revision": routeRevision,
-                    "x-milk-route-target": routeTarget,
+                    "x-milk-route-target": target,
                   }),
                   status: 200,
                 },
@@ -73,7 +98,7 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
 }
 
 assert.deepEqual(candidateRequest({ ...credential, reasoning_effort: null }), {
-  max_completion_tokens: 128,
+  max_completion_tokens: 256,
   messages: [{ role: "user", content: "Reply with only OK." }],
   model: credential.model,
 });
@@ -84,14 +109,17 @@ const receipt = await runCandidateSmoke(
   credential,
   revision,
 );
-assert.equal(receipt.schema_version, "milk.official-openai-sdk-route-smoke.v2");
+assert.equal(receipt.schema_version, "milk.official-openai-sdk-route-smoke.v3");
 assert.equal(receipt.proof_step, "candidate");
 assert.equal(receipt.model, PRODUCTION_PROOF.model);
-assert.equal(receipt.sdk_request_count, 1);
-assert.equal(receipt.baseline_request_count, 0);
-assert.equal(receipt.candidate_request_count, 1);
-assert.equal(receipt.max_completion_tokens, 128);
-assert.equal(receipt.proof_contract_sha256, productionProofSha256);
+assert.equal(receipt.sdk_request_count, 4);
+assert.equal(receipt.baseline_request_count, 2);
+assert.equal(receipt.candidate_request_count, 2);
+assert.equal(receipt.candidate_session_index, 2);
+assert.equal(receipt.selection_probe_count, 3);
+assert.equal(receipt.sticky_candidate_request_count, 2);
+assert.equal(receipt.max_completion_tokens, 256);
+assert.equal(receipt.proof_contract_sha256, routeProofSha256);
 assert.equal(receipt.route_revision, revision);
 assert.equal(receipt.route_target, "candidate");
 assert.equal(receipt.candidate_sha256, digest("3"));
@@ -99,6 +127,7 @@ assert.equal(receipt.artifact_sha256, digest("2"));
 assert.equal(receipt.deployment_sha256, digest("4"));
 assert.match(receipt.traffic_key_sha256, /^[0-9a-f]{64}$/);
 assert.match(receipt.traffic_cohort_sha256, /^[0-9a-f]{64}$/);
+assert.match(receipt.routing_session_sha256, /^[0-9a-f]{64}$/);
 
 const baseline = await runBaselineSmoke(
   client(revision, "candidate", false),
@@ -111,8 +140,8 @@ assert.equal(baseline.model, PRODUCTION_PROOF.model);
 assert.equal(baseline.sdk_request_count, 1);
 assert.equal(baseline.baseline_request_count, 1);
 assert.equal(baseline.candidate_request_count, 0);
-assert.equal(baseline.max_completion_tokens, 128);
-assert.equal(baseline.proof_contract_sha256, receipt.proof_contract_sha256);
+assert.equal(baseline.max_completion_tokens, 256);
+assert.equal(baseline.proof_contract_sha256, productionProofSha256);
 assert.equal(baseline.authenticated, true);
 assert.equal(baseline.content_retained, false);
 assert.match(baseline.traffic_key_sha256, /^[0-9a-f]{64}$/);
@@ -160,8 +189,12 @@ const aborted = [];
 const saturationClient = {
   chat: {
     completions: {
-      create(request) {
+      create(request, options) {
         assert.deepEqual(request, saturationRequest(credential));
+        assert.match(
+          options?.headers?.["x-milk-session-id"] ?? "",
+          /^milk-route-proof-[0-9a-f]{16}-002$/,
+        );
         const call = saturationCall++;
         assert.ok(call < 2);
         return {
@@ -196,18 +229,23 @@ const saturation = await runSaturationFallbackSmoke(
   new URL("https://carton.example/v1"),
   credential,
   revision,
+  receipt.candidate_session_index,
 );
-assert.equal(saturation.schema_version, "milk.official-openai-sdk-saturation-fallback-smoke.v2");
+assert.equal(saturation.schema_version, "milk.official-openai-sdk-saturation-fallback-smoke.v3");
 assert.equal(saturation.proof_step, "saturation_fallback");
 assert.equal(saturation.model, PRODUCTION_PROOF.model);
 assert.equal(saturation.sdk_request_count, 2);
 assert.equal(saturation.baseline_request_count, 1);
 assert.equal(saturation.candidate_request_count, 1);
+assert.equal(saturation.candidate_session_index, receipt.candidate_session_index);
+assert.equal(saturation.selection_probe_count, 0);
 assert.equal(saturation.max_completion_tokens, 3_840);
 assert.equal(saturation.proof_contract_sha256, receipt.proof_contract_sha256);
 assert.equal(saturation.candidate_route_target, "candidate");
 assert.equal(saturation.fallback_route_target, "openai");
 assert.equal(saturation.content_retained, false);
+assert.equal(saturation.routing_session_sha256, receipt.routing_session_sha256);
+assert.equal(saturation.streaming_candidate_held_during_fallback, true);
 assert.deepEqual(aborted.sort(), [0, 1]);
 
 function mechanicsResponse(call, omitRouteRevision = false) {
@@ -270,7 +308,10 @@ await assert.rejects(
 assert.equal(wrongModelTransportCalls, 0);
 const mechanicsPlan = generatedMechanicsPlan(PRODUCTION_PROOF.model);
 assert.equal(mechanicsPlan.length, 320);
-assert.equal(mechanicsPlan[0].request.max_completion_tokens, 128);
+assert.equal(mechanicsPlan[0].request.max_completion_tokens, 256);
+assert.equal(mechanicsPlan[0].request.reasoning_effort, "low");
+assert.equal(new Set(mechanicsPlan.map((row) => row.sessionId)).size, 320);
+assert.match(mechanicsPlan[0].sessionId, /^milk-mechanics-[0-9]{4}$/);
 assert.deepEqual(
   mechanicsPlan.slice(0, 251).reduce(
     (counts, row) => ({ ...counts, [row.partition]: counts[row.partition] + 1 }),
@@ -280,6 +321,8 @@ assert.deepEqual(
 );
 let mechanicsCalls = 0;
 let mechanicsHealthCalls = 0;
+const mechanicsSessions = new Set();
+const mechanicsLaunches = [];
 const mechanics = await runGeneratedMechanics(
   new URL("https://carton.example/v1"),
   {
@@ -295,21 +338,36 @@ const mechanics = await runGeneratedMechanics(
     }
     const call = mechanicsCalls;
     mechanicsCalls += 1;
+    mechanicsLaunches.push(performance.now());
+    if (call === 0) {
+      const blockedUntil = performance.now() + 30;
+      while (performance.now() < blockedUntil) {}
+    }
     assert.equal(request.url, "https://carton.example/v1/chat/completions");
+    assert.match(
+      request.headers.get("x-milk-session-id") ?? "",
+      /^milk-mechanics-[0-9]{4}$/,
+    );
+    mechanicsSessions.add(request.headers.get("x-milk-session-id"));
     return mechanicsResponse(call);
   },
+  5,
 );
 assert.equal(mechanicsCalls, 320);
 assert.equal(mechanicsHealthCalls, 2);
+assert.equal(mechanicsSessions.size, 320);
 assert.equal(mechanics.schema_version, "milk.official-openai-sdk-generated-mechanics.v2");
 assert.equal(mechanics.proof_step, "generated_mechanics");
 assert.equal(mechanics.model, PRODUCTION_PROOF.model);
-assert.equal(mechanics.request_timeout_ms, 30_000);
+assert.equal(mechanics.request_timeout_ms, 60_000);
+assert.equal(mechanics.minimum_request_interval_ms, 5);
+assert.equal(mechanics.reasoning_effort, "low");
+assert.equal(mechanics.concurrency, 1);
 assert.equal(mechanics.sdk_request_count, 320);
 assert.equal(mechanics.baseline_request_count, 320);
 assert.equal(mechanics.candidate_request_count, 0);
-assert.equal(mechanics.max_completion_tokens, 128);
-assert.equal(mechanics.proof_contract_sha256, receipt.proof_contract_sha256);
+assert.equal(mechanics.max_completion_tokens, 256);
+assert.equal(mechanics.proof_contract_sha256, productionProofSha256);
 assert.equal(mechanics.planned, 320);
 assert.equal(mechanics.attempted, 320);
 assert.equal(mechanics.successful, 320);
@@ -331,20 +389,20 @@ assert.equal(mechanics.gateway_config_sha256, "a".repeat(64));
 assert.equal(mechanics.route_revision, "openai-baseline-v1");
 assert.equal(mechanics.content_retained, false);
 assert.equal(mechanics.succeeded, true);
-assert.equal(
-  baseline.sdk_request_count + mechanics.sdk_request_count +
-    receipt.sdk_request_count + saturation.sdk_request_count,
-  PRODUCTION_PROOF.max_sdk_requests,
+const mechanicsLaunchGaps = mechanicsLaunches.slice(1).map(
+  (launchedAt, index) => launchedAt - mechanicsLaunches[index],
+);
+assert.ok(
+  mechanicsLaunchGaps.every((gap) => gap >= 3),
+  `minimum launch gap ${Math.min(...mechanicsLaunchGaps)}`,
 );
 assert.equal(
-  baseline.baseline_request_count + mechanics.baseline_request_count +
-    receipt.baseline_request_count + saturation.baseline_request_count,
-  PRODUCTION_PROOF.baseline_requests,
+  receipt.sdk_request_count,
+  receipt.baseline_request_count + receipt.candidate_request_count,
 );
 assert.equal(
-  baseline.candidate_request_count + mechanics.candidate_request_count +
-    receipt.candidate_request_count + saturation.candidate_request_count,
-  PRODUCTION_PROOF.candidate_requests,
+  saturation.sdk_request_count,
+  saturation.baseline_request_count + saturation.candidate_request_count,
 );
 
 let drainedCalls = 0;
@@ -366,6 +424,7 @@ const drained = await runGeneratedMechanics(
     drainedCalls += 1;
     return mechanicsResponse(call, call === 17);
   },
+  0,
 );
 assert.equal(drainedCalls, 320);
 assert.equal(drainedHealthCalls, 2);
@@ -391,6 +450,7 @@ await assert.rejects(
       rejectedChats += 1;
       return mechanicsResponse(rejectedChats);
     },
+    0,
   ),
 );
 assert.equal(rejectedChats, 0);

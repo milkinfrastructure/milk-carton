@@ -29,7 +29,7 @@ GHCR_REPOSITORY = "ghcr.io/milkinfrastructure/milk-carton"
 REGISTRY = "registry.cloudflare.com"
 WRANGLER_VERSION = "4.126.0"
 MAIN_SENTINEL = ".milk-private-deploy-script-required"
-IMAGE_SENTINEL = "MILK_CARTON_ADMITTED_IMAGE_REQUIRED"
+IMAGE_SENTINEL = "registry.invalid/milk-carton:admitted-image-required"
 CUSTOM_DOMAIN_SENTINEL = "MILK_CARTON_CUSTOM_DOMAIN_REQUIRED"
 BUILDKIT_IMAGE = "moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e"
 DOCKERFILE_FRONTEND = "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
@@ -50,15 +50,18 @@ HOSTNAME = re.compile(
 PRODUCTION_PROOF = {
     "baseline_requests": 322,
     "candidate_requests": 2,
+    "generated_concurrency": 1,
     "generated_health_timeout_ms": 30000,
+    "generated_minimum_request_interval_ms": 4250,
     "generated_mechanics_requests": 320,
-    "generated_request_timeout_ms": 30000,
+    "generated_reasoning_effort": "low",
+    "generated_request_timeout_ms": 60000,
     "max_sdk_requests": 324,
     "model": "zai-org/GLM-5.3-Flash",
     "saturation_max_completion_tokens": 3840,
-    "short_max_completion_tokens": 128,
+    "short_max_completion_tokens": 256,
 }
-PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf"
+PRODUCTION_PROOF_SHA256 = "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66"
 if hashlib.sha256(json.dumps(
     PRODUCTION_PROOF, sort_keys=True, separators=(",", ":"),
 ).encode()).hexdigest() != PRODUCTION_PROOF_SHA256:
@@ -121,6 +124,11 @@ class Interrupted(DeployFailure):
 
 def canonical_json(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def clear_sensitive_bytes(value):
+    if value is not None:
+        value[:] = b"\0" * len(value)
 
 
 def validate_api_base_url(value):
@@ -192,6 +200,51 @@ def read_regular(path, label, maximum=MAX_JSON):
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def validate_wrangler_oauth(command, config, environment, account_id):
+    try:
+        version = subprocess.run(
+            [command, "--version"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            check=False, timeout=60,
+        )
+        versions = re.findall(
+            r"(?<![0-9.])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9.])",
+            version.stdout.decode("utf-8", errors="strict"),
+        )
+        if version.returncode != 0 or versions != [WRANGLER_VERSION]:
+            raise ContractFailure("Wrangler is not pinned to 4.126.0")
+        whoami = subprocess.run(
+            [command, "whoami", "--json", "--config", str(config)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, check=False, timeout=60,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        raise DeployFailure("Wrangler OAuth preflight failed") from error
+    if whoami.returncode != 0:
+        raise DeployFailure("Wrangler OAuth preflight failed")
+    value = parse_json(whoami.stdout, "Wrangler whoami response")
+    accounts = value.get("accounts") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("loggedIn") is not True
+        or not isinstance(accounts, list)
+    ):
+        raise DeployFailure("Wrangler OAuth session is not logged in")
+    if not any(
+        isinstance(account, dict) and account.get("id") == account_id
+        for account in accounts
+    ):
+        raise DeployFailure("Wrangler OAuth account does not match CLOUDFLARE_ACCOUNT_ID")
+    return {
+        "schema_version": "milk.wrangler-oauth-preflight.v1",
+        "command": "wrangler whoami --json",
+        "wrangler_version": WRANGLER_VERSION,
+        "logged_in": True,
+        "account_match": True,
+        "content_retained": False,
+    }
 
 
 def validate_deployment_baseline_binding(current_raw, baseline_raw, expected_sha256):
@@ -588,7 +641,6 @@ def parse_application(raw, application_id, account_id):
         or info.get("id") != application_id
         or info.get("account_id") != account_id
         or info.get("name") != APPLICATION_NAME
-        or info.get("jobs") is not False
         or not isinstance(info.get("version"), int)
         or isinstance(info.get("version"), bool)
         or info["version"] < 1
@@ -699,7 +751,7 @@ def validate_gateway_config_file(path, repository):
     return raw, parse_gateway_config(raw)
 
 
-def validate_bootstrap_secrets(path, repository):
+def validate_bootstrap_secrets(path, repository, materialize=False):
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise DeployFailure("bootstrap secrets must be an absolute regular file")
     metadata = path.stat()
@@ -731,7 +783,8 @@ def validate_bootstrap_secrets(path, repository):
         raise DeployFailure("bootstrap secrets file is invalid")
     gateway_config_raw = secrets_value["MILK_CARTON_CONFIG_JSON"].encode("utf-8")
     gateway_config = parse_gateway_config(gateway_config_raw)
-    return canonical_json(secrets_value), set(secrets_value), gateway_config_raw, gateway_config
+    secret_input = bytearray(canonical_json(secrets_value)) if materialize else None
+    return secret_input, digest(raw), set(secrets_value), gateway_config_raw, gateway_config
 
 
 def validate_smoke_credential(path, gateway_config):
@@ -842,21 +895,24 @@ def main():
     arguments = sys.argv[2:]
     registry_token_file = None
     registry_token_stdin = False
-    while arguments and arguments[0].startswith("--registry-token-"):
+    wrangler_oauth = False
+    while arguments and arguments[0].startswith("--") and arguments[0] != "--bootstrap":
         option = arguments.pop(0)
-        if option == "--registry-token-file" and arguments and registry_token_file is None and not registry_token_stdin:
+        if option == "--wrangler-oauth" and not wrangler_oauth:
+            wrangler_oauth = True
+        elif option == "--registry-token-file" and arguments and registry_token_file is None and not registry_token_stdin:
             registry_token_file = Path(arguments.pop(0))
         elif option == "--registry-token-stdin" and registry_token_file is None and not registry_token_stdin:
             registry_token_stdin = True
         else:
-            raise DeployFailure("registry credential input must be selected exactly once")
+            raise DeployFailure("unsupported or duplicate deploy option")
     if registry_token_file is None and not registry_token_stdin:
         raise DeployFailure("registry credential input must be selected exactly once")
     bootstrap = len(arguments) == 6 and arguments[0] == "--bootstrap"
     if not bootstrap and len(arguments) != 6:
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
-            "       deploy-private-gateway.sh (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
+            "usage: deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
+            "       deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
         )
     api_base_url, api_hostname, health_url = validate_api_base_url(arguments.pop())
     script = Path(sys.argv[1]).resolve(strict=True)
@@ -865,17 +921,22 @@ def main():
     from github_registry import read_token, write_docker_config
     registry_stream = os.fdopen(3, "rb", closefd=False) if registry_token_stdin else None
     github_token = bytearray(read_token(registry_token_file, repository, registry_stream))
+    bootstrap_secret_input = None
+    bootstrap_secrets_path = None
+    bootstrap_secrets_sha256 = None
     if bootstrap:
         release_directory = Path(arguments[1]).resolve(strict=True)
         application_id = None
         requested_evidence = Path(arguments[2])
         credential_file = Path(arguments[3])
+        bootstrap_secrets_path = Path(arguments[4])
         (
-            bootstrap_secret_input,
+            _,
+            bootstrap_secrets_sha256,
             expected_bootstrap_secret_names,
             gateway_config_raw,
             gateway_config,
-        ) = validate_bootstrap_secrets(Path(arguments[4]), repository)
+        ) = validate_bootstrap_secrets(bootstrap_secrets_path, repository)
     else:
         release_directory = Path(arguments[0]).resolve(strict=True)
         application_id = arguments[1]
@@ -884,7 +945,6 @@ def main():
         gateway_config_raw, gateway_config = validate_gateway_config_file(
             Path(arguments[4]), repository,
         )
-        bootstrap_secret_input = None
         expected_bootstrap_secret_names = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
         raise DeployFailure("deploy evidence directory must be a new absolute path")
@@ -923,7 +983,11 @@ def main():
             raise DeployFailure("deploy shell contains an ambient provider, store, registry, or model credential")
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     cloudflare_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    if ACCOUNT_ID.fullmatch(account_id) is None or not 1 <= len(cloudflare_token) <= 8192:
+    if wrangler_oauth and "CLOUDFLARE_API_TOKEN" in os.environ:
+        raise DeployFailure("--wrangler-oauth is mutually exclusive with CLOUDFLARE_API_TOKEN")
+    if ACCOUNT_ID.fullmatch(account_id) is None or (
+        not wrangler_oauth and not 1 <= len(cloudflare_token) <= 8192
+    ):
         raise DeployFailure("exact Cloudflare account credentials are required")
     os.environ.pop("CLOUDFLARE_ACCOUNT_ID", None)
     os.environ.pop("CLOUDFLARE_API_TOKEN", None)
@@ -932,7 +996,9 @@ def main():
     base_environment["WRANGLER_SEND_METRICS"] = "false"
     cloudflare_environment = base_environment.copy()
     cloudflare_environment["CLOUDFLARE_ACCOUNT_ID"] = account_id
-    cloudflare_environment["CLOUDFLARE_API_TOKEN"] = cloudflare_token
+    if not wrangler_oauth:
+        cloudflare_environment["CLOUDFLARE_API_TOKEN"] = cloudflare_token
+        cloudflare_environment.pop("HOME", None)
 
     commands = {}
     for command in ("curl", "docker", "git", "node", "sleep", "wrangler"):
@@ -958,6 +1024,15 @@ def main():
     if buildx_plugin is None:
         raise DeployFailure("docker buildx plugin is unavailable in standard locations")
 
+    base_config_path = repository / "deploy/cloudflare/wrangler.jsonc"
+    oauth_preflight = None
+    if wrangler_oauth:
+        if not base_environment.get("HOME"):
+            raise DeployFailure("Wrangler OAuth requires the actual HOME")
+        oauth_preflight = validate_wrangler_oauth(
+            commands["wrangler"], base_config_path, cloudflare_environment, account_id,
+        )
+
     evidence_directory.mkdir(mode=0o700)
     operation_id = secrets.token_hex(12)
     evidence = Evidence(evidence_directory, operation_id)
@@ -982,7 +1057,8 @@ def main():
     for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signal_number, interrupt)
 
-    base_config_path = repository / "deploy/cloudflare/wrangler.jsonc"
+    if oauth_preflight is not None:
+        evidence.write("wrangler-oauth-preflight.json", oauth_preflight)
 
     def wrangler(action, *arguments, timeout=60, sensitive=False, check=True,
                  input_bytes=None, config=base_config_path):
@@ -1313,7 +1389,7 @@ def main():
             [commands["docker"], "--config", str(docker_config), "--host", docker_endpoint, "buildx", "version"],
         )
 
-        image_tag = f"sha256-{admitted['child_sha256']}-op-{operation_id}"
+        image_tag = f"milk-{admitted['child_sha256']}-op-{operation_id}"
         remote_image = f"{REGISTRY}/{account_id}/milk-carton:{image_tag}"
         evidence.write("intent.json", {
             "schema_version": "milk.private-gateway-deploy-intent.v1",
@@ -1401,6 +1477,30 @@ def main():
                 "gateway_config_sha256": previous_config_sha256,
                 "image_retained": True,
             })
+
+        if bootstrap:
+            stage = "bootstrap-secret-materialization"
+            (
+                bootstrap_secret_input,
+                rechecked_bootstrap_secrets_sha256,
+                rechecked_bootstrap_secret_names,
+                rechecked_gateway_config_raw,
+                _,
+            ) = validate_bootstrap_secrets(
+                bootstrap_secrets_path, repository, materialize=True,
+            )
+            try:
+                if (
+                    rechecked_bootstrap_secrets_sha256 != bootstrap_secrets_sha256
+                    or rechecked_bootstrap_secret_names != expected_bootstrap_secret_names
+                    or rechecked_gateway_config_raw != gateway_config_raw
+                ):
+                    raise ContractFailure("bootstrap secrets changed after validation")
+                deployment_secrets = scratch / "deploy-secrets.json"
+                write_private(deployment_secrets, bootstrap_secret_input)
+            finally:
+                clear_sensitive_bytes(bootstrap_secret_input)
+                bootstrap_secret_input = None
 
         stage = "ghcr-auth"
         try:
@@ -1502,7 +1602,9 @@ def main():
             write_private(deployment_secrets, canonical_json({
                 "MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8"),
             }))
-            deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
+        if deployment_secrets is None:
+            raise ContractFailure("deployment secrets were not materialized")
+        deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
         rechecked_head = runner.run(
             "git-predeploy-head",
             [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
@@ -1527,13 +1629,15 @@ def main():
         ):
             raise ContractFailure("source authority changed before deployment")
         deploy_started = True
-        wrangler(
-            "deploy-worker-and-container", *deploy_arguments, timeout=900,
-            sensitive=not bootstrap, config=temporary_config,
-        )
-        if deployment_secrets is not None:
-            deployment_secrets.unlink()
-            deployment_secrets = None
+        try:
+            wrangler(
+                "deploy-worker-and-container", *deploy_arguments, timeout=900,
+                sensitive=True, config=temporary_config,
+            )
+        finally:
+            if deployment_secrets is not None:
+                deployment_secrets.unlink(missing_ok=True)
+                deployment_secrets = None
 
         if bootstrap:
             stage = "bootstrap-application-discovery"
@@ -1560,12 +1664,7 @@ def main():
             if created_image != remote_image:
                 raise ContractFailure("bootstrap container does not use the admitted image")
 
-            stage = "bootstrap-secrets"
-            wrangler(
-                "bootstrap-secret-bulk", "secret", "bulk", "--name", WORKER,
-                timeout=300, sensitive=True, input_bytes=bootstrap_secret_input,
-            )
-            bootstrap_secret_input = None
+            stage = "bootstrap-secret-verification"
             installed_secrets = parse_secret_names(wrangler(
                 "bootstrap-secret-list", "secret", "list", "--name", WORKER,
                 "--format", "json", sensitive=True,
@@ -1670,6 +1769,7 @@ def main():
         failure_stage = stage
         outcome = "predeploy_failed"
         rollback_observation = None
+        clear_sensitive_bytes(bootstrap_secret_input)
         bootstrap_secret_input = None
         if deploy_started and bootstrap:
             outcome = "bootstrap_cleanup_failed"
