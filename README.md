@@ -161,7 +161,7 @@ See [`crates/milk-carton/README.md`](crates/milk-carton/README.md) for the full 
 
 The hosted proof sent 320 generated official-SDK requests through the baseline route and persisted 320 traces in isolated scope `f7f88ff0-5947-440c-a661-e4e35f1d04e0`. Milk Man then produced deterministic summary statistics, classification, an eval, and an unsigned route proposal, with one paid teacher inference. It did not train or deploy a candidate, activate a signed route, prove fallback, or verify provider teardown.
 
-Generated traffic proves mechanics only. The known scope and exact eval SHA-256 `26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499` are explicitly rejected by Carton's operator-route preparation and publication paths, so those artifacts cannot become a customer route.
+Generated traffic proves mechanics only. Carton rejects the known scope `f7f88ff0-5947-440c-a661-e4e35f1d04e0` before legacy tick or route preparation, and rejects that scope or exact eval SHA-256 `26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499` in operator-route preparation and publication. Provider dispatch must independently enforce the same denylist.
 
 The separate production-path workload leaves that proof unchanged. It checks an
 invalid key, both official SDK endpoints, then sends 100 deterministic sessions
@@ -185,7 +185,7 @@ prompts, or responses.
 The hosted release is production-qualified only after one cloud run proves the complete chain:
 
 1. An official SDK request returns normally and persists its completed trace.
-2. Real captured traffic produces at least 251 retained teacher results: 50 TRAIN, 73 DEV, and 128 CALIBRATION. Partitioning or skipped traffic can require more requests. Generated traffic does not count.
+2. Real qualification observes at least 750 independent sessions and passes the declared capture, parse, duplicate, abstention, and represented-class gates. Generated mechanics traffic does not count.
 3. One student is trained and merged, then BF16, dynamic FP8, and static FP8 branches are evaluated on the same ordered DEV set.
 4. The deterministic winner passes authenticated canary and baseline-fallback checks.
 5. A signed zero route becomes active and Baseten is observed at zero compute.

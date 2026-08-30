@@ -96,4 +96,4 @@ RUST_MIN_STACK=16777216 cargo +1.95.0 test --locked --offline --workspace
 cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 ```
 
-A hosted gateway and generated-traffic mechanics proof have been observed. This repository does not claim a production-qualified real-traffic eval, trained candidate, canary, rollback, or verified zero-GPU teardown. Source and image publication remain separate from production qualification.
+A hosted gateway and controlled production-infrastructure mechanics runs have proved a signed canary, bounded fallback, signed-zero baseline restoration, and candidate credential removal. Generated traffic does not qualify a customer tenant or real-traffic eval, and this repository does not claim a production-qualified trained candidate or verified provider teardown. Source and image publication remain separate from production qualification.

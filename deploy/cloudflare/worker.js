@@ -4,6 +4,12 @@ import { env } from "cloudflare:workers";
 const GATEWAY_INSTANCE = "gateway";
 const CANDIDATE_ADMIN_PATH = "/__milk/candidate-credential";
 const CANDIDATE_CHECK_PATH = "/healthz/candidate-credential";
+const PUBLIC_PATHS = new Set([
+  "/healthz",
+  "/v1/chat/completions",
+  "/v1/milk/outcomes",
+  "/v1/responses",
+]);
 const CANDIDATE_SHA256_HEADER =
   "x-milk-candidate-api-key-sha256";
 const CANDIDATE_STATE_HEADER =
@@ -259,12 +265,6 @@ export class MilkCarton extends Container {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === CANDIDATE_CHECK_PATH) {
-      return new Response(null, {
-        status: 404,
-        headers: { "cache-control": "no-store" },
-      });
-    }
     if (url.pathname === CANDIDATE_ADMIN_PATH && url.search === "") {
       if (request.method !== "POST") {
         return fixedResponse(405, "method_not_allowed");
@@ -318,6 +318,12 @@ export default {
           operation === "inspect" ? "inspection_failed" : "restart_failed",
         );
       }
+    }
+    if (!PUBLIC_PATHS.has(url.pathname)) {
+      return new Response(null, {
+        status: 404,
+        headers: { "cache-control": "no-store" },
+      });
     }
     return getContainer(env.MILK_CARTON, GATEWAY_INSTANCE).fetch(
       request,

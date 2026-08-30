@@ -104,24 +104,44 @@ direct = re.compile(
     r"\s*\.fetch\(\s*request,?\s*\);"
 )
 assert direct.search(worker)
-external_candidate_check_guard = re.compile(
-    r"if\s*\(url\.pathname\s*===\s*CANDIDATE_CHECK_PATH\)\s*\{"
-    r"\s*return\s+new Response\(null,\s*\{"
-    r"\s*status:\s*404,"
+public_paths_match = re.search(
+    r"const PUBLIC_PATHS = new Set\(\[(.*?)\]\);", worker, re.DOTALL
 )
-candidate_check_guard = external_candidate_check_guard.search(worker)
-assert candidate_check_guard
-assert candidate_check_guard.start() < direct.search(worker).start()
+assert public_paths_match
+public_paths = set(re.findall(r'"([^"\n]+)"', public_paths_match.group(1)))
+assert public_paths == {
+    "/healthz",
+    "/v1/chat/completions",
+    "/v1/milk/outcomes",
+    "/v1/responses",
+}
+public_path_guard = re.search(
+    r"if\s*\(!PUBLIC_PATHS\.has\(url\.pathname\)\)\s*\{"
+    r"\s*return\s+new Response\(null,\s*\{"
+    r"\s*status:\s*404,",
+    worker,
+)
+assert public_path_guard
+admin_path_guard = worker.index(
+    'if (url.pathname === CANDIDATE_ADMIN_PATH && url.search === "")'
+)
+assert admin_path_guard < public_path_guard.start()
+assert public_path_guard.start() < direct.search(worker).start()
+for encoded_candidate_path in (
+    "/%68ealthz/candidate-credential",
+    "/healthz/%63andidate-credential",
+    "/healthz/candidate-%63redential",
+    "/healthz/candidate%2dcredential",
+):
+    assert encoded_candidate_path not in public_paths
+assert "/healthz/candidate-credential" not in public_paths
+assert "/__milk/candidate-credential" not in public_paths
 assert worker.count("this.containerFetch(") == 1
 internal_candidate_check = worker.split(
     "async checkCandidateCredential", 1
 )[1].split("async inspectCandidateCredential", 1)[0]
 assert "this.containerFetch(" in internal_candidate_check
 assert "`http://container${CANDIDATE_CHECK_PATH}`" in internal_candidate_check
-public_candidate_guard = worker.split(
-    "if (url.pathname === CANDIDATE_CHECK_PATH)", 1
-)[1].split("if (url.pathname === CANDIDATE_ADMIN_PATH", 1)[0]
-assert "url.search" not in public_candidate_guard
 for buffered_or_mutated in (
     "request.arrayBuffer",
     "request.blob",

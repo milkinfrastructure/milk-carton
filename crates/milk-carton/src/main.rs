@@ -49,7 +49,7 @@ use route::{
     WINNER_ZERO_VALID_FOR_SECONDS, WinnerRouteAdvanceAction, WinnerRoutePhase,
     advance_winner_route, parse_operator_route_proposal, prepare_operator_route_manifest,
     prepare_operator_zero_route_manifest, prepare_route_manifest,
-    verify_operator_manifest_proposal_binding,
+    reject_non_production_mechanics_scope, verify_operator_manifest_proposal_binding,
 };
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -1804,6 +1804,7 @@ async fn tick_once_with_records(
     now: DateTime<Utc>,
     records: Records,
 ) -> Result<String> {
+    reject_non_production_mechanics_scope(config.scope_id)?;
     let scope = config_scope(config);
     let lease = tokio::time::timeout(
         TICK_LEASE_IO_TIMEOUT,

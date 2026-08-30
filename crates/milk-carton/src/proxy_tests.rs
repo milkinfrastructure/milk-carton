@@ -391,6 +391,32 @@ async fn keyless_tick_holds_without_reading_the_teacher_key() {
 }
 
 #[actix_web::test]
+async fn non_production_mechanics_tick_rejects_before_any_object_write() {
+    let mut config = config(1_024, 1);
+    config.scope_id = "f7f88ff0-5947-440c-a661-e4e35f1d04e0".parse().unwrap();
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let records = Records::start(
+        Arc::clone(&objects),
+        config.capture_queue_bytes,
+        config.capture_record_bytes,
+        config_scope(&config),
+        config.capture_basis_points,
+    )
+    .await
+    .unwrap();
+
+    let error = tick_once_with_records(&config, Utc::now(), records)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("mechanics scope is not route-admissible")
+    );
+    assert!(objects.list(None).next().await.is_none());
+}
+
+#[actix_web::test]
 async fn overlapping_tick_preserves_the_exact_hold_stdout_contract() {
     let mut config = config(1_024, 1);
     config.capture_mode = CaptureMode::WholeBodyAuthorized;
