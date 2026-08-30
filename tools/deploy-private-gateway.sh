@@ -39,6 +39,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 SHA1 = re.compile(r"[0-9a-f]{40}")
 ACCOUNT_ID = re.compile(r"[0-9a-f]{32}")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+UUID_V7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 TAG = re.compile(r"[a-z0-9_][a-z0-9._-]{0,127}")
 REPOSITORY = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")
@@ -68,11 +69,12 @@ if hashlib.sha256(json.dumps(
     raise RuntimeError("production proof contract SHA-256 is stale")
 OFFICIAL_OPENAI_SDK_BASELINE_FIELDS = {
     "authenticated", "baseline_request_count", "candidate_request_count",
-    "choice_count", "content_retained", "endpoint_sha256", "finish_reason",
+    "capture_intent", "choice_count", "content_retained", "endpoint_sha256", "finish_reason",
     "http_status", "max_completion_tokens", "model", "proof_contract_sha256",
     "proof_step", "request_sha256", "response_bytes", "response_sha256",
+    "route_revision", "route_target",
     "schema_version", "sdk", "sdk_request_count", "sdk_version", "succeeded",
-    "traffic_cohort_sha256", "traffic_key_sha256",
+    "traffic_cohort_sha256", "traffic_key_sha256", "trace_id",
 }
 CURRENT_DEPLOYMENT_FIELDS = {
     "schema_version", "operation_id", "worker_version_id", "application_name",
@@ -261,7 +263,7 @@ def validate_deployment_baseline_binding(current_raw, baseline_raw, expected_sha
         or baseline_raw != canonical_json(baseline)
         or SHA256.fullmatch(expected_sha256 or "") is None
         or current["schema_version"] != "milk.private-gateway-current-deployment.v2"
-        or baseline["schema_version"] != "milk.official-openai-sdk-smoke.v2"
+        or baseline["schema_version"] != "milk.official-openai-sdk-smoke.v3"
         or baseline["proof_step"] != "deployment_baseline"
         or digest(baseline_raw) != expected_sha256
         or current["official_openai_sdk_baseline_receipt_sha256"] != expected_sha256
@@ -1798,7 +1800,7 @@ def main():
         )
         if (
             sdk_result.stdout != canonical_json(sdk_smoke)
-            or sdk_smoke["schema_version"] != "milk.official-openai-sdk-smoke.v2"
+            or sdk_smoke["schema_version"] != "milk.official-openai-sdk-smoke.v3"
             or sdk_smoke["sdk"] != "openai-node"
             or sdk_smoke["sdk_version"] != "6.33.0"
             or sdk_smoke["proof_contract_sha256"] != PRODUCTION_PROOF_SHA256
@@ -1811,6 +1813,10 @@ def main():
             or sdk_smoke["authenticated"] is not True
             or sdk_smoke["succeeded"] is not True
             or sdk_smoke["content_retained"] is not False
+            or sdk_smoke["capture_intent"] != "selected"
+            or sdk_smoke["route_revision"] != "openai-baseline-v1"
+            or sdk_smoke["route_target"] != "openai"
+            or UUID_V7.fullmatch(sdk_smoke["trace_id"] or "") is None
             or sdk_smoke["http_status"] != 200
             or sdk_smoke["choice_count"] != 1
             or not isinstance(sdk_smoke["response_bytes"], int)

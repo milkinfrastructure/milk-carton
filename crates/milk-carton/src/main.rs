@@ -2178,7 +2178,10 @@ fn spawn_expiry_maintenance(records: Records, scope: Scope) {
                     outcomes_deleted = receipt.outcomes_deleted,
                     "retention maintenance advanced"
                 ),
-                Ok(None) => tracing::info!("retention maintenance checked"),
+                Ok(None) => tracing::info!(
+                    scope_id = %scope.scope_id,
+                    "retention maintenance checked"
+                ),
                 Err(error) => tracing::error!(
                     error = %error,
                     "retention maintenance failed; the next bounded pass will retry"

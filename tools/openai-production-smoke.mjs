@@ -14,6 +14,7 @@ const MAX_HEALTH_BYTES = 16_384;
 const MAX_RESPONSE_BYTES = 65_536;
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MECHANICS_EVAL_ID =
   "959caacb397004bf3e60f13613da50f4ed3160a65d18b178c3d996398e29b5a0";
@@ -319,10 +320,19 @@ export async function runBaselineSmoke(client, endpoint, credential) {
   assert.equal(data.choices.length, 1);
   assert.equal(typeof data.choices[0]?.message?.content, "string");
   assert.ok(data.choices[0].message.content.length > 0);
+  const captureIntent = response.headers.get("x-milk-capture-intent");
+  const routeRevision = response.headers.get("x-milk-route-revision");
+  const routeTarget = response.headers.get("x-milk-route-target");
+  const traceId = response.headers.get("x-milk-trace-id");
+  assert.equal(captureIntent, "selected");
+  assert.equal(routeRevision, "openai-baseline-v1");
+  assert.equal(routeTarget, "openai");
+  assert.match(traceId ?? "", UUID_V7);
   return {
     authenticated: true,
     baseline_request_count: 1,
     candidate_request_count: 0,
+    capture_intent: captureIntent,
     choice_count: data.choices.length,
     content_retained: false,
     endpoint_sha256: sha256(endpoint.href),
@@ -335,13 +345,16 @@ export async function runBaselineSmoke(client, endpoint, credential) {
     request_sha256: sha256(canonical(request)),
     response_bytes: Buffer.byteLength(responseRaw),
     response_sha256: sha256(responseRaw),
-    schema_version: "milk.official-openai-sdk-smoke.v2",
+    route_revision: routeRevision,
+    route_target: routeTarget,
+    schema_version: "milk.official-openai-sdk-smoke.v3",
     sdk: "openai-node",
     sdk_request_count: 1,
     sdk_version: SDK_VERSION,
     succeeded: true,
     traffic_cohort_sha256: sha256(credential.cohort_id),
     traffic_key_sha256: sha256(credential.api_key),
+    trace_id: traceId,
   };
 }
 

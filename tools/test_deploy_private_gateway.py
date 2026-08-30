@@ -274,6 +274,7 @@ if name == "node":
         "authenticated": True,
         "baseline_request_count": 1,
         "candidate_request_count": 0,
+        "capture_intent": "selected",
         "choice_count": 1,
         "content_retained": False,
         "endpoint_sha256": "6" * 64,
@@ -288,13 +289,16 @@ if name == "node":
         "request_sha256": "7" * 64,
         "response_bytes": 123,
         "response_sha256": "8" * 64,
-        "schema_version": "milk.official-openai-sdk-smoke.v2",
+        "route_revision": "openai-baseline-v1",
+        "route_target": "openai",
+        "schema_version": "milk.official-openai-sdk-smoke.v3",
         "sdk": "openai-node",
         "sdk_request_count": 1,
         "sdk_version": "6.33.0",
         "succeeded": True,
         "traffic_cohort_sha256": hashlib.sha256(credential["cohort_id"].encode()).hexdigest(),
         "traffic_key_sha256": hashlib.sha256(credential["api_key"].encode()).hexdigest(),
+        "trace_id": "00000000-0000-7000-8000-000000000001",
     }, sort_keys=True, separators=(",", ":")))
     done()
 

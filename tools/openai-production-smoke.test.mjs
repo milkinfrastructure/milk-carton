@@ -84,9 +84,11 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
                   headers: new Headers({
                     "x-milk-artifact-sha256": digest("2"),
                     "x-milk-candidate-sha256": digest("3"),
+                    "x-milk-capture-intent": "selected",
                     "x-milk-deployment-sha256": digest("4"),
                     "x-milk-route-revision": routeRevision,
                     "x-milk-route-target": target,
+                    "x-milk-trace-id": "00000000-0000-7000-8000-000000000001",
                   }),
                   status: 200,
                 },
@@ -132,11 +134,11 @@ assert.match(receipt.traffic_cohort_sha256, /^[0-9a-f]{64}$/);
 assert.match(receipt.routing_session_sha256, /^[0-9a-f]{64}$/);
 
 const baseline = await runBaselineSmoke(
-  client(revision, "candidate", false),
+  client("openai-baseline-v1", "openai", false),
   new URL("https://carton.example/v1"),
   { api_key: credential.api_key, cohort_id: credential.cohort_id, model: credential.model },
 );
-assert.equal(baseline.schema_version, "milk.official-openai-sdk-smoke.v2");
+assert.equal(baseline.schema_version, "milk.official-openai-sdk-smoke.v3");
 assert.equal(baseline.proof_step, "deployment_baseline");
 assert.equal(baseline.model, PRODUCTION_PROOF.model);
 assert.equal(baseline.sdk_request_count, 1);
@@ -146,6 +148,10 @@ assert.equal(baseline.max_completion_tokens, 256);
 assert.equal(baseline.proof_contract_sha256, productionProofSha256);
 assert.equal(baseline.authenticated, true);
 assert.equal(baseline.content_retained, false);
+assert.equal(baseline.capture_intent, "selected");
+assert.equal(baseline.route_revision, "openai-baseline-v1");
+assert.equal(baseline.route_target, "openai");
+assert.equal(baseline.trace_id, "00000000-0000-7000-8000-000000000001");
 assert.match(baseline.traffic_key_sha256, /^[0-9a-f]{64}$/);
 assert.match(baseline.traffic_cohort_sha256, /^[0-9a-f]{64}$/);
 await assert.rejects(
