@@ -50,15 +50,18 @@ HOSTNAME = re.compile(
 PRODUCTION_PROOF = {
     "baseline_requests": 322,
     "candidate_requests": 2,
+    "generated_concurrency": 1,
     "generated_health_timeout_ms": 30000,
+    "generated_minimum_request_interval_ms": 4250,
     "generated_mechanics_requests": 320,
-    "generated_request_timeout_ms": 30000,
+    "generated_reasoning_effort": "low",
+    "generated_request_timeout_ms": 60000,
     "max_sdk_requests": 324,
     "model": "zai-org/GLM-5.3-Flash",
     "saturation_max_completion_tokens": 3840,
-    "short_max_completion_tokens": 128,
+    "short_max_completion_tokens": 256,
 }
-PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf"
+PRODUCTION_PROOF_SHA256 = "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66"
 if hashlib.sha256(json.dumps(
     PRODUCTION_PROOF, sort_keys=True, separators=(",", ":"),
 ).encode()).hexdigest() != PRODUCTION_PROOF_SHA256:

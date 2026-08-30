@@ -21,7 +21,7 @@ assert "official-sdk-smoke" in deploy_script
 assert "automatic-rollback" in deploy_script
 assert "milk.private-gateway-current-deployment.v2" in deploy_script
 assert '"official_openai_sdk_baseline_receipt_sha256"' in deploy_script
-assert 'PRODUCTION_PROOF_SHA256 = "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf"' in deploy_script
+assert 'PRODUCTION_PROOF_SHA256 = "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66"' in deploy_script
 assert "validate_deployment_baseline_binding" in deploy_script
 assert 'deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])' in deploy_script
 assert '"MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8")' in deploy_script
@@ -35,11 +35,14 @@ assert 'model: "zai-org/GLM-5.3-Flash"' in production_smoke
 assert "max_sdk_requests: 324" in production_smoke
 assert "baseline_requests: 322" in production_smoke
 assert "candidate_requests: 2" in production_smoke
-assert "generated_request_timeout_ms: 30_000" in production_smoke
+assert "generated_concurrency: 1" in production_smoke
+assert "generated_minimum_request_interval_ms: 4_250" in production_smoke
+assert 'generated_reasoning_effort: "low"' in production_smoke
+assert "generated_request_timeout_ms: 60_000" in production_smoke
 assert "timeout: PRODUCTION_PROOF.generated_request_timeout_ms" in production_smoke
 assert "AbortSignal.timeout(PRODUCTION_PROOF.generated_health_timeout_ms)" in production_smoke
 assert 'headers: { "x-milk-session-id": planned.sessionId }' in production_smoke
-assert "short_max_completion_tokens: 128" in production_smoke
+assert "short_max_completion_tokens: 256" in production_smoke
 assert "saturation_max_completion_tokens: 3_840" in production_smoke
 assert "proof_contract_sha256" in production_smoke
 assert "99.5% monthly" in operator_notes

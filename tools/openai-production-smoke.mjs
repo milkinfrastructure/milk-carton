@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 
 import OpenAI from "openai";
@@ -23,20 +24,22 @@ const MECHANICS_PHASES = [
   { train: 50, dev: 73, calibration: 128 },
   { train: 13, dev: 18, calibration: 38 },
 ];
-const MECHANICS_CONCURRENCY = 4;
 const MECHANICS_MAX_CANDIDATES = 10_000;
 const MECHANICS_ROUTE_REVISION = "openai-baseline-v1";
 const SATURATION_LINE_COUNT = 4_096;
 export const PRODUCTION_PROOF = Object.freeze({
   baseline_requests: 322,
   candidate_requests: 2,
+  generated_concurrency: 1,
   generated_health_timeout_ms: 30_000,
+  generated_minimum_request_interval_ms: 4_250,
   generated_mechanics_requests: 320,
-  generated_request_timeout_ms: 30_000,
+  generated_reasoning_effort: "low",
+  generated_request_timeout_ms: 60_000,
   max_sdk_requests: 324,
   model: "zai-org/GLM-5.3-Flash",
   saturation_max_completion_tokens: 3_840,
-  short_max_completion_tokens: 128,
+  short_max_completion_tokens: 256,
 });
 
 function assertProofModel(model) {
@@ -91,6 +94,7 @@ export function generatedMechanicsPlan(model) {
       const request = {
         model,
         max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
+        reasoning_effort: PRODUCTION_PROOF.generated_reasoning_effort,
         messages: [
           {
             role: "user",
@@ -393,8 +397,13 @@ export async function runGeneratedMechanics(
   credential,
   expectedConfigSha256,
   transport = globalThis.fetch,
+  minimumRequestIntervalMs = PRODUCTION_PROOF.generated_minimum_request_interval_ms,
 ) {
   assert.match(expectedConfigSha256, SHA256);
+  assert.ok(
+    Number.isSafeInteger(minimumRequestIntervalMs) &&
+      minimumRequestIntervalMs >= 0,
+  );
   assertProofModel(credential.model);
   const toolSha256 = sha256(await readFile(new URL(import.meta.url)));
   const preflightHealth = await generatedMechanicsHealth(
@@ -406,6 +415,14 @@ export async function runGeneratedMechanics(
   const plan = generatedMechanicsPlan(credential.model);
   const expected = new Map(plan.map((row) => [row.requestSha256, row]));
   const transported = new Set();
+  let nextTransportAt = performance.now();
+  async function waitForLaunchSlot() {
+    let delay = nextTransportAt - performance.now();
+    while (delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = nextTransportAt - performance.now();
+    }
+  }
   const client = new OpenAI({
     apiKey: credential.api_key,
     baseURL: endpoint.href,
@@ -421,6 +438,7 @@ export async function runGeneratedMechanics(
       assert.equal(partition, planned.partition);
       assert.equal(outgoing.headers.get("x-milk-session-id"), planned.sessionId);
       assert.equal(transported.has(requestSha256), false);
+      nextTransportAt = performance.now() + minimumRequestIntervalMs;
       const response = await transport(outgoing);
       transported.add(requestSha256);
       return response;
@@ -436,6 +454,7 @@ export async function runGeneratedMechanics(
       const planned = plan[index];
       let httpStatus = null;
       try {
+        await waitForLaunchSlot();
         const { data, response } = await client.chat.completions
           .create(planned.request, {
             headers: { "x-milk-session-id": planned.sessionId },
@@ -475,7 +494,9 @@ export async function runGeneratedMechanics(
       }
     }
   }
-  await Promise.all(Array.from({ length: MECHANICS_CONCURRENCY }, worker));
+  await Promise.all(
+    Array.from({ length: PRODUCTION_PROOF.generated_concurrency }, worker),
+  );
   const successful = observations.filter((value) => value.responseSha256);
   const traceIds = successful.map((value) => value.traceId);
   const statusCounts = {};
@@ -517,8 +538,10 @@ export async function runGeneratedMechanics(
     proof_contract_sha256: PRODUCTION_PROOF_SHA256,
     proof_step: "generated_mechanics",
     request_timeout_ms: PRODUCTION_PROOF.generated_request_timeout_ms,
+    minimum_request_interval_ms: minimumRequestIntervalMs,
+    reasoning_effort: PRODUCTION_PROOF.generated_reasoning_effort,
     traffic_cohort_sha256: sha256(credential.cohort_id),
-    concurrency: MECHANICS_CONCURRENCY,
+    concurrency: PRODUCTION_PROOF.generated_concurrency,
     candidates_scanned: plan.at(-1).nonce + 1,
     planned: plan.length,
     attempted: observations.length,
