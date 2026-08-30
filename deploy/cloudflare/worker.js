@@ -259,6 +259,12 @@ export class MilkCarton extends Container {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === CANDIDATE_CHECK_PATH) {
+      return new Response(null, {
+        status: 404,
+        headers: { "cache-control": "no-store" },
+      });
+    }
     if (url.pathname === CANDIDATE_ADMIN_PATH && url.search === "") {
       if (request.method !== "POST") {
         return fixedResponse(405, "method_not_allowed");

@@ -315,8 +315,8 @@ impl StoreAccessPlan {
             },
             Command::Status => Self {
                 capture: Some(ReadOnly),
-                control: Some(ReadOnly),
                 routes: Some(ReadOnly),
+                ..Self::default()
             },
             Command::GenerationStatus => Self {
                 capture: Some(ReadOnly),
@@ -825,7 +825,7 @@ struct WinnerRouteAdvanceWrite {
 #[derive(Serialize)]
 struct StatusWrite {
     schema_version: &'static str,
-    records: records::RecordsStatusWrite,
+    records: records::DataPlaneStatusWrite,
     route: RouteStatusWrite,
 }
 
@@ -1858,14 +1858,12 @@ async fn status_once(config: &FileConfig, now: DateTime<Utc>) -> Result<String> 
         false,
     )
     .await?;
-    let provider_binding = snapshot_provider_binding(config)?;
-    let max_decisions = teacher_config(config)?.max_decisions;
     let record_status = records
-        .status(&config_scope(config), &provider_binding, max_decisions, now)
+        .data_plane_status(&config_scope(config), now)
         .await?;
     let route = route_status(config, &records, now).await?;
     Ok(serde_json::to_string(&StatusWrite {
-        schema_version: "milk.status.v2",
+        schema_version: "milk.status.v3",
         records: record_status,
         route,
     })?)
@@ -2283,8 +2281,8 @@ fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -
                 config.baseline.allow_loopback_http,
             )?;
         }
+        Command::Status => {}
         Command::Tick { .. }
-        | Command::Status
         | Command::GenerationStatus
         | Command::BeginTeacherRun { .. }
         | Command::ExecuteTeacherRun { .. }
@@ -4803,7 +4801,7 @@ mod cli_tests {
             StoreAccessPlan::for_command(&Command::Status),
             StoreAccessPlan {
                 capture: Some(ReadOnly),
-                control: Some(ReadOnly),
+                control: None,
                 routes: Some(ReadOnly),
             }
         );

@@ -6,7 +6,7 @@ This is the OpenAI-compatible Chat Completions and Responses data plane and obje
 
 - `serve`: proxy exact request/response bytes and asynchronously persist selected completed interactions. It has capture read-write and routes read-only access, never control access.
 - `tick --once`: derive at most one safe control-plane action and create or reconcile immutable claims, results, frontiers, and GPU launch outbox records. It has capture/control read-write access, never route access or provider credentials.
-- `status`: return bounded content-free state with all three stores read-only. It cannot mutate provider or route state.
+- `status`: return bounded content-free capture, expiry, and route state with capture/routes read-only. It requires neither teacher configuration nor control-store credentials.
 
 The config has exactly three logical store roles: `stores.capture`, `stores.control`, and `stores.routes`. Each is either an owner-only local directory or a strict `{"type":"s3","endpoint":"https://...","region":"...","bucket":"..."}` binding, and all three may name the same physical bucket. The `MILK_CAPTURE_STORE_*`, `MILK_CONTROL_STORE_*`, and `MILK_ROUTE_STORE_*` credentials remain explicit, and each command opens only its declared roles. S3 endpoints must be HTTPS origins. Read-write startup qualifies create-if-absent, ETag compare-and-swap, immediate read, ordered prefix listing, and deletion; read-only startup qualifies listing. Cloudflare R2 is one supported deployment, not a distinct storage type.
 
@@ -96,4 +96,4 @@ RUST_MIN_STACK=16777216 cargo +1.95.0 test --locked --offline --workspace
 cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
 ```
 
-No hosted deployment, paid GPU proof, canary, rollback, or verified zero-GPU teardown is claimed by this repository yet. Source and image publication are separate from production qualification.
+A hosted gateway and generated-traffic mechanics proof have been observed. This repository does not claim a production-qualified real-traffic eval, trained candidate, canary, rollback, or verified zero-GPU teardown. Source and image publication remain separate from production qualification.

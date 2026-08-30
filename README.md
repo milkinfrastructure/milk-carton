@@ -25,13 +25,13 @@ During the single-tenant pilot, Milk issues, rotates, and revokes `milk_live_...
 
 The gateway records only completed traffic admitted by the operator's capture policy. It loads one strict startup configuration, reports its SHA-256, and polls signed, revisioned route state while retaining the last verified route after a failed refresh.
 
-Milk Carton is MIT-licensed. The hosted cloud proof has not run, so there is no production-qualified hosted release or live customer endpoint yet.
+Milk Carton is MIT-licensed. The hosted endpoint at `https://carton.milkinfrastructure.com/v1` and a generated-traffic mechanics proof have run. Neither is a production-qualified customer release.
 
 ## Product boundary
 
 - `serve`: authenticates, proxies, captures admitted completed requests, and follows verified route state.
-- `tick --once`: converts captured traffic and eval configuration into at most one safe control-plane action.
-- `status`: reports bounded counts without returning prompts, responses, or credentials.
+- `tick --once`: retains the legacy Carton control loop while its fixed jobs move to Milk Man.
+- `status`: reports bounded capture, expiry, and route state without teacher configuration or control-store access.
 - Immutable claims, results, launch records, and signed route state in object storage.
 
 The maintained products are this Carton and [`milk-man`](https://github.com/milkinfrastructure/milk-man). Object storage is their durable memory, not a third service. Milk Man invokes fixed one-shot jobs; it cannot publish routes or choose credentials, provider settings, or spend. Carton receives only the scoped key needed to call an admitted winner, while provider management credentials remain outside the data plane.
@@ -55,7 +55,7 @@ Secrets stay in environment variables:
 | --- | --- |
 | `serve` | upstream API key, capture read/write, routes read-only |
 | `tick --once` | capture read/write, control read/write |
-| `status` | capture, control, and routes read-only |
+| `status` | capture and routes read-only |
 
 All three store configs may name the same S3-compatible bucket. The `MILK_CAPTURE_STORE_*`, `MILK_CONTROL_STORE_*`, and `MILK_ROUTE_STORE_*` bindings remain explicit, and each command opens only the logical roles in the table above. Each remote role uses the same strict config form:
 
@@ -151,45 +151,17 @@ The bootstrap secret document includes `MILK_CAPTURE_SAMPLING_KEY_HEX` as 64 low
 
 [`milk-man`](https://github.com/milkinfrastructure/milk-man) invokes the fixed reconciliation job that continues from captured traffic through summary statistics, readiness, eval generation, and an unsigned route proposal. Route signing and publication remain explicit operator actions outside the agent.
 
-The release contract keeps the gateway image CPU-only, with no shell, package manager, Python, Node, GPU runtime, model weights, or local GPU dependency.
+The release contract keeps the gateway image CPU-only, with no shell, package manager, Python, Node, GPU runtime, model weights, or local GPU dependency. The verifier rejects a runnable image whose compressed layers total more than 20 MiB.
 
 Release evidence is digest-addressed and content-free. Prompts, model outputs, API keys, and raw build logs are not release artifacts.
 
 See [`crates/milk-carton/README.md`](crates/milk-carton/README.md) for the full command and authority contract.
 
-### Cloud-mechanics proof
+### Generated-traffic mechanics evidence
 
-The first end-to-end cloud check uses generated SDK traffic and a dedicated eval configured with `capture_basis_points=10000`, `max_decisions=320`, `max_calls=20`, `max_gpu_seconds=3600`, and `max_parallel_runs=1`. It runs on cloud `linux/amd64` capacity; no local GPU participates. The Baseten-only 20-call job must pass the exact admitted teacher profile before any later paid create is authorized. Its separately confirmed all-in envelope is `$175`: `$160` of GPU reservations plus `$15` for the external services used by the proof. The provider ledger's `$1,000` ceiling and `$850` launch cutoff remain additional GPU controls.
+The hosted proof sent 320 generated official-SDK requests through the baseline route and persisted 320 traces in isolated scope `f7f88ff0-5947-440c-a661-e4e35f1d04e0`. Milk Man then produced deterministic summary statistics, classification, an eval, and an unsigned route proposal, with one paid teacher inference. It did not train or deploy a candidate, activate a signed route, prove fallback, or verify provider teardown.
 
-This check proves the deployment, capture, Baseten execution, training, short canary, baseline route fallback, signed-zero, teardown, and zero-compute mechanics. Because its traffic is generated, it cannot production-qualify the release or admit the resulting candidate for real application traffic.
-
-Run the pinned official-SDK driver with an owner-only credential for the dedicated capture-enabled mechanics key:
-
-```sh
-node tools/openai-production-smoke.mjs \
-  "$MILK_CARTON_API_BASE_URL" \
-  /absolute/path/to/mechanics-credential.json \
-  <expected-gateway-config-sha256> \
-  --generated-mechanics
-```
-
-The fixed proof model is `zai-org/GLM-5.3-Flash`. The contract SHA-256 is `d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66`.
-
-| Step | SDK calls | Baseline | Candidate | Completion-token cap |
-| --- | ---: | ---: | ---: | ---: |
-| Deployment baseline | 1 | 1 | 0 | 256 |
-| Generated mechanics | 320 | 320 | 0 | 256 |
-| Candidate | 1 | 0 | 1 | 256 |
-| Saturation fallback | 2 | 1 | 1 | 3,840 |
-| **Total** | **324** | **322** | **2** |  |
-
-Every v2 receipt carries that contract hash plus its exact step, model, request count, route split, and token cap. The stateless SDK driver enforces each invocation. Milk Man's fixed job owns the durable one-use mechanics intent and content-free receipt, so an ambiguous run is not replayed.
-
-The verified deployment's `current.json` is v2 and binds the canonical deployment-baseline receipt SHA-256 and the fixed proof-contract SHA-256. Deployment finalization re-reads both records before sealing the evidence manifest.
-
-The generated mechanics driver contributes exactly 320 of those baseline requests with one request in flight, a 4.25-second minimum launch interval, a 60-second timeout per request, and no SDK retries. That interval stays below Baseten's 15-request-per-minute Basic-account rate limit. It uses GLM's supported `low` reasoning effort so the bounded response reaches final content. Its preflight and postflight health checks have 30-second timeouts. It verifies the deployed config digest and capture health before and after the run, plus the exact SDK body bytes, assigned partition, and baseline route revision for every request. Its canonical receipt retains only aggregate hashes, counts, timing, and success state; durable R2 readback remains a separate required gate.
-
-After this mechanics proof reaches the production gate, hosted GLM is the next explicit typed teacher profile. It uses the same eval, capture, and route contracts; it does not add a generic provider layer.
+Generated traffic proves mechanics only. The known scope and exact eval SHA-256 `26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499` are explicitly rejected by Carton's operator-route preparation and publication paths, so those artifacts cannot become a customer route.
 
 ## Production qualification
 

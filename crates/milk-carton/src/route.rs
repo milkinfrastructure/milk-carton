@@ -49,6 +49,9 @@ const _: () = assert!(
 );
 const MAX_ROUTE_VALIDITY_HOURS: i64 = 24;
 const MAX_PUBLICATION_START_DELAY_MINUTES: i64 = 5;
+const NON_PRODUCTION_MECHANICS_SCOPE_ID: u128 = 0xf7f88ff0_5947_440c_a661_e4e35f1d04e0;
+const NON_PRODUCTION_MECHANICS_EVAL_SHA256: &str =
+    "26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -755,6 +758,7 @@ pub(crate) fn prepare_operator_route_manifest(
         bail!("candidate_basis_points cannot exceed 10000");
     }
     decode_lowercase_hex_32(&proposal.eval_sha256, "route proposal eval SHA-256")?;
+    reject_non_production_mechanics_route(proposal.scope_id, Some(&proposal.eval_sha256))?;
     if !valid_bounded_ascii(&proposal.candidate_id, MAX_EXECUTION_ID_BYTES)
         || !valid_model_alias(&proposal.model)
     {
@@ -1739,6 +1743,13 @@ fn validate_operator_manifest(
     if &manifest.scope != expected_scope {
         bail!("operator route manifest scope does not match startup configuration");
     }
+    reject_non_production_mechanics_route(
+        manifest.scope.scope_id,
+        manifest
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.eval_sha256.as_str()),
+    )?;
     if config.signing_key_id.is_empty()
         || config.signing_key_id.len() > MAX_KEY_ID_BYTES
         || manifest.signing_key_id != config.signing_key_id
@@ -1773,6 +1784,16 @@ fn validate_operator_manifest(
         (Some(_), 0) => bail!("zero-basis-point route must not contain a candidate"),
         (Some(_), _) => bail!("candidate_basis_points cannot exceed 10000"),
     }
+}
+
+fn reject_non_production_mechanics_route(scope_id: Uuid, eval_sha256: Option<&str>) -> Result<()> {
+    if scope_id.as_u128() == NON_PRODUCTION_MECHANICS_SCOPE_ID {
+        bail!("non-production mechanics scope is not route-admissible");
+    }
+    if eval_sha256.is_some_and(|value| value == NON_PRODUCTION_MECHANICS_EVAL_SHA256) {
+        bail!("non-production mechanics eval is not route-admissible");
+    }
+    Ok(())
 }
 
 fn validate_operator_candidate(
@@ -2517,6 +2538,104 @@ mod tests {
                 Instant::now(),
             ),
             BaselineReason::PolicyZero,
+        );
+    }
+
+    #[test]
+    fn non_production_mechanics_identities_cannot_prepare_or_publish_operator_routes() {
+        let fixture = Fixture::active(10_000, r#"["stream"]"#);
+        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
+        let mechanics_scope = RouteScope {
+            scope_id: "f7f88ff0-5947-440c-a661-e4e35f1d04e0".parse().unwrap(),
+        };
+        let proposal = |scope: &RouteScope, eval_sha256: &str| {
+            format!(
+                concat!(
+                    "{{\"api_base_url\":\"https://candidate.example/v1/\",",
+                    "\"candidate_basis_points\":100,",
+                    "\"candidate_id\":\"candidate-2026-08-29\",",
+                    "\"eval_sha256\":\"{}\",",
+                    "\"model\":\"customer-model\",",
+                    "\"schema_version\":\"milk.unsigned-route-proposal.v1\",",
+                    "\"scope_id\":\"{}\"}}\n"
+                ),
+                eval_sha256, scope.scope_id,
+            )
+            .into_bytes()
+        };
+
+        let blocked_scope = prepare_operator_route_manifest(
+            &fixture.config,
+            &mechanics_scope,
+            &proposal(&mechanics_scope, &repeated_digest(0xa3)),
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            blocked_scope
+                .to_string()
+                .contains("mechanics scope is not route-admissible")
+        );
+
+        let blocked_eval = prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal(&fixture.scope, NON_PRODUCTION_MECHANICS_EVAL_SHA256),
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            blocked_eval
+                .to_string()
+                .contains("mechanics eval is not route-admissible")
+        );
+
+        let mut unrelated_eval = NON_PRODUCTION_MECHANICS_EVAL_SHA256.to_owned();
+        unrelated_eval.replace_range(63..64, "8");
+        prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal(&fixture.scope, &unrelated_eval),
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            None,
+            now,
+        )
+        .unwrap();
+
+        let (manifest_bytes, _) = prepare_operator_route_manifest(
+            &fixture.config,
+            &fixture.scope,
+            &proposal(&fixture.scope, &repeated_digest(0xa4)),
+            Some(&fixture.secret_hex),
+            Some(CANDIDATE_API_KEY),
+            None,
+            now,
+        )
+        .unwrap();
+        let mut manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        manifest.candidate.as_mut().unwrap().eval_sha256 =
+            NON_PRODUCTION_MECHANICS_EVAL_SHA256.to_owned();
+        let blocked_manifest = serde_json::to_vec(&manifest).unwrap();
+        let signature = signing_key().sign(&blocked_manifest);
+        let error = RoutePublication::parse_for_publication(
+            &fixture.config,
+            &fixture.scope,
+            &blocked_manifest,
+            Some(signature.as_ref()),
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mechanics eval is not route-admissible")
         );
     }
 
