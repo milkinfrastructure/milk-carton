@@ -163,6 +163,20 @@ The hosted proof sent 320 generated official-SDK requests through the baseline r
 
 Generated traffic proves mechanics only. The known scope and exact eval SHA-256 `26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499` are explicitly rejected by Carton's operator-route preparation and publication paths, so those artifacts cannot become a customer route.
 
+The separate production-path workload leaves that proof unchanged. It checks an
+invalid key, both official SDK endpoints, then sends 100 deterministic sessions
+at the gateway's concurrency limit of four with no pacing delay. Pass the fresh
+mechanics tenant only through an owner-only gateway credential file:
+
+```sh
+node tools/openai-production-path-workload.mjs \
+  https://your-domain.example/v1 \
+  /absolute/fresh-mechanics-gateway-credential.json
+```
+
+Its canonical receipt contains only counts, SHA-256 digests, trace IDs, and
+status. It never contains the tenant scope, API key, prompts, or responses.
+
 ## Production qualification
 
 The hosted release is production-qualified only after one cloud run proves the complete chain:
