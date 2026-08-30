@@ -33,9 +33,9 @@ use super::{
     candidate_health_failure, capture_sample_selected, config_scope, configured_traffic_keys,
     decode_lowercase_sha256, generation_status_once, is_json_content_type,
     parse_openai_compatible_api_base_url, parse_openai_compatible_endpoint,
-    records_sampling_key_version, sampling_identity, start_records, start_records_with_timeout,
-    status_once, tick_once_with_records, validate_config_for_command, validate_config_identity,
-    validate_teacher_config,
+    records_sampling_key_version, run_expiry_maintenance_once, sampling_identity, start_records,
+    start_records_with_timeout, status_once, tick_once_with_records, validate_config_for_command,
+    validate_config_identity, validate_teacher_config,
 };
 use crate::records::{
     CAPTURE_SAMPLER_ID, Records, RouteBlockReason, RouteObservation, SamplingIndependence,
@@ -458,7 +458,7 @@ async fn overlapping_tick_preserves_the_exact_hold_stdout_contract() {
 }
 
 #[actix_web::test]
-async fn due_expiry_returns_before_teacher_readiness() {
+async fn serve_retention_expires_due_capture_without_teacher_or_control_write() {
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!(
@@ -480,7 +480,7 @@ async fn due_expiry_returns_before_teacher_readiness() {
     let response = br#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#.to_vec();
     let records = start_records(
         &config,
-        StoreAccessPlan::for_command(&super::Command::Tick { once: true }),
+        StoreAccessPlan::for_command(&super::Command::Serve),
     )
     .await
     .unwrap();
@@ -532,16 +532,18 @@ async fn due_expiry_returns_before_teacher_readiness() {
     records.flush().await.unwrap();
     drop(records);
 
-    let records = start_records_with_timeout(
-        &config,
-        StoreAccessPlan::for_command(&Command::Tick { once: true }),
-        true,
-    )
-    .await
-    .unwrap();
-    let output = tick_once_with_records(&config, now, records).await.unwrap();
-    assert!(output.starts_with(r#"{"schema_version":"milk.expiry-receipt.v1""#));
-    assert!(!output.contains("teacher-required"));
+    let records =
+        start_records_with_timeout(&config, StoreAccessPlan::for_command(&Command::Serve), true)
+            .await
+            .unwrap();
+    let receipt = run_expiry_maintenance_once(&records, &config_scope(&config), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.schema_version, "milk.expiry-receipt.v1");
+    assert_eq!(receipt.scanned, 1);
+    assert_eq!(receipt.tombstoned, 1);
+    assert_eq!(receipt.deferred, 1);
     fs::remove_dir_all(root).unwrap();
 }
 

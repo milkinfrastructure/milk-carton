@@ -29,7 +29,7 @@ Milk Carton is MIT-licensed. The hosted endpoint at `https://carton.milkinfrastr
 
 ## Product boundary
 
-- `serve`: authenticates, proxies, captures admitted completed requests, and follows verified route state.
+- `serve`: authenticates, proxies, captures admitted completed requests, follows verified route state, and advances bounded trace/outcome retention without teacher or control-store access.
 - `tick --once`: retains the legacy Carton control loop while its fixed jobs move to Milk Man.
 - `status`: reports bounded capture, expiry, and route state without teacher configuration or control-store access.
 - Immutable claims, results, launch records, and signed route state in object storage.
@@ -53,7 +53,7 @@ Secrets stay in environment variables:
 
 | Process | Required access |
 | --- | --- |
-| `serve` | upstream API key, capture read/write, routes read-only |
+| `serve` | upstream API key, capture read/write, routes read-only; retention runs immediately and then hourly while an instance is active |
 | `tick --once` | capture read/write, control read/write |
 | `status` | capture and routes read-only |
 

@@ -31,16 +31,17 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use records::{
-    CAPTURE_SAMPLER_ID, CaptureState, EnqueueResult, MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
-    MAX_STUDENT_ARTIFACT_BYTES, MAX_STUDENT_ARTIFACT_FILES, MAX_STUDENT_RESULT_BYTES,
-    MAX_STUDENT_UPLOAD_BYTES, MAX_WINNER_DEPLOYMENT_RESULT_BYTES, OutcomeDisposition, OutcomeKind,
-    OutcomeSubmission, OutcomeValue, PartitionedObjectStore, ProviderTeardownResult, Records,
-    RouteFallbackReason, RouteObservation, SamplingIndependence, SamplingUnitKind, Scope,
-    SnapshotAnalysisAuthorization, SnapshotAnalyzerConfig, SnapshotAnalyzerExecution,
-    SnapshotAnalyzerReasoningEffort, StoreAccess, StorePartition, StudentArtifactInput,
-    StudentArtifactSource, StudentBranchMaterialization, StudentBranchResult, StudentTrainResult,
-    StudentUpload, StudentVariant, StudentWinnerDeploymentResult, TICK_LEASE_TTL_SECONDS,
-    TeacherGpuTickWrite, TraceCapture, TraceCatalog, current_effective_uid, is_not_found,
+    CAPTURE_SAMPLER_ID, CaptureState, EnqueueResult, ExpiryWrite,
+    MAX_PROVIDER_TEARDOWN_RESULT_BYTES, MAX_STUDENT_ARTIFACT_BYTES, MAX_STUDENT_ARTIFACT_FILES,
+    MAX_STUDENT_RESULT_BYTES, MAX_STUDENT_UPLOAD_BYTES, MAX_WINNER_DEPLOYMENT_RESULT_BYTES,
+    OutcomeDisposition, OutcomeKind, OutcomeSubmission, OutcomeValue, PartitionedObjectStore,
+    ProviderTeardownResult, Records, RouteFallbackReason, RouteObservation, SamplingIndependence,
+    SamplingUnitKind, Scope, SnapshotAnalysisAuthorization, SnapshotAnalyzerConfig,
+    SnapshotAnalyzerExecution, SnapshotAnalyzerReasoningEffort, StoreAccess, StorePartition,
+    StudentArtifactInput, StudentArtifactSource, StudentBranchMaterialization, StudentBranchResult,
+    StudentTrainResult, StudentUpload, StudentVariant, StudentWinnerDeploymentResult,
+    TICK_LEASE_TTL_SECONDS, TeacherGpuTickWrite, TraceCapture, TraceCatalog, current_effective_uid,
+    is_not_found,
 };
 use route::{
     CandidateReasoningEffort, CandidateRoute, ED25519_SIGNATURE_BYTES, MAX_ROUTE_MANIFEST_BYTES,
@@ -85,6 +86,8 @@ const TICK_MUTATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const _: () = assert!(
     TICK_MUTATION_TIMEOUT.as_secs() + 2 * TICK_LEASE_IO_TIMEOUT.as_secs() < TICK_LEASE_TTL_SECONDS
 );
+const EXPIRY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const EXPIRY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ROUTE_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
@@ -1161,6 +1164,9 @@ async fn main() -> Result<()> {
                 records.clone(),
                 candidate_api_key.as_deref(),
             )?;
+            if let Some(records) = &records {
+                spawn_expiry_maintenance(records.clone(), config_scope(&config));
+            }
             if config.route.is_some()
                 && let Some(records) = &records
             {
@@ -2154,6 +2160,42 @@ fn spawn_live_route_poller(
             }
         }
     });
+}
+
+fn spawn_expiry_maintenance(records: Records, scope: Scope) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(EXPIRY_MAINTENANCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match run_expiry_maintenance_once(&records, &scope, Utc::now()).await {
+                Ok(Some(receipt)) => tracing::info!(
+                    scanned = receipt.scanned,
+                    tombstoned = receipt.tombstoned,
+                    deferred = receipt.deferred,
+                    missing = receipt.missing,
+                    traces_deleted = receipt.traces_deleted,
+                    outcomes_deleted = receipt.outcomes_deleted,
+                    "retention maintenance advanced"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "retention maintenance failed; the next bounded pass will retry"
+                ),
+            }
+        }
+    });
+}
+
+async fn run_expiry_maintenance_once(
+    records: &Records,
+    scope: &Scope,
+    now: DateTime<Utc>,
+) -> Result<Option<ExpiryWrite>> {
+    tokio::time::timeout(EXPIRY_MAINTENANCE_TIMEOUT, records.expire_due(scope, now))
+        .await
+        .context("retention maintenance exceeded its bounded deadline")?
 }
 
 async fn start_records(config: &FileConfig, access: StoreAccessPlan) -> Result<Records> {
