@@ -251,7 +251,7 @@ if name == "git":
 if name == "node":
     if state["mode"] in {
         "sdk_fail", "resource_restore_fail", "rollback_source_dirty",
-        "bootstrap_sdk_fail",
+        "rollback_input_tamper", "bootstrap_sdk_fail",
         "bootstrap_cleanup_fail",
     }:
         done(70)
@@ -429,7 +429,7 @@ if name == "wrangler":
         if "--secrets-file" not in values:
             done(2)
         secrets_path = Path(values[values.index("--secrets-file") + 1])
-        if secrets_path.stat().st_mode & 0o777 != 0o600:
+        if secrets_path.stat().st_mode & 0o777 not in {0o400, 0o600}:
             done(2)
         supplied = json.loads(secrets_path.read_text())
         state["deployment_secrets_path"] = str(secrets_path)
@@ -468,6 +468,11 @@ if name == "wrangler":
         state["active_image"] = state["target_image"]
         state["active_config_sha256"] = supplied_config_sha256
         state["application_version"] += 1
+        if state["mode"] == "rollback_input_tamper" and not restoring:
+            rollback_secrets = config_path.parent / "rollback-secrets.json"
+            rollback_secrets.chmod(0o600)
+            rollback_secrets.write_text("{}\n")
+            rollback_secrets.chmod(0o400)
         if state["mode"] == "config_mismatch" and not restoring:
             state["active_config_sha256"] = "0" * 64
         target_failed = (
@@ -1023,7 +1028,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         )
         rollback = json.loads((fixture.evidence / "rollback.json").read_text())
         self.assertEqual(rollback["schema_version"], "milk.private-gateway-rollback.v2")
-        self.assertIs(rollback["source_authority_rechecked"], True)
+        self.assertIs(rollback["rollback_inputs_verified"], True)
         self.assertIs(rollback["resource_restore_command_succeeded"], True)
         self.assertIs(rollback["resource_restore_accepted"], True)
         self.assertIs(rollback["worker_rollback_command_succeeded"], True)
@@ -1079,7 +1084,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         result = fixture.run()
         self.assertNotEqual(result.returncode, 0)
         rollback = json.loads((fixture.evidence / "rollback.json").read_text())
-        self.assertIs(rollback["source_authority_rechecked"], True)
+        self.assertIs(rollback["rollback_inputs_verified"], True)
         self.assertIs(rollback["resource_restore_command_succeeded"], False)
         self.assertIs(rollback["resource_restore_accepted"], False)
         self.assertIs(rollback["worker_rollback_command_succeeded"], False)
@@ -1092,19 +1097,44 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         )
         self.assertEqual(fixture.terminal()["outcome"], "rollback_failed")
 
-    def test_source_authority_is_rechecked_before_resource_restore(self):
-        fixture = Fixture("rollback_source_dirty")
+    def test_staged_rollback_input_tamper_fails_closed_without_git(self):
+        fixture = Fixture("rollback_input_tamper")
         self.addCleanup(fixture.close)
         result = fixture.run()
         self.assertNotEqual(result.returncode, 0)
         rollback = json.loads((fixture.evidence / "rollback.json").read_text())
-        self.assertIs(rollback["source_authority_rechecked"], False)
+        self.assertIs(rollback["rollback_inputs_verified"], False)
         self.assertIs(rollback["resource_restore_command_succeeded"], False)
         self.assertIs(rollback["resource_restore_accepted"], False)
         self.assertIs(rollback["worker_rollback_command_succeeded"], False)
         self.assertIs(rollback["accepted"], False)
         self.assertEqual(len(fixture.state["deployments"]), 1)
         self.assertEqual(fixture.terminal()["outcome"], "rollback_failed")
+
+    def test_postmutation_repo_drift_does_not_block_staged_rollback(self):
+        fixture = Fixture("rollback_source_dirty")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        rollback = json.loads((fixture.evidence / "rollback.json").read_text())
+        self.assertIs(rollback["rollback_inputs_verified"], True)
+        self.assertIs(rollback["resource_restore_command_succeeded"], True)
+        self.assertIs(rollback["resource_restore_accepted"], True)
+        self.assertIs(rollback["worker_rollback_command_succeeded"], True)
+        self.assertIs(rollback["accepted"], True)
+        commands = fixture.state["commands"]
+        deploy_index = next(
+            index for index, item in enumerate(commands)
+            if item["command"] == "wrangler" and "deploy" in item["arguments"]
+        )
+        self.assertFalse(any(
+            item["command"] == "git" for item in commands[deploy_index + 1:]
+        ))
+        self.assertEqual(len(fixture.state["deployments"]), 2)
+        self.assertEqual(
+            fixture.terminal()["outcome"],
+            "deployment_failed_rolled_back",
+        )
 
     def test_existing_target_tag_fails_before_registry_or_deploy_mutation(self):
         fixture = Fixture("collision")

@@ -22,6 +22,8 @@ assert "automatic-rollback" in deploy_script
 assert "--previous-gateway-config-file" in deploy_script
 assert "restore-previous-image-and-config" in deploy_script
 assert '"resource_restore_accepted"' in deploy_script
+assert '"rollback_inputs_verified"' in deploy_script
+assert 'source_authority_unchanged("rollback")' not in deploy_script
 assert "milk.private-gateway-rollback.v2" in deploy_script
 assert "milk.private-gateway-current-deployment.v2" in deploy_script
 assert '"official_openai_sdk_baseline_receipt_sha256"' in deploy_script

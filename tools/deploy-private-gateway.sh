@@ -1056,6 +1056,11 @@ def main():
     previous_worker = None
     temporary_config = None
     deployment_secrets = None
+    rollback_config = None
+    rollback_config_sha256 = None
+    rollback_secrets = None
+    rollback_secrets_sha256 = None
+    worker_source_sha256 = None
     scratch = Path(tempfile.mkdtemp(prefix="milk-carton-deploy."))
     docker_config = scratch / "docker-config"
     docker_config.mkdir(mode=0o700)
@@ -1330,8 +1335,10 @@ def main():
         stage = "release-evidence"
         admitted = validate_release(release_directory)
         base_config = validate_base_config(base_config_path)
-        if not (repository / "deploy/cloudflare/worker.js").is_file():
-            raise ContractFailure("Worker entrypoint is missing")
+        worker_entrypoint = repository / "deploy/cloudflare/worker.js"
+        worker_source_sha256 = digest(read_regular(
+            worker_entrypoint, "Worker entrypoint", 262144,
+        ))
 
         stage = "source-authority"
         top = runner.run("git-top-level", [commands["git"], "rev-parse", "--show-toplevel"]).stdout.decode().strip()
@@ -1636,7 +1643,7 @@ def main():
             base_config,
             temporary_config,
             remote_image,
-            repository / "deploy/cloudflare/worker.js",
+            worker_entrypoint,
             api_hostname,
         )
         deploy_arguments = [
@@ -1687,6 +1694,30 @@ def main():
                 or previous_tag not in rechecked_images.get(previous_repository, set())
             ):
                 raise ContractFailure("rollback anchor changed before deployment")
+            rollback_config = scratch / "rollback-wrangler.jsonc"
+            make_deploy_config(
+                base_config,
+                rollback_config,
+                previous["image"],
+                worker_entrypoint,
+                api_hostname,
+            )
+            rollback_secrets = scratch / "rollback-secrets.json"
+            write_private(rollback_secrets, canonical_json({
+                "MILK_CARTON_CONFIG_JSON": previous_gateway_config_raw.decode("utf-8"),
+            }))
+            os.chmod(rollback_config, 0o400)
+            os.chmod(rollback_secrets, 0o400)
+            rollback_config_sha256 = digest(read_regular(
+                rollback_config, "rollback deploy config", 65536,
+            ))
+            rollback_secrets_sha256 = digest(read_regular(
+                rollback_secrets, "rollback deploy secrets", 65536,
+            ))
+            if digest(read_regular(
+                worker_entrypoint, "Worker entrypoint", 262144,
+            )) != worker_source_sha256:
+                raise ContractFailure("Worker entrypoint changed before deployment")
         stage = "worker-deploy"
         deploy_started = True
         try:
@@ -1843,31 +1874,30 @@ def main():
             outcome = "rollback_failed"
             resource_restore_command_succeeded = False
             resource_restore_accepted = False
-            source_authority_rechecked = False
+            rollback_inputs_verified = False
             worker_rollback_command_succeeded = False
             rollback_accepted = False
             rollback_app_version = None
-            rollback_config = None
-            rollback_secrets = None
             try:
                 stage = "automatic-resource-restore"
-                if scratch is None:
-                    raise ContractFailure("rollback scratch directory is unavailable")
-                if not source_authority_unchanged("rollback"):
-                    raise ContractFailure("source authority changed before resource restoration")
-                source_authority_rechecked = True
-                rollback_config = scratch / "rollback-wrangler.jsonc"
-                make_deploy_config(
-                    base_config,
-                    rollback_config,
-                    previous["image"],
-                    repository / "deploy/cloudflare/worker.js",
-                    api_hostname,
-                )
-                rollback_secrets = scratch / "rollback-secrets.json"
-                write_private(rollback_secrets, canonical_json({
-                    "MILK_CARTON_CONFIG_JSON": previous_gateway_config_raw.decode("utf-8"),
-                }))
+                if (
+                    rollback_config is None
+                    or rollback_config_sha256 is None
+                    or rollback_secrets is None
+                    or rollback_secrets_sha256 is None
+                    or worker_source_sha256 is None
+                    or digest(read_regular(
+                        rollback_config, "rollback deploy config", 65536,
+                    )) != rollback_config_sha256
+                    or digest(read_regular(
+                        rollback_secrets, "rollback deploy secrets", 65536,
+                    )) != rollback_secrets_sha256
+                    or digest(read_regular(
+                        worker_entrypoint, "Worker entrypoint", 262144,
+                    )) != worker_source_sha256
+                ):
+                    raise ContractFailure("staged rollback inputs changed")
+                rollback_inputs_verified = True
                 wrangler(
                     "restore-previous-image-and-config",
                     "deploy", "--strict", "--containers-rollout", "immediate",
@@ -1883,15 +1913,16 @@ def main():
                     rollback_secrets.unlink(missing_ok=True)
                 if rollback_config is not None:
                     rollback_config.unlink(missing_ok=True)
-            try:
-                stage = "automatic-resource-restore-acceptance"
-                poll(
-                    "resource-restore", previous["image"], None, False,
-                    previous["config_sha256"],
-                )
-                resource_restore_accepted = True
-            except BaseException:
-                pass
+            if rollback_inputs_verified:
+                try:
+                    stage = "automatic-resource-restore-acceptance"
+                    poll(
+                        "resource-restore", previous["image"], None, False,
+                        previous["config_sha256"],
+                    )
+                    resource_restore_accepted = True
+                except BaseException:
+                    pass
             if resource_restore_accepted:
                 try:
                     stage = "automatic-worker-rollback"
@@ -1920,7 +1951,7 @@ def main():
                 "previous_gateway_config_sha256": previous["config_sha256"],
                 "application_id": application_id,
                 "application_version": rollback_app_version,
-                "source_authority_rechecked": source_authority_rechecked,
+                "rollback_inputs_verified": rollback_inputs_verified,
                 "resource_restore_command_succeeded": resource_restore_command_succeeded,
                 "resource_restore_accepted": resource_restore_accepted,
                 "worker_rollback_command_succeeded": worker_rollback_command_succeeded,
