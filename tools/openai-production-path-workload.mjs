@@ -11,6 +11,7 @@ const CONCURRENCY = 4;
 const MAX_CREDENTIAL_BYTES = 8_192;
 const MAX_RESPONSE_BYTES = 65_536;
 const SESSION_COUNT = 100;
+const SDK_VERSION = "6.33.0";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -118,6 +119,10 @@ async function runRequest(client, row) {
 }
 
 export async function runProductionPath(endpoint, credential, fetch = globalThis.fetch) {
+  const packageMetadata = JSON.parse(
+    await readFile(new URL("../node_modules/openai/package.json", import.meta.url), "utf8"),
+  );
+  assert.equal(packageMetadata.version, SDK_VERSION);
   const options = {
     baseURL: endpoint.href,
     fetch,
@@ -210,6 +215,7 @@ export async function runProductionPath(endpoint, credential, fetch = globalThis
       workload_sessions: workload.length,
     },
     hashes: {
+      endpoint_sha256: sha256(endpoint.href),
       request_set_sha256: sha256(canonical(requestSet)),
       response_set_sha256: sha256(canonical(responseSet)),
       tool_sha256: sha256(await readFile(new URL(import.meta.url))),
@@ -217,6 +223,8 @@ export async function runProductionPath(endpoint, credential, fetch = globalThis
     },
     http_status_counts: { 200: observations.length, 401: 1 },
     schema_version: "milk.official-openai-sdk-production-path.v1",
+    sdk: "openai-node",
+    sdk_version: SDK_VERSION,
     status: "succeeded",
     trace_ids: traceIds,
   };

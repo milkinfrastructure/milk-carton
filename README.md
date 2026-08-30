@@ -174,8 +174,9 @@ node tools/openai-production-path-workload.mjs \
   /absolute/fresh-mechanics-gateway-credential.json
 ```
 
-Its canonical receipt contains only counts, SHA-256 digests, trace IDs, and
-status. It never contains the tenant scope, API key, prompts, or responses.
+Its canonical receipt contains only pinned SDK identity, counts, SHA-256
+digests, trace IDs, and status. It never contains the tenant scope, API key,
+prompts, or responses.
 
 ## Production qualification
 

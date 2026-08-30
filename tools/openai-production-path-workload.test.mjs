@@ -144,6 +144,8 @@ assert.equal(responsesRequests, 51);
 assert.equal(sessions.size, 102);
 assert.equal(maximumActive, 4);
 assert.equal(receipt.schema_version, "milk.official-openai-sdk-production-path.v1");
+assert.equal(receipt.sdk, "openai-node");
+assert.equal(receipt.sdk_version, "6.33.0");
 assert.equal(receipt.status, "succeeded");
 assert.deepEqual(receipt.counts, {
   captured_requests: 102,
@@ -161,6 +163,7 @@ assert.deepEqual(receipt.counts, {
 });
 assert.deepEqual(receipt.http_status_counts, { 200: 102, 401: 1 });
 assert.deepEqual(Object.keys(receipt.hashes).sort(), [
+  "endpoint_sha256",
   "request_set_sha256",
   "response_set_sha256",
   "tool_sha256",
