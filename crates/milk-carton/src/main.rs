@@ -49,6 +49,7 @@ use route::{
     WINNER_ZERO_VALID_FOR_SECONDS, WinnerRouteAdvanceAction, WinnerRoutePhase,
     advance_winner_route, parse_operator_route_proposal, prepare_operator_route_manifest,
     prepare_operator_zero_route_manifest, prepare_route_manifest,
+    verify_operator_manifest_proposal_binding,
 };
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -1636,13 +1637,23 @@ async fn main() -> Result<()> {
             let proposal_bytes = proposal.reread_unchanged()?;
             let parsed_proposal =
                 parse_operator_route_proposal(route_config, &route_scope, &proposal_bytes)?;
-            records
-                .verify_operator_route_preflight(
-                    &config_scope(&config),
-                    &parsed_proposal,
-                    &proposal_bytes,
-                )
-                .await?;
+            if zero {
+                records
+                    .verify_operator_route_proposal_identity(
+                        &config_scope(&config),
+                        &parsed_proposal,
+                        &proposal_bytes,
+                    )
+                    .await?;
+            } else {
+                records
+                    .verify_operator_route_preflight(
+                        &config_scope(&config),
+                        &parsed_proposal,
+                        &proposal_bytes,
+                    )
+                    .await?;
+            }
             let (manifest_bytes, publication) = if zero {
                 prepare_operator_zero_route_manifest(
                     route_config,
@@ -1723,6 +1734,26 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            if let Some(proposal_sha256) = publication.operator_proposal_sha256() {
+                let (proposal, proposal_bytes) = records
+                    .load_operator_route_proposal(&config_scope(&config), &proposal_sha256)
+                    .await?;
+                verify_operator_manifest_proposal_binding(
+                    route_config,
+                    &route_scope,
+                    &manifest_bytes,
+                    &proposal_bytes,
+                )?;
+                if publication.has_candidate {
+                    records
+                        .verify_operator_route_preflight(
+                            &config_scope(&config),
+                            &proposal,
+                            &proposal_bytes,
+                        )
+                        .await?;
+                }
+            }
             if check_only {
                 tokio::time::timeout(
                     ROUTE_PUBLICATION_TIMEOUT,

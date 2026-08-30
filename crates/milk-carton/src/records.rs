@@ -4552,6 +4552,29 @@ impl Records {
             .await
     }
 
+    pub(crate) async fn verify_operator_route_proposal_identity(
+        &self,
+        scope: &Scope,
+        proposal: &OperatorRouteProposal,
+        proposal_bytes: &[u8],
+    ) -> Result<()> {
+        self.store
+            .verify_operator_route_proposal_identity(scope, proposal, proposal_bytes)
+            .await
+    }
+
+    pub(crate) async fn load_operator_route_proposal(
+        &self,
+        scope: &Scope,
+        proposal_sha256: &[u8; 32],
+    ) -> Result<(OperatorRouteProposal, Vec<u8>)> {
+        let (proposal, bytes) = self
+            .store
+            .load_operator_route_proposal(scope, proposal_sha256)
+            .await?;
+        Ok((proposal, bytes.to_vec()))
+    }
+
     pub(crate) async fn load_route_publication(
         &self,
         scope: &Scope,
@@ -11234,7 +11257,21 @@ impl RecordStore {
         Ok((value, bytes))
     }
 
-    async fn verify_operator_route_preflight(
+    async fn load_operator_route_proposal(
+        &self,
+        scope: &Scope,
+        proposal_sha256: &[u8; 32],
+    ) -> Result<(OperatorRouteProposal, Bytes)> {
+        let proposal_sha256 = hex_digest(proposal_sha256);
+        let proposal_key = format!(
+            "{}/route-proposals/versions/{proposal_sha256}.json",
+            scope_prefix(scope)
+        );
+        self.load_harness_artifact(&proposal_key, &proposal_sha256, "operator route proposal")
+            .await
+    }
+
+    async fn verify_operator_route_proposal_identity(
         &self,
         scope: &Scope,
         proposal: &OperatorRouteProposal,
@@ -11243,16 +11280,24 @@ impl RecordStore {
         if proposal.scope_id != scope.scope_id {
             bail!("route proposal preflight scope differs");
         }
-        let prefix = scope_prefix(scope);
-        let series = &proposal.series_id;
-        let proposal_sha256 = hex_digest(&Sha256::digest(proposal_bytes).into());
-        let proposal_key = format!("{prefix}/route-proposals/versions/{proposal_sha256}.json");
-        let (stored_proposal, stored_proposal_bytes): (OperatorRouteProposal, _) = self
-            .load_harness_artifact(&proposal_key, &proposal_sha256, "operator route proposal")
+        let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
+        let (stored_proposal, stored_proposal_bytes) = self
+            .load_operator_route_proposal(scope, &proposal_sha256)
             .await?;
         if stored_proposal != *proposal || stored_proposal_bytes.as_ref() != proposal_bytes {
             bail!("operator route proposal differs from its stored content address");
         }
+        Ok(())
+    }
+
+    async fn verify_current_operator_route_proposal(
+        &self,
+        scope: &Scope,
+        proposal_sha256: &[u8; 32],
+    ) -> Result<()> {
+        let prefix = scope_prefix(scope);
+        let proposal_sha256 = hex_digest(proposal_sha256);
+        let proposal_key = format!("{prefix}/route-proposals/versions/{proposal_sha256}.json");
         let current_key = format!("{prefix}/route-proposals/current.json");
         let current_bytes = self
             .load_bytes(&current_key, MAX_HARNESS_ARTIFACT_BYTES)
@@ -11270,6 +11315,22 @@ impl RecordStore {
         {
             bail!("operator route proposal is not the current qualified proposal");
         }
+        Ok(())
+    }
+
+    async fn verify_operator_route_preflight(
+        &self,
+        scope: &Scope,
+        proposal: &OperatorRouteProposal,
+        proposal_bytes: &[u8],
+    ) -> Result<()> {
+        self.verify_operator_route_proposal_identity(scope, proposal, proposal_bytes)
+            .await?;
+        let prefix = scope_prefix(scope);
+        let series = &proposal.series_id;
+        let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
+        self.verify_current_operator_route_proposal(scope, &proposal_sha256)
+            .await?;
 
         let source_key = format!(
             "{prefix}/pending-source/versions/{}.json",
@@ -11460,6 +11521,8 @@ impl RecordStore {
         }
 
         self.verify_candidate_score_preflight(proposal, &eval, &validation, &score)?;
+        self.verify_current_operator_route_proposal(scope, &proposal_sha256)
+            .await?;
         Ok(())
     }
 
@@ -18590,6 +18653,23 @@ mod tests {
                 .to_string()
                 .contains("current qualified proposal")
         );
+        fixture
+            .store
+            .verify_operator_route_proposal_identity(
+                &fixture.scope,
+                &fixture.proposal,
+                &fixture.proposal_bytes,
+            )
+            .await
+            .unwrap();
+        let proposal_sha256: [u8; 32] = Sha256::digest(&fixture.proposal_bytes).into();
+        let (stored_proposal, stored_bytes) = fixture
+            .store
+            .load_operator_route_proposal(&fixture.scope, &proposal_sha256)
+            .await
+            .unwrap();
+        assert_eq!(stored_proposal, fixture.proposal);
+        assert_eq!(stored_bytes.as_ref(), fixture.proposal_bytes.as_slice());
     }
 
     #[tokio::test]

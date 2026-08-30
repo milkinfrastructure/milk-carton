@@ -772,6 +772,11 @@ impl RoutePublication {
     pub(crate) const fn is_operator_proposal(&self) -> bool {
         matches!(self.source, RoutePublicationSource::OperatorProposal)
     }
+
+    pub(crate) fn operator_proposal_sha256(&self) -> Option<[u8; 32]> {
+        self.is_operator_proposal()
+            .then_some(self.student_result_sha256)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1066,6 +1071,56 @@ pub(crate) fn parse_operator_route_proposal(
     }
     validate_candidate_api_base_url(&proposal.api_base_url, config.allow_private_candidate_http)?;
     Ok(proposal)
+}
+
+pub(crate) fn verify_operator_manifest_proposal_binding(
+    config: &RouteStartupConfig,
+    scope: &RouteScope,
+    manifest_bytes: &[u8],
+    proposal_bytes: &[u8],
+) -> Result<()> {
+    let proposal = parse_operator_route_proposal(config, scope, proposal_bytes)?;
+    let manifest: OperatorRouteManifest = serde_json::from_slice(manifest_bytes)
+        .context("operator route manifest is not strict typed JSON")?;
+    if serde_json::to_vec(&manifest)? != manifest_bytes {
+        bail!("route manifest is not canonical JSON");
+    }
+    validate_operator_manifest(config, scope, &manifest)?;
+    let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
+    if manifest.proposal_sha256 != hex_digest(&proposal_sha256) {
+        bail!("signed route does not reference the exact stored proposal");
+    }
+
+    let expected_validity = if let Some(candidate) = &manifest.candidate {
+        if manifest.candidate_basis_points != proposal.candidate_basis_points
+            || proposal.candidate_basis_points == 0
+            || candidate.eval_sha256 != proposal.eval_sha256
+            || candidate.candidate_id != proposal.candidate_id
+            || candidate.api_base_url != proposal.api_base_url
+            || candidate.model != proposal.model
+            || candidate.supported_capabilities != [RouteCapability::Stream]
+            || candidate.reasoning_effort.is_some()
+        {
+            bail!("signed candidate route differs from its stored proposal");
+        }
+        WINNER_CANARY_VALID_FOR_SECONDS
+    } else {
+        if proposal.candidate_basis_points == 0
+            || manifest.candidate_basis_points != 0
+            || manifest.previous_route_revision.is_none()
+        {
+            bail!("signed zero route differs from its candidate proposal lineage");
+        }
+        WINNER_ZERO_VALID_FOR_SECONDS
+    };
+    if manifest.not_before.nanosecond() != 0
+        || manifest.not_after.nanosecond() != 0
+        || manifest.not_after - manifest.not_before
+            != TimeDelta::seconds(i64::from(expected_validity))
+    {
+        bail!("signed operator route validity differs from the bounded prepared route");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2779,8 +2834,56 @@ mod tests {
         assert_eq!(manifest.schema_version, OPERATOR_ROUTE_SCHEMA_VERSION);
         assert_eq!(manifest.previous_route_revision, None);
         assert_eq!(
-            manifest.candidate.unwrap().supported_capabilities,
+            manifest.candidate.as_ref().unwrap().supported_capabilities,
             [RouteCapability::Stream]
+        );
+        verify_operator_manifest_proposal_binding(
+            &generic_config,
+            &fixture.scope,
+            &manifest_bytes,
+            &proposal,
+        )
+        .unwrap();
+
+        let mut mismatched = manifest.clone();
+        mismatched.candidate.as_mut().unwrap().model = "other-model".to_owned();
+        assert!(
+            verify_operator_manifest_proposal_binding(
+                &generic_config,
+                &fixture.scope,
+                &serde_json::to_vec(&mismatched).unwrap(),
+                &proposal,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("differs from its stored proposal")
+        );
+
+        let mut extended = manifest.clone();
+        extended.candidate.as_mut().unwrap().supported_capabilities =
+            vec![RouteCapability::Stream, RouteCapability::Responses];
+        assert!(
+            verify_operator_manifest_proposal_binding(
+                &generic_config,
+                &fixture.scope,
+                &serde_json::to_vec(&extended).unwrap(),
+                &proposal,
+            )
+            .is_err()
+        );
+
+        let mut long_lived = manifest.clone();
+        long_lived.not_after += TimeDelta::seconds(1);
+        assert!(
+            verify_operator_manifest_proposal_binding(
+                &generic_config,
+                &fixture.scope,
+                &serde_json::to_vec(&long_lived).unwrap(),
+                &proposal,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("validity differs")
         );
 
         let signature = signing_key().sign(&manifest_bytes);
@@ -2895,6 +2998,13 @@ mod tests {
             zero_manifest.previous_route_revision,
             Some(canary.revision_hex())
         );
+        verify_operator_manifest_proposal_binding(
+            &fixture.config,
+            &fixture.scope,
+            &zero_bytes,
+            &proposal,
+        )
+        .unwrap();
 
         let other = operator_proposal(
             &fixture.scope,
