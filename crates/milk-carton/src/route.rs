@@ -793,6 +793,7 @@ pub(crate) fn prepare_route_manifest(
     now: DateTime<Utc>,
     valid_for_seconds: u32,
 ) -> Result<(Vec<u8>, RoutePublication)> {
+    reject_non_production_mechanics_route(scope.scope_id, None)?;
     if !(60..=u32::try_from(MAX_ROUTE_VALIDITY_HOURS * 60 * 60)?).contains(&valid_for_seconds) {
         bail!("route validity must be in 60..=86400 seconds");
     }
@@ -2087,10 +2088,15 @@ fn validate_operator_manifest(
     }
 }
 
-fn reject_non_production_mechanics_route(scope_id: Uuid, eval_sha256: Option<&str>) -> Result<()> {
+pub(crate) fn reject_non_production_mechanics_scope(scope_id: Uuid) -> Result<()> {
     if scope_id.as_u128() == NON_PRODUCTION_MECHANICS_SCOPE_ID {
         bail!("non-production mechanics scope is not route-admissible");
     }
+    Ok(())
+}
+
+fn reject_non_production_mechanics_route(scope_id: Uuid, eval_sha256: Option<&str>) -> Result<()> {
+    reject_non_production_mechanics_scope(scope_id)?;
     if eval_sha256.is_some_and(|value| value == NON_PRODUCTION_MECHANICS_EVAL_SHA256) {
         bail!("non-production mechanics eval is not route-admissible");
     }
@@ -3055,6 +3061,26 @@ mod tests {
         let proposal = |scope: &RouteScope, eval_sha256: &str| {
             operator_proposal(scope, eval_sha256, WINNER_CANARY_BASIS_POINTS)
         };
+
+        let (winner, admission) = verified_winner(&fixture);
+        let blocked_legacy = prepare_route_manifest(
+            &fixture.config,
+            &mechanics_scope,
+            &winner,
+            &admission,
+            &fixture.secret_hex,
+            WINNER_CANARY_BASIS_POINTS,
+            None,
+            None,
+            now,
+            WINNER_CANARY_VALID_FOR_SECONDS,
+        )
+        .unwrap_err();
+        assert!(
+            blocked_legacy
+                .to_string()
+                .contains("mechanics scope is not route-admissible")
+        );
 
         let blocked_scope = prepare_operator_route_manifest(
             &fixture.config,
