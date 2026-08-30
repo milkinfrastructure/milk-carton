@@ -165,7 +165,9 @@ Generated traffic proves mechanics only. The known scope and exact eval SHA-256 
 
 The separate production-path workload leaves that proof unchanged. It checks an
 invalid key, both official SDK endpoints, then sends 100 deterministic sessions
-at the gateway's concurrency limit of four with no pacing delay. Pass the fresh
+with four workers. Request starts default to 4.1 seconds apart for Baseten's
+15-RPM unverified Basic limit. After the workspace reports the 120-RPM verified
+limit, set `MILK_PRODUCTION_PATH_REQUEST_INTERVAL_MS=520`. Pass the fresh
 mechanics tenant only through an owner-only gateway credential file:
 
 ```sh

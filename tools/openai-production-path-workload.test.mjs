@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   productionPathPlan,
+  productionPathRequestInterval,
   readCredential,
   runProductionPath,
 } from "./openai-production-path-workload.mjs";
@@ -26,6 +27,9 @@ assert.ok(plan.every((row) => (
   row.request.max_completion_tokens ?? row.request.max_output_tokens
 ) === 64));
 assert.deepEqual(plan, productionPathPlan(credential.model));
+assert.equal(productionPathRequestInterval(), 4_100);
+assert.equal(productionPathRequestInterval("520"), 520);
+assert.throws(() => productionPathRequestInterval("10001"));
 
 const temporary = await mkdtemp(join(tmpdir(), "milk-production-path-"));
 try {
@@ -42,6 +46,8 @@ let validRequests = 0;
 let invalidRequests = 0;
 let chatRequests = 0;
 let responsesRequests = 0;
+let virtualNow = 0;
+const launchWaits = [];
 const sessions = new Set();
 
 const server = createServer(async (request, response) => {
@@ -130,6 +136,15 @@ try {
   receipt = await runProductionPath(
     new URL(`http://127.0.0.1:${address.port}/v1`),
     credential,
+    undefined,
+    productionPathRequestInterval("520"),
+    {
+      now: () => virtualNow,
+      sleep: async (milliseconds) => {
+        launchWaits.push(milliseconds);
+        virtualNow += milliseconds;
+      },
+    },
   );
 } finally {
   await new Promise((resolve, reject) => {
@@ -143,6 +158,8 @@ assert.equal(chatRequests, 51);
 assert.equal(responsesRequests, 51);
 assert.equal(sessions.size, 102);
 assert.equal(maximumActive, 4);
+assert.equal(launchWaits.length, 101);
+assert.ok(launchWaits.every((milliseconds) => milliseconds === 520));
 assert.equal(receipt.schema_version, "milk.official-openai-sdk-production-path.v1");
 assert.equal(receipt.sdk, "openai-node");
 assert.equal(receipt.sdk_version, "6.33.0");
@@ -153,6 +170,7 @@ assert.deepEqual(receipt.counts, {
   concurrency: 4,
   failed_workload_sessions: 0,
   invalid_key_requests: 1,
+  minimum_request_interval_ms: 520,
   planned_sessions: 100,
   responses_requests: 51,
   sdk_requests: 103,

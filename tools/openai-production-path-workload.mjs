@@ -3,11 +3,14 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 import OpenAI from "openai";
 
 const CONCURRENCY = 4;
+const DEFAULT_MINIMUM_REQUEST_INTERVAL_MS = 4_100;
+const MAXIMUM_REQUEST_INTERVAL_MS = 10_000;
 const MAX_CREDENTIAL_BYTES = 8_192;
 const MAX_RESPONSE_BYTES = 65_536;
 const SESSION_COUNT = 100;
@@ -28,6 +31,29 @@ function canonical(value) {
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export function productionPathRequestInterval(value = DEFAULT_MINIMUM_REQUEST_INTERVAL_MS) {
+  const raw = String(value);
+  assert.match(raw, /^(?:0|[1-9][0-9]{0,4})$/);
+  const interval = Number(raw);
+  assert.ok(interval <= MAXIMUM_REQUEST_INTERVAL_MS);
+  return interval;
+}
+
+function launchScheduler(interval, { now = Date.now, sleep = delay } = {}) {
+  let lastStart = null;
+  let pending = Promise.resolve();
+  return () => {
+    pending = pending.then(async () => {
+      if (lastStart !== null) {
+        const waitMs = lastStart + interval - now();
+        if (waitMs > 0) await sleep(waitMs);
+      }
+      lastStart = now();
+    });
+    return pending;
+  };
 }
 
 export async function readCredential(path) {
@@ -118,7 +144,14 @@ async function runRequest(client, row) {
   return responseObservation(result.data, result.response, row.requestSha256);
 }
 
-export async function runProductionPath(endpoint, credential, fetch = globalThis.fetch) {
+export async function runProductionPath(
+  endpoint,
+  credential,
+  fetch = globalThis.fetch,
+  minimumRequestIntervalMs = DEFAULT_MINIMUM_REQUEST_INTERVAL_MS,
+  timing,
+) {
+  minimumRequestIntervalMs = productionPathRequestInterval(minimumRequestIntervalMs);
   const packageMetadata = JSON.parse(
     await readFile(new URL("../node_modules/openai/package.json", import.meta.url), "utf8"),
   );
@@ -144,7 +177,15 @@ export async function runProductionPath(endpoint, credential, fetch = globalThis
   }
   assert.equal(invalidStatus, 401);
 
-  const client = new OpenAI({ ...options, apiKey: credential.api_key });
+  const waitForLaunch = launchScheduler(minimumRequestIntervalMs, timing);
+  const client = new OpenAI({
+    ...options,
+    apiKey: credential.api_key,
+    fetch: async (input, init) => {
+      await waitForLaunch();
+      return fetch(input, init);
+    },
+  });
   const smoke = [
     {
       endpoint: "chat_completions",
@@ -206,6 +247,7 @@ export async function runProductionPath(endpoint, credential, fetch = globalThis
       concurrency: CONCURRENCY,
       failed_workload_sessions: 0,
       invalid_key_requests: 1,
+      minimum_request_interval_ms: minimumRequestIntervalMs,
       planned_sessions: plan.length,
       responses_requests: 51,
       sdk_requests: 103,
@@ -247,13 +289,22 @@ async function main() {
   assert.equal(process.argv.length, 4);
   const endpoint = productionEndpoint(process.argv[2]);
   const credential = await readCredential(process.argv[3]);
-  const receipt = await runProductionPath(endpoint, credential);
+  const interval = productionPathRequestInterval(
+    process.env.MILK_PRODUCTION_PATH_REQUEST_INTERVAL_MS,
+  );
+  const receipt = await runProductionPath(
+    endpoint,
+    credential,
+    globalThis.fetch,
+    interval,
+  );
   process.stdout.write(`${canonical(receipt)}\n`);
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  main().catch(() => {
-    process.stderr.write("openai-production-path-workload: failed\n");
+  main().catch((error) => {
+    const status = Number.isInteger(error?.status) ? ` status=${error.status}` : "";
+    process.stderr.write(`openai-production-path-workload: failed${status}\n`);
     process.exitCode = 70;
   });
 }
