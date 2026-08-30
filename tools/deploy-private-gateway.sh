@@ -593,7 +593,6 @@ def parse_application(raw, application_id, account_id):
         or info.get("id") != application_id
         or info.get("account_id") != account_id
         or info.get("name") != APPLICATION_NAME
-        or info.get("jobs") is not False
         or not isinstance(info.get("version"), int)
         or isinstance(info.get("version"), bool)
         or info["version"] < 1
