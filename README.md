@@ -110,7 +110,7 @@ target/release/milk-carton --config "$PWD/milk-carton.json" status
 
 ## Production deployment
 
-The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudflare Worker and Container. A non-bootstrap deployment uploads code and the reviewed `MILK_CARTON_CONFIG_JSON` in one atomic, versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. A failed update restores the prior Worker version and config binding together, then verifies that live health reports the exact pre-deploy config digest.
+The intended hosted deployment runs an admitted `linux/amd64` image in a Cloudflare Worker and Container. A non-bootstrap deployment uploads code and the reviewed `MILK_CARTON_CONFIG_JSON` in one atomic, versioned Worker deploy, checks one healthy instance on that exact config digest, and runs the official OpenAI SDK smoke. The operator must also supply the exact config bytes already live before the update. A failed update first restores that config and the retained prior Container image, then rolls back the exact prior Worker version and verifies all three states.
 
 Build and verify one private image from a clean published checkout:
 
@@ -137,6 +137,7 @@ tools/deploy-private-gateway.sh \
 
 tools/deploy-private-gateway.sh \
   --registry-token-file /absolute/owner-only/ghcr-token \
+  --previous-gateway-config-file /absolute/previous-gateway-config.json \
   /absolute/gateway-release-evidence \
   <cloudflare-application-id> \
   /absolute/new/gateway-deploy-evidence \
