@@ -173,13 +173,13 @@ node tools/openai-production-smoke.mjs \
   --generated-mechanics
 ```
 
-The fixed proof model is `zai-org/GLM-5.3-Flash`. The contract SHA-256 is `086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf`.
+The fixed proof model is `zai-org/GLM-5.3-Flash`. The contract SHA-256 is `d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66`.
 
 | Step | SDK calls | Baseline | Candidate | Completion-token cap |
 | --- | ---: | ---: | ---: | ---: |
-| Deployment baseline | 1 | 1 | 0 | 128 |
-| Generated mechanics | 320 | 320 | 0 | 128 |
-| Candidate | 1 | 0 | 1 | 128 |
+| Deployment baseline | 1 | 1 | 0 | 256 |
+| Generated mechanics | 320 | 320 | 0 | 256 |
+| Candidate | 1 | 0 | 1 | 256 |
 | Saturation fallback | 2 | 1 | 1 | 3,840 |
 | **Total** | **324** | **322** | **2** |  |
 
@@ -187,7 +187,7 @@ Every v2 receipt carries that contract hash plus its exact step, model, request 
 
 The verified deployment's `current.json` is v2 and binds the canonical deployment-baseline receipt SHA-256 and the fixed proof-contract SHA-256. Deployment finalization re-reads both records before sealing the evidence manifest.
 
-The generated mechanics driver contributes exactly 320 of those baseline requests with four-way concurrency, a 30-second timeout per request, and no SDK retries. Its preflight and postflight health checks also have 30-second timeouts, keeping the network wait within 41 minutes for a 60-minute cloud job. It verifies the deployed config digest and capture health before and after the run, plus the exact SDK body bytes, assigned partition, and baseline route revision for every request. Its canonical receipt retains only aggregate hashes, counts, timing, and success state; durable R2 readback remains a separate required gate.
+The generated mechanics driver contributes exactly 320 of those baseline requests with one request in flight, a 4.25-second minimum launch interval, a 60-second timeout per request, and no SDK retries. That interval stays below Baseten's 15-request-per-minute Basic-account rate limit. It uses GLM's supported `low` reasoning effort so the bounded response reaches final content. Its preflight and postflight health checks have 30-second timeouts. It verifies the deployed config digest and capture health before and after the run, plus the exact SDK body bytes, assigned partition, and baseline route revision for every request. Its canonical receipt retains only aggregate hashes, counts, timing, and success state; durable R2 readback remains a separate required gate.
 
 After this mechanics proof reaches the production gate, hosted GLM is the next explicit typed teacher profile. It uses the same eval, capture, and route contracts; it does not add a generic provider layer.
 

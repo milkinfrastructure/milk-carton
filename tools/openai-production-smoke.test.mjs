@@ -22,16 +22,19 @@ const credential = {
 assert.deepEqual(PRODUCTION_PROOF, {
   baseline_requests: 322,
   candidate_requests: 2,
+  generated_concurrency: 1,
   generated_health_timeout_ms: 30_000,
+  generated_minimum_request_interval_ms: 4_250,
   generated_mechanics_requests: 320,
-  generated_request_timeout_ms: 30_000,
+  generated_reasoning_effort: "low",
+  generated_request_timeout_ms: 60_000,
   max_sdk_requests: 324,
   model: "zai-org/GLM-5.3-Flash",
   saturation_max_completion_tokens: 3_840,
-  short_max_completion_tokens: 128,
+  short_max_completion_tokens: 256,
 });
 const productionProofSha256 =
-  "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf";
+  "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66";
 const revision = digest("1");
 const data = {
   choices: [{ finish_reason: "stop", message: { content: "OK", role: "assistant" } }],
@@ -43,7 +46,7 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
       completions: {
         create(request) {
           const expected = {
-            max_completion_tokens: 128,
+            max_completion_tokens: 256,
             messages: [{ role: "user", content: "Reply with only OK." }],
             model: credential.model,
           };
@@ -73,7 +76,7 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
 }
 
 assert.deepEqual(candidateRequest({ ...credential, reasoning_effort: null }), {
-  max_completion_tokens: 128,
+  max_completion_tokens: 256,
   messages: [{ role: "user", content: "Reply with only OK." }],
   model: credential.model,
 });
@@ -90,7 +93,7 @@ assert.equal(receipt.model, PRODUCTION_PROOF.model);
 assert.equal(receipt.sdk_request_count, 1);
 assert.equal(receipt.baseline_request_count, 0);
 assert.equal(receipt.candidate_request_count, 1);
-assert.equal(receipt.max_completion_tokens, 128);
+assert.equal(receipt.max_completion_tokens, 256);
 assert.equal(receipt.proof_contract_sha256, productionProofSha256);
 assert.equal(receipt.route_revision, revision);
 assert.equal(receipt.route_target, "candidate");
@@ -111,7 +114,7 @@ assert.equal(baseline.model, PRODUCTION_PROOF.model);
 assert.equal(baseline.sdk_request_count, 1);
 assert.equal(baseline.baseline_request_count, 1);
 assert.equal(baseline.candidate_request_count, 0);
-assert.equal(baseline.max_completion_tokens, 128);
+assert.equal(baseline.max_completion_tokens, 256);
 assert.equal(baseline.proof_contract_sha256, receipt.proof_contract_sha256);
 assert.equal(baseline.authenticated, true);
 assert.equal(baseline.content_retained, false);
@@ -270,7 +273,8 @@ await assert.rejects(
 assert.equal(wrongModelTransportCalls, 0);
 const mechanicsPlan = generatedMechanicsPlan(PRODUCTION_PROOF.model);
 assert.equal(mechanicsPlan.length, 320);
-assert.equal(mechanicsPlan[0].request.max_completion_tokens, 128);
+assert.equal(mechanicsPlan[0].request.max_completion_tokens, 256);
+assert.equal(mechanicsPlan[0].request.reasoning_effort, "low");
 assert.equal(new Set(mechanicsPlan.map((row) => row.sessionId)).size, 320);
 assert.match(mechanicsPlan[0].sessionId, /^milk-mechanics-[0-9]{4}$/);
 assert.deepEqual(
@@ -283,6 +287,7 @@ assert.deepEqual(
 let mechanicsCalls = 0;
 let mechanicsHealthCalls = 0;
 const mechanicsSessions = new Set();
+const mechanicsLaunches = [];
 const mechanics = await runGeneratedMechanics(
   new URL("https://carton.example/v1"),
   {
@@ -298,6 +303,11 @@ const mechanics = await runGeneratedMechanics(
     }
     const call = mechanicsCalls;
     mechanicsCalls += 1;
+    mechanicsLaunches.push(performance.now());
+    if (call === 0) {
+      const blockedUntil = performance.now() + 30;
+      while (performance.now() < blockedUntil) {}
+    }
     assert.equal(request.url, "https://carton.example/v1/chat/completions");
     assert.match(
       request.headers.get("x-milk-session-id") ?? "",
@@ -306,6 +316,7 @@ const mechanics = await runGeneratedMechanics(
     mechanicsSessions.add(request.headers.get("x-milk-session-id"));
     return mechanicsResponse(call);
   },
+  5,
 );
 assert.equal(mechanicsCalls, 320);
 assert.equal(mechanicsHealthCalls, 2);
@@ -313,11 +324,14 @@ assert.equal(mechanicsSessions.size, 320);
 assert.equal(mechanics.schema_version, "milk.official-openai-sdk-generated-mechanics.v2");
 assert.equal(mechanics.proof_step, "generated_mechanics");
 assert.equal(mechanics.model, PRODUCTION_PROOF.model);
-assert.equal(mechanics.request_timeout_ms, 30_000);
+assert.equal(mechanics.request_timeout_ms, 60_000);
+assert.equal(mechanics.minimum_request_interval_ms, 5);
+assert.equal(mechanics.reasoning_effort, "low");
+assert.equal(mechanics.concurrency, 1);
 assert.equal(mechanics.sdk_request_count, 320);
 assert.equal(mechanics.baseline_request_count, 320);
 assert.equal(mechanics.candidate_request_count, 0);
-assert.equal(mechanics.max_completion_tokens, 128);
+assert.equal(mechanics.max_completion_tokens, 256);
 assert.equal(mechanics.proof_contract_sha256, receipt.proof_contract_sha256);
 assert.equal(mechanics.planned, 320);
 assert.equal(mechanics.attempted, 320);
@@ -340,6 +354,13 @@ assert.equal(mechanics.gateway_config_sha256, "a".repeat(64));
 assert.equal(mechanics.route_revision, "openai-baseline-v1");
 assert.equal(mechanics.content_retained, false);
 assert.equal(mechanics.succeeded, true);
+const mechanicsLaunchGaps = mechanicsLaunches.slice(1).map(
+  (launchedAt, index) => launchedAt - mechanicsLaunches[index],
+);
+assert.ok(
+  mechanicsLaunchGaps.every((gap) => gap >= 3),
+  `minimum launch gap ${Math.min(...mechanicsLaunchGaps)}`,
+);
 assert.equal(
   baseline.sdk_request_count + mechanics.sdk_request_count +
     receipt.sdk_request_count + saturation.sdk_request_count,
@@ -375,6 +396,7 @@ const drained = await runGeneratedMechanics(
     drainedCalls += 1;
     return mechanicsResponse(call, call === 17);
   },
+  0,
 );
 assert.equal(drainedCalls, 320);
 assert.equal(drainedHealthCalls, 2);
@@ -400,6 +422,7 @@ await assert.rejects(
       rejectedChats += 1;
       return mechanicsResponse(rejectedChats);
     },
+    0,
   ),
 );
 assert.equal(rejectedChats, 0);

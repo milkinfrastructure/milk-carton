@@ -250,13 +250,16 @@ if name == "node":
     proof_contract = {
         "baseline_requests": 322,
         "candidate_requests": 2,
+        "generated_concurrency": 1,
         "generated_health_timeout_ms": 30000,
+        "generated_minimum_request_interval_ms": 4250,
         "generated_mechanics_requests": 320,
-        "generated_request_timeout_ms": 30000,
+        "generated_reasoning_effort": "low",
+        "generated_request_timeout_ms": 60000,
         "max_sdk_requests": 324,
         "model": "zai-org/GLM-5.3-Flash",
         "saturation_max_completion_tokens": 3840,
-        "short_max_completion_tokens": 128,
+        "short_max_completion_tokens": 256,
     }
     print(json.dumps({
         "authenticated": True,
@@ -267,7 +270,7 @@ if name == "node":
         "endpoint_sha256": "6" * 64,
         "finish_reason": "stop",
         "http_status": 200,
-        "max_completion_tokens": 128,
+        "max_completion_tokens": 256,
         "model": "zai-org/GLM-5.3-Flash",
         "proof_contract_sha256": hashlib.sha256(json.dumps(
             proof_contract, sort_keys=True, separators=(",", ":"),
@@ -744,7 +747,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertIs(sdk_smoke["content_retained"], False)
         self.assertEqual(
             sdk_smoke["proof_contract_sha256"],
-            "086cec569f90032d235b890a32dcd3388bca69c297bd1df1218fba9408dce5cf",
+            "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66",
         )
         current = json.loads((fixture.evidence / "current.json").read_text())
         self.assertEqual(
