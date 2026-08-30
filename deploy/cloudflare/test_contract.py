@@ -19,6 +19,12 @@ assert not (root / "prepare-context.sh").exists()
 assert package["scripts"]["deploy"] == "../../tools/deploy-private-gateway.sh"
 assert "official-sdk-smoke" in deploy_script
 assert "automatic-rollback" in deploy_script
+assert "--previous-gateway-config-file" in deploy_script
+assert "restore-previous-image-and-config" in deploy_script
+assert '"resource_restore_accepted"' in deploy_script
+assert '"rollback_inputs_verified"' in deploy_script
+assert 'source_authority_unchanged("rollback")' not in deploy_script
+assert "milk.private-gateway-rollback.v2" in deploy_script
 assert "milk.private-gateway-current-deployment.v2" in deploy_script
 assert '"official_openai_sdk_baseline_receipt_sha256"' in deploy_script
 assert 'PRODUCTION_PROOF_SHA256 = "d9fb8b4daa1754acdbadc3b4028601434b79bf9c2096343c7a790df838bbcc66"' in deploy_script

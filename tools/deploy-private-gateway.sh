@@ -895,6 +895,7 @@ def main():
     arguments = sys.argv[2:]
     registry_token_file = None
     registry_token_stdin = False
+    previous_gateway_config_file = None
     wrangler_oauth = False
     while arguments and arguments[0].startswith("--") and arguments[0] != "--bootstrap":
         option = arguments.pop(0)
@@ -904,14 +905,19 @@ def main():
             registry_token_file = Path(arguments.pop(0))
         elif option == "--registry-token-stdin" and registry_token_file is None and not registry_token_stdin:
             registry_token_stdin = True
+        elif option == "--previous-gateway-config-file" and arguments and previous_gateway_config_file is None:
+            previous_gateway_config_file = Path(arguments.pop(0))
         else:
             raise DeployFailure("unsupported or duplicate deploy option")
     if registry_token_file is None and not registry_token_stdin:
         raise DeployFailure("registry credential input must be selected exactly once")
     bootstrap = len(arguments) == 6 and arguments[0] == "--bootstrap"
-    if not bootstrap and len(arguments) != 6:
+    if (
+        (bootstrap and previous_gateway_config_file is not None)
+        or (not bootstrap and (len(arguments) != 6 or previous_gateway_config_file is None))
+    ):
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
+            "usage: deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --previous-gateway-config-file ABSOLUTE_FILE RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
             "       deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
         )
     api_base_url, api_hostname, health_url = validate_api_base_url(arguments.pop())
@@ -945,6 +951,9 @@ def main():
         gateway_config_raw, gateway_config = validate_gateway_config_file(
             Path(arguments[4]), repository,
         )
+        previous_gateway_config_raw, _ = validate_gateway_config_file(
+            previous_gateway_config_file, repository,
+        )
         expected_bootstrap_secret_names = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
         raise DeployFailure("deploy evidence directory must be a new absolute path")
@@ -969,6 +978,9 @@ def main():
         credential_file, gateway_config,
     )
     gateway_config_sha256 = digest(gateway_config_raw)
+    previous_gateway_config_sha256 = (
+        None if bootstrap else digest(previous_gateway_config_raw)
+    )
 
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}
     forbidden = re.compile(
@@ -1044,6 +1056,11 @@ def main():
     previous_worker = None
     temporary_config = None
     deployment_secrets = None
+    rollback_config = None
+    rollback_config_sha256 = None
+    rollback_secrets = None
+    rollback_secrets_sha256 = None
+    worker_source_sha256 = None
     scratch = Path(tempfile.mkdtemp(prefix="milk-carton-deploy."))
     docker_config = scratch / "docker-config"
     docker_config.mkdir(mode=0o700)
@@ -1234,7 +1251,14 @@ def main():
                 worker_version = parse_active_worker(status.stdout)
                 last["worker_ready"] = (
                     worker_version is not None
-                    and ((worker_version != expected_worker) if worker_must_differ else (worker_version == expected_worker))
+                    and (
+                        expected_worker is None
+                        or (
+                            (worker_version != expected_worker)
+                            if worker_must_differ
+                            else (worker_version == expected_worker)
+                        )
+                    )
                 )
             except (CommandFailure, ContractFailure):
                 worker_version = None
@@ -1311,8 +1335,10 @@ def main():
         stage = "release-evidence"
         admitted = validate_release(release_directory)
         base_config = validate_base_config(base_config_path)
-        if not (repository / "deploy/cloudflare/worker.js").is_file():
-            raise ContractFailure("Worker entrypoint is missing")
+        worker_entrypoint = repository / "deploy/cloudflare/worker.js"
+        worker_source_sha256 = digest(read_regular(
+            worker_entrypoint, "Worker entrypoint", 262144,
+        ))
 
         stage = "source-authority"
         top = runner.run("git-top-level", [commands["git"], "rev-parse", "--show-toplevel"]).stdout.decode().strip()
@@ -1367,6 +1393,29 @@ def main():
                 admitted["source_commit"], commit,
             ],
         )
+
+        def source_authority_unchanged(phase):
+            rechecked_head = runner.run(
+                f"git-{phase}-head",
+                [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
+            ).stdout.decode().strip()
+            rechecked_status = runner.run(
+                f"git-{phase}-clean",
+                [commands["git"], "status", "--porcelain=v1", "--untracked-files=all"],
+            ).stdout
+            rechecked_remote = runner.run(
+                f"git-{phase}-published-main",
+                [
+                    commands["git"], "ls-remote", "--exit-code", "origin",
+                    "refs/heads/main",
+                ],
+                timeout=60,
+            ).stdout.decode().split()
+            return (
+                rechecked_head == commit
+                and not rechecked_status
+                and rechecked_remote == [published_main_commit, "refs/heads/main"]
+            )
 
         stage = "tool-authority"
         version_raw = runner.run("wrangler-version", [commands["wrangler"], "--version"]).stdout.decode()
@@ -1453,6 +1502,10 @@ def main():
                 or SHA256.fullmatch(previous_config_sha256 or "") is None
             ):
                 raise ContractFailure("previous gateway config is not healthy and observable")
+            if previous_config_sha256 != previous_gateway_config_sha256:
+                raise ContractFailure(
+                    "operator-supplied previous gateway config does not match the live deployment"
+                )
             previous_repository, previous_tag = split_cloudflare_image(previous_image, account_id)
             images = parse_images(wrangler(
                 "preflight-image-list", "containers", "images", "list", "--json",
@@ -1590,7 +1643,7 @@ def main():
             base_config,
             temporary_config,
             remote_image,
-            repository / "deploy/cloudflare/worker.js",
+            worker_entrypoint,
             api_hostname,
         )
         deploy_arguments = [
@@ -1605,29 +1658,67 @@ def main():
         if deployment_secrets is None:
             raise ContractFailure("deployment secrets were not materialized")
         deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
-        rechecked_head = runner.run(
-            "git-predeploy-head",
-            [commands["git"], "rev-parse", "--verify", "HEAD^{commit}"],
-        ).stdout.decode().strip()
-        rechecked_status = runner.run(
-            "git-predeploy-clean",
-            [commands["git"], "status", "--porcelain=v1", "--untracked-files=all"],
-        ).stdout
-        rechecked_remote = runner.run(
-            "git-predeploy-published-main",
-            [
-                commands["git"], "ls-remote", "--exit-code", "origin",
-                "refs/heads/main",
-            ],
-            timeout=60,
-        ).stdout.decode().split()
-        if (
-            rechecked_head != commit
-            or rechecked_status
-            or rechecked_remote
-            != [published_main_commit, "refs/heads/main"]
-        ):
+        stage = "source-authority-recheck"
+        if not source_authority_unchanged("predeploy"):
             raise ContractFailure("source authority changed before deployment")
+        if not bootstrap:
+            stage = "rollback-anchor-recheck"
+            rechecked_worker = parse_active_worker(wrangler(
+                "predeploy-previous-worker-status",
+                "deployments", "status", "--name", WORKER, "--json",
+            ).stdout)
+            rechecked_image, rechecked_app_version = parse_application(
+                wrangler(
+                    "predeploy-previous-container-info",
+                    "containers", "info", application_id, "--json",
+                ).stdout,
+                application_id,
+                account_id,
+            )
+            (
+                rechecked_health_status,
+                rechecked_health_ready,
+                rechecked_config_sha256,
+            ) = probe_health("predeploy-anchor", 1)
+            rechecked_images = parse_images(wrangler(
+                "predeploy-previous-image-list",
+                "containers", "images", "list", "--json",
+            ).stdout)
+            if (
+                rechecked_worker != previous["worker_version_id"]
+                or rechecked_image != previous["image"]
+                or rechecked_app_version != previous["application_version"]
+                or rechecked_health_status != 200
+                or not rechecked_health_ready
+                or rechecked_config_sha256 != previous["config_sha256"]
+                or previous_tag not in rechecked_images.get(previous_repository, set())
+            ):
+                raise ContractFailure("rollback anchor changed before deployment")
+            rollback_config = scratch / "rollback-wrangler.jsonc"
+            make_deploy_config(
+                base_config,
+                rollback_config,
+                previous["image"],
+                worker_entrypoint,
+                api_hostname,
+            )
+            rollback_secrets = scratch / "rollback-secrets.json"
+            write_private(rollback_secrets, canonical_json({
+                "MILK_CARTON_CONFIG_JSON": previous_gateway_config_raw.decode("utf-8"),
+            }))
+            os.chmod(rollback_config, 0o400)
+            os.chmod(rollback_secrets, 0o400)
+            rollback_config_sha256 = digest(read_regular(
+                rollback_config, "rollback deploy config", 65536,
+            ))
+            rollback_secrets_sha256 = digest(read_regular(
+                rollback_secrets, "rollback deploy secrets", 65536,
+            ))
+            if digest(read_regular(
+                worker_entrypoint, "Worker entrypoint", 262144,
+            )) != worker_source_sha256:
+                raise ContractFailure("Worker entrypoint changed before deployment")
+        stage = "worker-deploy"
         deploy_started = True
         try:
             wrangler(
@@ -1781,32 +1872,89 @@ def main():
                 pass
         elif deploy_started and previous is not None:
             outcome = "rollback_failed"
-            rollback_command_succeeded = False
+            resource_restore_command_succeeded = False
+            resource_restore_accepted = False
+            rollback_inputs_verified = False
+            worker_rollback_command_succeeded = False
             rollback_accepted = False
+            rollback_app_version = None
             try:
-                stage = "automatic-rollback"
+                stage = "automatic-resource-restore"
+                if (
+                    rollback_config is None
+                    or rollback_config_sha256 is None
+                    or rollback_secrets is None
+                    or rollback_secrets_sha256 is None
+                    or worker_source_sha256 is None
+                    or digest(read_regular(
+                        rollback_config, "rollback deploy config", 65536,
+                    )) != rollback_config_sha256
+                    or digest(read_regular(
+                        rollback_secrets, "rollback deploy secrets", 65536,
+                    )) != rollback_secrets_sha256
+                    or digest(read_regular(
+                        worker_entrypoint, "Worker entrypoint", 262144,
+                    )) != worker_source_sha256
+                ):
+                    raise ContractFailure("staged rollback inputs changed")
+                rollback_inputs_verified = True
                 wrangler(
-                    "rollback-worker", "rollback", previous["worker_version_id"], "--name", WORKER,
-                    "--message", f"milk automatic rollback {operation_id}", "--yes", timeout=300,
+                    "restore-previous-image-and-config",
+                    "deploy", "--strict", "--containers-rollout", "immediate",
+                    "--message", f"milk automatic resource restore {operation_id}",
+                    "--secrets-file", str(rollback_secrets),
+                    timeout=900, sensitive=True, config=rollback_config,
                 )
-                rollback_command_succeeded = True
-                _, _, rollback_app_version = poll(
-                    "rollback", previous["image"], previous["worker_version_id"], False,
-                    previous["config_sha256"],
-                )
-                rollback_accepted = True
-                outcome = "deployment_failed_rolled_back"
+                resource_restore_command_succeeded = True
             except BaseException:
-                rollback_app_version = None
+                pass
+            finally:
+                if rollback_secrets is not None:
+                    rollback_secrets.unlink(missing_ok=True)
+                if rollback_config is not None:
+                    rollback_config.unlink(missing_ok=True)
+            if rollback_inputs_verified:
+                try:
+                    stage = "automatic-resource-restore-acceptance"
+                    poll(
+                        "resource-restore", previous["image"], None, False,
+                        previous["config_sha256"],
+                    )
+                    resource_restore_accepted = True
+                except BaseException:
+                    pass
+            if resource_restore_accepted:
+                try:
+                    stage = "automatic-worker-rollback"
+                    wrangler(
+                        "rollback-worker", "rollback", previous["worker_version_id"], "--name", WORKER,
+                        "--message", f"milk automatic rollback {operation_id}", "--yes", timeout=300,
+                    )
+                    worker_rollback_command_succeeded = True
+                except BaseException:
+                    pass
+                try:
+                    stage = "automatic-rollback-acceptance"
+                    _, _, rollback_app_version = poll(
+                        "rollback", previous["image"], previous["worker_version_id"], False,
+                        previous["config_sha256"],
+                    )
+                    rollback_accepted = True
+                    outcome = "deployment_failed_rolled_back"
+                except BaseException:
+                    pass
             rollback_observation = {
-                "schema_version": "milk.private-gateway-rollback.v1",
+                "schema_version": "milk.private-gateway-rollback.v2",
                 "operation_id": operation_id,
                 "previous_worker_version_id": previous["worker_version_id"],
                 "previous_image": previous["image"],
                 "previous_gateway_config_sha256": previous["config_sha256"],
                 "application_id": application_id,
                 "application_version": rollback_app_version,
-                "command_succeeded": rollback_command_succeeded,
+                "rollback_inputs_verified": rollback_inputs_verified,
+                "resource_restore_command_succeeded": resource_restore_command_succeeded,
+                "resource_restore_accepted": resource_restore_accepted,
+                "worker_rollback_command_succeeded": worker_rollback_command_succeeded,
                 "accepted": rollback_accepted,
             }
         try:

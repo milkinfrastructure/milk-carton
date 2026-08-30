@@ -42,6 +42,8 @@ SMOKE_GATEWAY_CONFIG["traffic_keys"] = [{
     "api_key_sha256": sha256(SMOKE_API_KEY.encode()),
     "capture_allowed": False,
 }]
+PREVIOUS_GATEWAY_CONFIG = dict(SMOKE_GATEWAY_CONFIG)
+PREVIOUS_GATEWAY_CONFIG["scope_id"] = "00000000-0000-4000-8000-000000000011"
 BOOTSTRAP_SECRETS = {
     "MILK_CARTON_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
     "MILK_CARTON_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
@@ -228,7 +230,10 @@ if name == "git":
     elif args[:2] == ["rev-parse", "--verify"]:
         print(state["commit"])
     elif args[:2] == ["status", "--porcelain=v1"]:
-        if state["mode"] == "dirty":
+        if state["mode"] == "dirty" or (
+            state["mode"] == "rollback_source_dirty"
+            and state["active_image"] != state["previous_image"]
+        ):
             print(" M deploy/cloudflare/wrangler.jsonc")
     elif args[:3] == ["remote", "get-url", "origin"]:
         print("https://github.com/milkinfrastructure/milk-carton.git")
@@ -244,7 +249,11 @@ if name == "git":
     done()
 
 if name == "node":
-    if state["mode"] in {"sdk_fail", "bootstrap_sdk_fail", "bootstrap_cleanup_fail"}:
+    if state["mode"] in {
+        "sdk_fail", "resource_restore_fail", "rollback_source_dirty",
+        "rollback_input_tamper", "bootstrap_sdk_fail",
+        "bootstrap_cleanup_fail",
+    }:
         done(70)
     credential = json.loads(Path(args[-1]).read_text())
     proof_contract = {
@@ -294,7 +303,10 @@ if name == "sleep":
 
 if name == "curl":
     output = Path(args[args.index("--output") + 1])
-    failed = state["mode"] in {"health_fail", "rollback_fail"} and state["deployment"] == "deployed"
+    failed = (
+        state["mode"] in {"health_fail", "rollback_fail"}
+        and state["active_image"] != state["previous_image"]
+    )
     output.write_text(json.dumps({
         "config_sha256": state["active_config_sha256"],
         "provider": "uncontrolled",
@@ -364,8 +376,7 @@ if name == "wrangler":
     elif values[:2] == ["secret", "bulk"]:
         done(2)
     elif values[:2] == ["deployments", "status"]:
-        version = state["previous_worker"] if state["deployment"] in {"initial", "rollback"} else state["current_worker"]
-        print(json.dumps({"id": "deployment", "source": "api", "strategy": "percentage", "versions": [{"percentage": 100, "version_id": version}]}))
+        print(json.dumps({"id": "deployment", "source": "api", "strategy": "percentage", "versions": [{"percentage": 100, "version_id": state["active_worker"]}]}))
     elif values[:2] == ["containers", "list"]:
         present = (
             not state.get("bootstrap", False)
@@ -382,15 +393,16 @@ if name == "wrangler":
             })
         print(json.dumps(values))
     elif values[:2] == ["containers", "info"]:
-        if state["deployment"] in {"deployed", "partial"}:
-            image, version = state["target_image"], 8
-        elif state["deployment"] == "rollback":
-            image, version = state["previous_image"], 9
-        else:
-            image, version = state["previous_image"], 7
+        state["container_info_calls"] = state.get("container_info_calls", 0) + 1
+        if state["mode"] == "anchor_drift" and state["container_info_calls"] == 2:
+            state["active_image"] = (
+                f"registry.cloudflare.com/{state['account']}/legacy-gateway:drifted"
+            )
+            state["application_version"] += 1
         print(json.dumps({
             "id": state["application"], "account_id": state["account"], "name": state["application_name"],
-            "version": version, "configuration": {"image": image},
+            "version": state["application_version"],
+            "configuration": {"image": state["active_image"]},
         }))
     elif values[:3] == ["containers", "images", "list"]:
         milk_tags = list(state.get("milk_tags", []))
@@ -417,7 +429,7 @@ if name == "wrangler":
         if "--secrets-file" not in values:
             done(2)
         secrets_path = Path(values[values.index("--secrets-file") + 1])
-        if secrets_path.stat().st_mode & 0o777 != 0o600:
+        if secrets_path.stat().st_mode & 0o777 not in {0o400, 0o600}:
             done(2)
         supplied = json.loads(secrets_path.read_text())
         state["deployment_secrets_path"] = str(secrets_path)
@@ -440,24 +452,46 @@ if name == "wrangler":
             if set(supplied) != {"MILK_CARTON_CONFIG_JSON"}:
                 done(2)
         state["deployed_secret_names"] = sorted(supplied)
-        state["active_config_sha256"] = hashlib.sha256(
+        supplied_config_sha256 = hashlib.sha256(
             supplied["MILK_CARTON_CONFIG_JSON"].encode()
         ).hexdigest()
-        if state["mode"] == "config_mismatch":
+        restoring = state["target_image"] == state["previous_image"]
+        state.setdefault("deployments", []).append({
+            "config_sha256": supplied_config_sha256,
+            "image": state["target_image"],
+            "restoring": restoring,
+        })
+        restore_failed = state["mode"] == "resource_restore_fail" and restoring
+        if restore_failed:
+            done(1)
+        state["active_worker"] = state["current_worker"]
+        state["active_image"] = state["target_image"]
+        state["active_config_sha256"] = supplied_config_sha256
+        state["application_version"] += 1
+        if state["mode"] == "rollback_input_tamper" and not restoring:
+            rollback_secrets = config_path.parent / "rollback-secrets.json"
+            rollback_secrets.chmod(0o600)
+            rollback_secrets.write_text("{}\n")
+            rollback_secrets.chmod(0o400)
+        if state["mode"] == "config_mismatch" and not restoring:
             state["active_config_sha256"] = "0" * 64
-        state["deployment"] = "partial" if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"} else "deployed"
-        if state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"}:
+        target_failed = (
+            state["mode"] in {"deploy_fail", "bootstrap_deploy_fail"}
+            and not restoring
+        )
+        state["deployment"] = "partial" if target_failed else "deployed"
+        if target_failed:
             done(1)
     elif values and values[0] == "rollback":
         if state["mode"] == "rollback_fail":
             done(1)
+        state["active_worker"] = state["previous_worker"]
         state["deployment"] = "rollback"
-        state["active_config_sha256"] = state["previous_config_sha256"]
     elif values[:2] == ["containers", "instances"]:
-        version = 9 if state["deployment"] == "rollback" else 8
         print(json.dumps([{
             "id": "33333333-3333-3333-3333-333333333333", "state": "running",
-            "location": "sfo06", "version": version, "created": "2026-08-27T00:00:00Z",
+            "location": "sfo06", "version": state["application_version"],
+            "created": "2026-08-27T00:00:00Z",
         }]))
     elif values[:2] == ["containers", "delete"]:
         if state["mode"] == "bootstrap_cleanup_fail":
@@ -492,8 +526,11 @@ class Fixture:
             "previous_worker": PREVIOUS_WORKER,
             "current_worker": CURRENT_WORKER,
             "previous_image": PREVIOUS_IMAGE,
-            "previous_config_sha256": "9" * 64,
-            "active_config_sha256": "9" * 64,
+            "previous_config_sha256": sha256(canonical(PREVIOUS_GATEWAY_CONFIG)),
+            "active_config_sha256": sha256(canonical(PREVIOUS_GATEWAY_CONFIG)),
+            "active_worker": PREVIOUS_WORKER,
+            "active_image": PREVIOUS_IMAGE,
+            "application_version": 7,
             "deployment": "initial",
             "remote_manifest": remote_manifest,
             "child_sha": child_sha,
@@ -526,6 +563,9 @@ class Fixture:
         self.gateway_config = self.root / "gateway-config.json"
         self.gateway_config.write_bytes(canonical(SMOKE_GATEWAY_CONFIG))
         self.gateway_config.chmod(0o600)
+        self.previous_gateway_config = self.root / "previous-gateway-config.json"
+        self.previous_gateway_config.write_bytes(canonical(PREVIOUS_GATEWAY_CONFIG))
+        self.previous_gateway_config.chmod(0o600)
         self.bootstrap_secrets = self.root / "bootstrap-secrets.json"
         self.bootstrap_secrets.write_bytes(canonical({
             "schema_version": "milk.gateway-bootstrap-secrets.v1",
@@ -550,6 +590,7 @@ class Fixture:
         ]
         arguments = [
             str(script), *( ["--wrangler-oauth"] if wrangler_oauth else [] ), *registry_arguments,
+            "--previous-gateway-config-file", str(self.previous_gateway_config),
             str(self.release), APPLICATION, str(self.evidence),
             str(self.credential), str(self.gateway_config), API_BASE_URL,
         ]
@@ -663,6 +704,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         arguments = [
             str(SCRIPT), "--wrangler-oauth", "--registry-token-file", str(fixture.registry_token),
+            "--previous-gateway-config-file", str(fixture.previous_gateway_config),
             str(fixture.release), APPLICATION, str(fixture.evidence), str(fixture.credential),
             str(fixture.gateway_config), API_BASE_URL,
         ]
@@ -714,6 +756,56 @@ class DeployPrivateGatewayTests(unittest.TestCase):
                 self.assertIn(b"not an exact non-capturable traffic key", result.stderr)
                 self.assertFalse(fixture.evidence.exists())
                 self.assertEqual(fixture.state["commands"], [])
+
+    def test_nonbootstrap_requires_operator_supplied_previous_config(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        arguments = [
+            str(SCRIPT), "--registry-token-file", str(fixture.registry_token),
+            str(fixture.release), APPLICATION, str(fixture.evidence),
+            str(fixture.credential), str(fixture.gateway_config), API_BASE_URL,
+        ]
+        result = subprocess.run(
+            arguments, cwd=ROOT, env=fixture.environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"--previous-gateway-config-file", result.stderr)
+        self.assertFalse(fixture.evidence.exists())
+        self.assertEqual(fixture.state["commands"], [])
+
+    def test_previous_config_must_match_live_digest_before_mutation(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        changed = json.loads(fixture.previous_gateway_config.read_text())
+        changed["capture_basis_points"] += 1
+        fixture.previous_gateway_config.write_bytes(canonical(changed))
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"predeploy_failed at rollback-anchor", result.stderr)
+        self.assertFalse(any(
+            item["command"] == "wrangler"
+            and any(value in item["arguments"] for value in ("push", "deploy", "rollback"))
+            for item in fixture.state["commands"]
+        ))
+        self.assertEqual(fixture.terminal()["outcome"], "predeploy_failed")
+        self.assertEqual(fixture.terminal()["failure_stage"], "rollback-anchor")
+
+    def test_rollback_anchor_is_rechecked_immediately_before_deploy(self):
+        fixture = Fixture("anchor_drift")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(
+            item["command"] == "wrangler"
+            and any(value in item["arguments"] for value in ("deploy", "rollback"))
+            for item in fixture.state["commands"]
+        ))
+        self.assertEqual(fixture.terminal()["outcome"], "predeploy_failed")
+        self.assertEqual(
+            fixture.terminal()["failure_stage"],
+            "rollback-anchor-recheck",
+        )
 
     def test_success_uses_only_admitted_prebuilt_image_and_content_free_evidence(self):
         fixture = Fixture()
@@ -910,14 +1002,46 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         result = fixture.run()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(fixture.state["deployment"], "rollback")
+        self.assertEqual(fixture.state["active_worker"], PREVIOUS_WORKER)
+        self.assertEqual(fixture.state["active_image"], PREVIOUS_IMAGE)
+        self.assertEqual(
+            fixture.state["active_config_sha256"],
+            fixture.state["previous_config_sha256"],
+        )
+        deployments = fixture.state["deployments"]
+        self.assertEqual(len(deployments), 2)
+        self.assertIs(deployments[0]["restoring"], False)
+        self.assertEqual(deployments[1], {
+            "config_sha256": fixture.state["previous_config_sha256"],
+            "image": PREVIOUS_IMAGE,
+            "restoring": True,
+        })
+        wrangler_mutations = [
+            item["arguments"]
+            for item in fixture.state["commands"]
+            if item["command"] == "wrangler"
+            and any(value in item["arguments"] for value in ("deploy", "rollback"))
+        ]
+        self.assertEqual(
+            ["deploy" if "deploy" in arguments else "rollback" for arguments in wrangler_mutations],
+            ["deploy", "deploy", "rollback"],
+        )
         rollback = json.loads((fixture.evidence / "rollback.json").read_text())
-        self.assertIs(rollback["command_succeeded"], True)
+        self.assertEqual(rollback["schema_version"], "milk.private-gateway-rollback.v2")
+        self.assertIs(rollback["rollback_inputs_verified"], True)
+        self.assertIs(rollback["resource_restore_command_succeeded"], True)
+        self.assertIs(rollback["resource_restore_accepted"], True)
+        self.assertIs(rollback["worker_rollback_command_succeeded"], True)
         self.assertIs(rollback["accepted"], True)
         self.assertEqual(
             rollback["previous_gateway_config_sha256"],
             fixture.state["previous_config_sha256"],
         )
         self.assertFalse(Path(fixture.state["deployment_secrets_path"]).exists())
+        evidence_raw = b"".join(
+            path.read_bytes() for path in fixture.evidence.rglob("*") if path.is_file()
+        )
+        self.assertNotIn(fixture.previous_gateway_config.read_bytes(), evidence_raw)
         self.assertEqual(fixture.terminal()["outcome"], "deployment_failed_rolled_back")
 
     def test_official_sdk_smoke_failure_rolls_back(self):
@@ -948,9 +1072,69 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         result = fixture.run()
         self.assertNotEqual(result.returncode, 0)
         rollback = json.loads((fixture.evidence / "rollback.json").read_text())
-        self.assertIs(rollback["command_succeeded"], False)
+        self.assertIs(rollback["resource_restore_command_succeeded"], True)
+        self.assertIs(rollback["resource_restore_accepted"], True)
+        self.assertIs(rollback["worker_rollback_command_succeeded"], False)
         self.assertIs(rollback["accepted"], False)
         self.assertEqual(fixture.terminal()["outcome"], "rollback_failed")
+
+    def test_failed_resource_restore_does_not_expose_old_worker_to_new_resources(self):
+        fixture = Fixture("resource_restore_fail")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        rollback = json.loads((fixture.evidence / "rollback.json").read_text())
+        self.assertIs(rollback["rollback_inputs_verified"], True)
+        self.assertIs(rollback["resource_restore_command_succeeded"], False)
+        self.assertIs(rollback["resource_restore_accepted"], False)
+        self.assertIs(rollback["worker_rollback_command_succeeded"], False)
+        self.assertIs(rollback["accepted"], False)
+        self.assertEqual(fixture.state["active_worker"], CURRENT_WORKER)
+        self.assertNotEqual(fixture.state["active_image"], PREVIOUS_IMAGE)
+        self.assertNotEqual(
+            fixture.state["active_config_sha256"],
+            fixture.state["previous_config_sha256"],
+        )
+        self.assertEqual(fixture.terminal()["outcome"], "rollback_failed")
+
+    def test_staged_rollback_input_tamper_fails_closed_without_git(self):
+        fixture = Fixture("rollback_input_tamper")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        rollback = json.loads((fixture.evidence / "rollback.json").read_text())
+        self.assertIs(rollback["rollback_inputs_verified"], False)
+        self.assertIs(rollback["resource_restore_command_succeeded"], False)
+        self.assertIs(rollback["resource_restore_accepted"], False)
+        self.assertIs(rollback["worker_rollback_command_succeeded"], False)
+        self.assertIs(rollback["accepted"], False)
+        self.assertEqual(len(fixture.state["deployments"]), 1)
+        self.assertEqual(fixture.terminal()["outcome"], "rollback_failed")
+
+    def test_postmutation_repo_drift_does_not_block_staged_rollback(self):
+        fixture = Fixture("rollback_source_dirty")
+        self.addCleanup(fixture.close)
+        result = fixture.run()
+        self.assertNotEqual(result.returncode, 0)
+        rollback = json.loads((fixture.evidence / "rollback.json").read_text())
+        self.assertIs(rollback["rollback_inputs_verified"], True)
+        self.assertIs(rollback["resource_restore_command_succeeded"], True)
+        self.assertIs(rollback["resource_restore_accepted"], True)
+        self.assertIs(rollback["worker_rollback_command_succeeded"], True)
+        self.assertIs(rollback["accepted"], True)
+        commands = fixture.state["commands"]
+        deploy_index = next(
+            index for index, item in enumerate(commands)
+            if item["command"] == "wrangler" and "deploy" in item["arguments"]
+        )
+        self.assertFalse(any(
+            item["command"] == "git" for item in commands[deploy_index + 1:]
+        ))
+        self.assertEqual(len(fixture.state["deployments"]), 2)
+        self.assertEqual(
+            fixture.terminal()["outcome"],
+            "deployment_failed_rolled_back",
+        )
 
     def test_existing_target_tag_fails_before_registry_or_deploy_mutation(self):
         fixture = Fixture("collision")
