@@ -84,7 +84,7 @@ function client(routeRevision = revision, routeTarget = "candidate", includeReas
                   headers: new Headers({
                     "x-milk-artifact-sha256": digest("2"),
                     "x-milk-candidate-sha256": digest("3"),
-                    "x-milk-capture-intent": "selected",
+                    "x-milk-capture-intent": target === "openai" ? "not_selected" : "selected",
                     "x-milk-deployment-sha256": digest("4"),
                     "x-milk-route-revision": routeRevision,
                     "x-milk-route-target": target,
@@ -148,7 +148,7 @@ assert.equal(baseline.max_completion_tokens, 256);
 assert.equal(baseline.proof_contract_sha256, productionProofSha256);
 assert.equal(baseline.authenticated, true);
 assert.equal(baseline.content_retained, false);
-assert.equal(baseline.capture_intent, "selected");
+assert.equal(baseline.capture_intent, "not_selected");
 assert.equal(baseline.route_revision, "openai-baseline-v1");
 assert.equal(baseline.route_target, "openai");
 assert.equal(baseline.trace_id, "00000000-0000-7000-8000-000000000001");

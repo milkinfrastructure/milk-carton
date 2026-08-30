@@ -274,7 +274,7 @@ if name == "node":
         "authenticated": True,
         "baseline_request_count": 1,
         "candidate_request_count": 0,
-        "capture_intent": "selected",
+        "capture_intent": "not_selected",
         "choice_count": 1,
         "content_retained": False,
         "endpoint_sha256": "6" * 64,

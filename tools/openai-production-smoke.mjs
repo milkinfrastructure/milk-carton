@@ -324,7 +324,7 @@ export async function runBaselineSmoke(client, endpoint, credential) {
   const routeRevision = response.headers.get("x-milk-route-revision");
   const routeTarget = response.headers.get("x-milk-route-target");
   const traceId = response.headers.get("x-milk-trace-id");
-  assert.equal(captureIntent, "selected");
+  assert.equal(captureIntent, "not_selected");
   assert.equal(routeRevision, "openai-baseline-v1");
   assert.equal(routeTarget, "openai");
   assert.match(traceId ?? "", UUID_V7);

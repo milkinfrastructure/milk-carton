@@ -1813,7 +1813,7 @@ def main():
             or sdk_smoke["authenticated"] is not True
             or sdk_smoke["succeeded"] is not True
             or sdk_smoke["content_retained"] is not False
-            or sdk_smoke["capture_intent"] != "selected"
+            or sdk_smoke["capture_intent"] != "not_selected"
             or sdk_smoke["route_revision"] != "openai-baseline-v1"
             or sdk_smoke["route_target"] != "openai"
             or UUID_V7.fullmatch(sdk_smoke["trace_id"] or "") is None
