@@ -197,6 +197,7 @@ from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 state_path = Path(sys.argv[0]).resolve().parent.parent / "state.json"
+oauth = (state_path.parent / "wrangler-oauth").is_file()
 state = json.loads(state_path.read_text())
 state.setdefault("commands", []).append({"command": name, "arguments": args})
 
@@ -207,7 +208,7 @@ def done(code=0):
 def transition():
     state["worker"] = state["future_workers"].pop(0)
 
-if state.get("oauth"):
+if oauth:
     if "CLOUDFLARE_API_TOKEN" in os.environ:
         done(90)
 else:
@@ -284,12 +285,7 @@ if name == "curl":
     prefix = b"Authorization: Bearer "
     if not authorization.startswith(prefix) or not authorization.endswith(b"\n"):
         done(94)
-    admin_sha256 = hashlib.sha256(authorization[len(prefix):-1]).hexdigest()
-    allowed_admin_sha256s = {
-        hashlib.sha256(b"milk_admin_" + b"A" * 48).hexdigest(),
-        hashlib.sha256(b'milk_admin_"\\' + b"A" * 40).hexdigest(),
-    }
-    if admin_sha256 not in allowed_admin_sha256s:
+    if hashlib.sha256(authorization[len(prefix):-1]).hexdigest() != state["admin_sha256"]:
         done(95)
     expected = next(value.split(": ", 1)[1] for value in args if value.startswith("x-milk-candidate-api-key-sha256: "))
     operation = next(value.split(": ", 1)[1] for value in args if value.startswith("x-milk-candidate-operation: "))
@@ -338,6 +334,9 @@ class Fixture:
     def __init__(self, mode="success", candidate_installed=False, worker=PREVIOUS_WORKER, oauth=False):
         self.temporary = tempfile.TemporaryDirectory(prefix="milk-candidate-helper-test.")
         self.root = Path(self.temporary.name)
+        self.oauth = oauth
+        if oauth:
+            (self.root / "wrangler-oauth").touch(mode=0o600)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         fake = self.bin / "fake-command"
@@ -349,6 +348,7 @@ class Fixture:
         self.state_path = self.root / "state.json"
         self.state_path.write_text(json.dumps({
             "account": ACCOUNT,
+            "admin_sha256": hashlib.sha256(ADMIN_KEY.encode()).hexdigest(),
             "application": APPLICATION,
             "application_version": 7,
             "candidate_installed": candidate_installed,
@@ -358,7 +358,6 @@ class Fixture:
             "future_workers": [INSTALLED_WORKER, REMOVED_WORKER],
             "image": IMAGE,
             "mode": mode,
-            "oauth": oauth,
             "worker": worker,
         }, sort_keys=True))
 
@@ -388,7 +387,7 @@ class Fixture:
             "PATH": f"{self.bin}:{os.environ['PATH']}",
         }
         arguments = []
-        if self.state["oauth"]:
+        if self.oauth:
             environment["HOME"] = str(self.root / "oauth-home")
             arguments.append("--wrangler-oauth")
         else:
@@ -710,6 +709,9 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         fixture = Fixture()
         self.addCleanup(fixture.close)
         admin = ('milk_admin_"\\' + "A" * 40).encode()
+        state = fixture.state
+        state["admin_sha256"] = hashlib.sha256(admin).hexdigest()
+        fixture.state_path.write_text(json.dumps(state, sort_keys=True))
         code, response, stdout, stderr = fixture.transact(
             candidate_frame(), admin=admin
         )
