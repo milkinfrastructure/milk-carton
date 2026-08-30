@@ -73,9 +73,11 @@ const receipt = await runCaptureProof({
   endpoint: new URL("http://127.0.0.1:1/v1"), credential,
   targetScopeId: target, sentinelScopeIds: [sentinel], listScope, readStats,
   invalidRequest, workload,
+  waitBeforeBaseline: async () => { events.push("waitBaseline"); },
   waitAfter401: async () => { events.push("wait401"); phase = "after401"; },
   waitForStats: async () => { events.push("waitStats"); phase = "valid"; },
 });
+assert.ok(events.indexOf("waitBaseline") < events.findIndex((event) => event.startsWith("list:")));
 assert.ok(events.indexOf("invalid") < events.indexOf("wait401"));
 assert.ok(events.indexOf("wait401") < events.indexOf("workload"));
 assert.ok(events.indexOf("workload") < events.indexOf("waitStats"));
