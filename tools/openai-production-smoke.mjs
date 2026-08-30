@@ -397,6 +397,65 @@ export async function runCandidateSmoke(client, endpoint, credential, expectedRo
   };
 }
 
+export async function runZeroRouteSmoke(
+  client,
+  endpoint,
+  credential,
+  expectedRouteRevision,
+) {
+  assert.match(expectedRouteRevision, SHA256);
+  const request = candidateRequest(credential);
+  const { data, response } = await client.chat.completions
+    .create(request)
+    .withResponse();
+  const responseRaw = JSON.stringify(data);
+  assert.ok(responseRaw.length > 0 && responseRaw.length <= MAX_RESPONSE_BYTES);
+  assert.equal(response.status, 200);
+  assert.equal(
+    response.headers.get("x-milk-route-revision"),
+    expectedRouteRevision,
+  );
+  assert.equal(response.headers.get("x-milk-route-target"), "openai");
+  for (const header of [
+    "x-milk-artifact-sha256",
+    "x-milk-candidate-sha256",
+    "x-milk-deployment-sha256",
+  ]) {
+    assert.equal(response.headers.get(header), null);
+  }
+  assert.equal(data.choices.length, 1);
+  assert.equal(typeof data.choices[0]?.message?.content, "string");
+  assert.ok(data.choices[0].message.content.length > 0);
+  return {
+    authenticated: true,
+    baseline_only: true,
+    baseline_request_count: 1,
+    candidate_identity_headers_absent: true,
+    candidate_request_count: 0,
+    choice_count: data.choices.length,
+    content_retained: false,
+    endpoint_sha256: sha256(endpoint.href),
+    finish_reason: data.choices[0].finish_reason,
+    http_status: response.status,
+    max_completion_tokens: PRODUCTION_PROOF.short_max_completion_tokens,
+    model: PRODUCTION_PROOF.model,
+    proof_contract_sha256: ROUTE_PROOF_SHA256,
+    proof_step: "zero_route",
+    request_sha256: sha256(canonical(request)),
+    response_bytes: Buffer.byteLength(responseRaw),
+    response_sha256: sha256(responseRaw),
+    route_revision: expectedRouteRevision,
+    route_target: "openai",
+    schema_version: "milk.official-openai-sdk-zero-route-smoke.v1",
+    sdk: "openai-node",
+    sdk_request_count: 1,
+    sdk_version: SDK_VERSION,
+    succeeded: true,
+    traffic_cohort_sha256: sha256(credential.cohort_id),
+    traffic_key_sha256: sha256(credential.api_key),
+  };
+}
+
 export async function runSaturationFallbackSmoke(
   client,
   endpoint,
@@ -678,7 +737,11 @@ async function main() {
     process.argv.length === 6 && process.argv[5] === "--generated-mechanics";
   const saturationFallback =
     process.argv.length >= 6 && process.argv[5] === "--saturation-fallback";
-  if (process.argv.length >= 6) assert.ok(generatedMechanics || saturationFallback);
+  const zeroRoute =
+    process.argv.length === 6 && process.argv[5] === "--zero-route";
+  if (process.argv.length >= 6) {
+    assert.ok(generatedMechanics || saturationFallback || zeroRoute);
+  }
   const candidateSessionIndex = process.argv.length === 7
     ? Number(process.argv[6])
     : null;
@@ -717,8 +780,10 @@ async function main() {
     maxRetries: 0,
     timeout: 120_000,
   });
-  const receipt = saturationFallback
-    ? await runSaturationFallbackSmoke(
+  const receipt = zeroRoute
+    ? await runZeroRouteSmoke(client, endpoint, credential, process.argv[4])
+    : saturationFallback
+      ? await runSaturationFallbackSmoke(
         client,
         endpoint,
         credential,

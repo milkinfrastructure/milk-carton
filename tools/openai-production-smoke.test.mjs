@@ -9,6 +9,7 @@ import {
   runCandidateSmoke,
   runGeneratedMechanics,
   runSaturationFallbackSmoke,
+  runZeroRouteSmoke,
   saturationRequest,
 } from "./openai-production-smoke.mjs";
 
@@ -170,6 +171,84 @@ await assert.rejects(
     revision,
   ),
 );
+
+function zeroRouteClient({
+  identityHeader = null,
+  routeRevision = revision,
+  routeTarget = "openai",
+  status = 200,
+} = {}) {
+  return {
+    chat: {
+      completions: {
+        create(request, options) {
+          assert.deepEqual(request, candidateRequest(credential));
+          assert.equal(options, undefined);
+          const headers = new Headers({
+            "x-milk-route-revision": routeRevision,
+            "x-milk-route-target": routeTarget,
+          });
+          if (identityHeader !== null) headers.set(identityHeader, digest("2"));
+          return {
+            async withResponse() {
+              return { data, response: { headers, status } };
+            },
+          };
+        },
+      },
+    },
+  };
+}
+
+const zeroRoute = await runZeroRouteSmoke(
+  zeroRouteClient(),
+  new URL("https://carton.example/v1"),
+  credential,
+  revision,
+);
+assert.equal(zeroRoute.schema_version, "milk.official-openai-sdk-zero-route-smoke.v1");
+assert.equal(zeroRoute.proof_step, "zero_route");
+assert.equal(zeroRoute.model, PRODUCTION_PROOF.model);
+assert.equal(zeroRoute.sdk_request_count, 1);
+assert.equal(zeroRoute.baseline_request_count, 1);
+assert.equal(zeroRoute.candidate_request_count, 0);
+assert.equal(zeroRoute.max_completion_tokens, 256);
+assert.equal(zeroRoute.proof_contract_sha256, routeProofSha256);
+assert.equal(zeroRoute.route_revision, revision);
+assert.equal(zeroRoute.route_target, "openai");
+assert.equal(zeroRoute.baseline_only, true);
+assert.equal(zeroRoute.candidate_identity_headers_absent, true);
+assert.equal(zeroRoute.authenticated, true);
+assert.equal(zeroRoute.content_retained, false);
+assert.match(zeroRoute.response_sha256, /^[0-9a-f]{64}$/);
+for (const identityHeader of [
+  "x-milk-artifact-sha256",
+  "x-milk-candidate-sha256",
+  "x-milk-deployment-sha256",
+]) {
+  await assert.rejects(
+    runZeroRouteSmoke(
+      zeroRouteClient({ identityHeader }),
+      new URL("https://carton.example/v1"),
+      credential,
+      revision,
+    ),
+  );
+}
+for (const invalidClient of [
+  zeroRouteClient({ routeRevision: digest("5") }),
+  zeroRouteClient({ routeTarget: "candidate" }),
+  zeroRouteClient({ status: 503 }),
+]) {
+  await assert.rejects(
+    runZeroRouteSmoke(
+      invalidClient,
+      new URL("https://carton.example/v1"),
+      credential,
+      revision,
+    ),
+  );
+}
 
 assert.deepEqual(saturationRequest(credential), {
   max_completion_tokens: 3_840,
