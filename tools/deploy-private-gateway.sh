@@ -848,7 +848,7 @@ def validate_bootstrap_secrets(path, repository, materialize=False):
     return secret_input, digest(raw), set(secrets_value), gateway_config_raw, gateway_config
 
 
-def validate_smoke_credential(path, gateway_config):
+def validate_smoke_credential(path, gateway_config=None):
     raw = read_regular(path, "gateway credential", 8192)
     credential = parse_json(raw, "gateway credential", 8192)
     require_keys(credential, {"api_key", "cohort_id", "model"}, "gateway credential")
@@ -871,6 +871,8 @@ def validate_smoke_credential(path, gateway_config):
     ):
         raise DeployFailure("gateway credential is invalid")
     api_key_sha256 = digest(api_key.encode())
+    if gateway_config is None:
+        return api_key_sha256, digest(credential["cohort_id"].encode())
     matches = [
         traffic_key
         for traffic_key in gateway_config["traffic_keys"]
@@ -959,6 +961,7 @@ def main():
     registry_token_file = None
     registry_token_stdin = False
     previous_gateway_config_file = None
+    preserve_existing_config_sha256 = None
     wrangler_oauth = False
     deployment_target = None
     while arguments and arguments[0].startswith("--") and arguments[0] != "--bootstrap":
@@ -973,6 +976,14 @@ def main():
             registry_token_stdin = True
         elif option == "--previous-gateway-config-file" and arguments and previous_gateway_config_file is None:
             previous_gateway_config_file = Path(arguments.pop(0))
+        elif (
+            option == "--preserve-existing-config-sha256"
+            and arguments
+            and preserve_existing_config_sha256 is None
+        ):
+            preserve_existing_config_sha256 = arguments.pop(0)
+            if SHA256.fullmatch(preserve_existing_config_sha256) is None:
+                raise DeployFailure("preserved gateway config SHA-256 is invalid")
         else:
             raise DeployFailure("unsupported or duplicate deploy option")
     selected_target = deployment_target or "production"
@@ -982,12 +993,21 @@ def main():
     if registry_token_file is None and not registry_token_stdin:
         raise DeployFailure("registry credential input must be selected exactly once")
     bootstrap = len(arguments) == 6 and arguments[0] == "--bootstrap"
+    preserve_existing_config = preserve_existing_config_sha256 is not None
     if (
-        (bootstrap and previous_gateway_config_file is not None)
-        or (not bootstrap and (len(arguments) != 6 or previous_gateway_config_file is None))
+        (bootstrap and (
+            previous_gateway_config_file is not None or preserve_existing_config
+        ))
+        or (preserve_existing_config and (
+            len(arguments) != 5 or previous_gateway_config_file is not None
+        ))
+        or (not bootstrap and not preserve_existing_config and (
+            len(arguments) != 6 or previous_gateway_config_file is None
+        ))
     ):
         raise DeployFailure(
             "usage: deploy-private-gateway.sh [--target production|mechanics] [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --previous-gateway-config-file ABSOLUTE_FILE RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
+            "       deploy-private-gateway.sh [--target production|mechanics] [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --preserve-existing-config-sha256 SHA256 RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE API_BASE_URL\n"
             "       deploy-private-gateway.sh [--target production|mechanics] [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
         )
     api_base_url, api_hostname, health_url = validate_api_base_url(arguments.pop())
@@ -1015,6 +1035,13 @@ def main():
             gateway_config_raw,
             gateway_config,
         ) = validate_bootstrap_secrets(bootstrap_secrets_path, repository)
+    elif preserve_existing_config:
+        release_directory = Path(arguments[0]).resolve(strict=True)
+        application_id = arguments[1]
+        requested_evidence = Path(arguments[2])
+        credential_file = Path(arguments[3])
+        gateway_config = None
+        expected_bootstrap_secret_names = None
     else:
         release_directory = Path(arguments[0]).resolve(strict=True)
         application_id = arguments[1]
@@ -1049,10 +1076,14 @@ def main():
     smoke_key_sha256, smoke_cohort_sha256 = validate_smoke_credential(
         credential_file, gateway_config,
     )
-    gateway_config_sha256 = digest(gateway_config_raw)
-    previous_gateway_config_sha256 = (
-        None if bootstrap else digest(previous_gateway_config_raw)
-    )
+    if preserve_existing_config:
+        gateway_config_sha256 = preserve_existing_config_sha256
+        previous_gateway_config_sha256 = preserve_existing_config_sha256
+    else:
+        gateway_config_sha256 = digest(gateway_config_raw)
+        previous_gateway_config_sha256 = (
+            None if bootstrap else digest(previous_gateway_config_raw)
+        )
 
     allowed_cloudflare = {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}
     forbidden = re.compile(
@@ -1132,6 +1163,7 @@ def main():
     rollback_config_sha256 = None
     rollback_secrets = None
     rollback_secrets_sha256 = None
+    config_preservation_preflight_sha256 = None
     worker_source_sha256 = None
     scratch = Path(tempfile.mkdtemp(prefix="milk-carton-deploy."))
     docker_config = scratch / "docker-config"
@@ -1512,7 +1544,7 @@ def main():
 
         image_tag = f"milk-{admitted['child_sha256']}-op-{operation_id}"
         remote_image = f"{REGISTRY}/{account_id}/milk-carton:{image_tag}"
-        evidence.write("intent.json", {
+        intent = {
             "schema_version": "milk.private-gateway-deploy-intent.v1",
             "operation_id": operation_id,
             "worker": WORKER,
@@ -1532,7 +1564,14 @@ def main():
             "target_image": remote_image,
             "rollout": "immediate",
             "started_at": started_at,
-        })
+        }
+        if preserve_existing_config:
+            intent.update({
+                "gateway_config_handling": "preserve-existing-worker-secret",
+                "gateway_config_supplied": False,
+                "secrets_file_supplied": False,
+            })
+        evidence.write("intent.json", intent)
 
         if bootstrap:
             stage = "bootstrap-preflight"
@@ -1576,7 +1615,32 @@ def main():
                 raise ContractFailure("previous gateway config is not healthy and observable")
             if previous_config_sha256 != previous_gateway_config_sha256:
                 raise ContractFailure(
-                    "operator-supplied previous gateway config does not match the live deployment"
+                    (
+                        "expected preserved gateway config does not match the live deployment"
+                        if preserve_existing_config
+                        else "operator-supplied previous gateway config does not match the live deployment"
+                    )
+                )
+            if preserve_existing_config:
+                installed_secrets = parse_secret_names(wrangler(
+                    "preserved-config-secret-list", "secret", "list", "--name", WORKER,
+                    "--format", "json", sensitive=True,
+                ).stdout)
+                if "MILK_CARTON_CONFIG_JSON" not in installed_secrets:
+                    raise ContractFailure("preserved gateway config secret is absent")
+                config_preservation_preflight_sha256 = evidence.write(
+                    "config-preservation-preflight.json", {
+                        "schema_version": "milk.private-gateway-config-preservation-preflight.v1",
+                        "operation_id": operation_id,
+                        "expected_gateway_config_sha256": gateway_config_sha256,
+                        "observed_gateway_config_sha256": previous_config_sha256,
+                        "config_secret_present": True,
+                        "installed_secret_count": len(installed_secrets),
+                        "secret_names_retained": False,
+                        "gateway_config_supplied": False,
+                        "secrets_file_supplied": False,
+                        "verified": True,
+                    },
                 )
             previous_repository, previous_tag = split_cloudflare_image(previous_image, account_id)
             images = parse_images(wrangler(
@@ -1722,14 +1786,18 @@ def main():
             "deploy", "--strict", "--containers-rollout", "immediate",
             "--message", f"milk private gateway {operation_id}",
         ]
-        if not bootstrap:
+        if not bootstrap and not preserve_existing_config:
             deployment_secrets = scratch / "deploy-secrets.json"
             write_private(deployment_secrets, canonical_json({
                 "MILK_CARTON_CONFIG_JSON": gateway_config_raw.decode("utf-8"),
             }))
-        if deployment_secrets is None:
-            raise ContractFailure("deployment secrets were not materialized")
-        deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
+        if preserve_existing_config:
+            if deployment_secrets is not None:
+                raise ContractFailure("preserved config deployment materialized secrets")
+        else:
+            if deployment_secrets is None:
+                raise ContractFailure("deployment secrets were not materialized")
+            deploy_arguments.extend(["--secrets-file", str(deployment_secrets)])
         stage = "source-authority-recheck"
         if not source_authority_unchanged("predeploy"):
             raise ContractFailure("source authority changed before deployment")
@@ -1774,18 +1842,19 @@ def main():
                 worker_entrypoint,
                 api_hostname,
             )
-            rollback_secrets = scratch / "rollback-secrets.json"
-            write_private(rollback_secrets, canonical_json({
-                "MILK_CARTON_CONFIG_JSON": previous_gateway_config_raw.decode("utf-8"),
-            }))
             os.chmod(rollback_config, 0o400)
-            os.chmod(rollback_secrets, 0o400)
             rollback_config_sha256 = digest(read_regular(
                 rollback_config, "rollback deploy config", 65536,
             ))
-            rollback_secrets_sha256 = digest(read_regular(
-                rollback_secrets, "rollback deploy secrets", 65536,
-            ))
+            if not preserve_existing_config:
+                rollback_secrets = scratch / "rollback-secrets.json"
+                write_private(rollback_secrets, canonical_json({
+                    "MILK_CARTON_CONFIG_JSON": previous_gateway_config_raw.decode("utf-8"),
+                }))
+                os.chmod(rollback_secrets, 0o400)
+                rollback_secrets_sha256 = digest(read_regular(
+                    rollback_secrets, "rollback deploy secrets", 65536,
+                ))
             if digest(read_regular(
                 worker_entrypoint, "Worker entrypoint", 262144,
             )) != worker_source_sha256:
@@ -1851,6 +1920,19 @@ def main():
             "bootstrap" if bootstrap else "deploy", remote_image, previous_worker, True,
             gateway_config_sha256,
         )
+        if preserve_existing_config:
+            evidence.write("config-preservation.json", {
+                "schema_version": "milk.private-gateway-config-preservation.v1",
+                "operation_id": operation_id,
+                "preflight_receipt_sha256": config_preservation_preflight_sha256,
+                "expected_gateway_config_sha256": gateway_config_sha256,
+                "preflight_gateway_config_sha256": previous["config_sha256"],
+                "predeploy_gateway_config_sha256": rechecked_config_sha256,
+                "postdeploy_gateway_config_sha256": gateway_config_sha256,
+                "gateway_config_supplied": False,
+                "secrets_file_supplied": False,
+                "preserved": True,
+            })
         stage = "official-sdk-smoke"
         sdk_result = runner.run(
             "deploy-official-openai-sdk-smoke",
@@ -1955,26 +2037,46 @@ def main():
                 if (
                     rollback_config is None
                     or rollback_config_sha256 is None
-                    or rollback_secrets is None
-                    or rollback_secrets_sha256 is None
                     or worker_source_sha256 is None
                     or digest(read_regular(
                         rollback_config, "rollback deploy config", 65536,
                     )) != rollback_config_sha256
-                    or digest(read_regular(
-                        rollback_secrets, "rollback deploy secrets", 65536,
-                    )) != rollback_secrets_sha256
+                    or (
+                        not preserve_existing_config
+                        and (
+                            rollback_secrets is None
+                            or rollback_secrets_sha256 is None
+                            or digest(read_regular(
+                                rollback_secrets, "rollback deploy secrets", 65536,
+                            )) != rollback_secrets_sha256
+                        )
+                    )
+                    or (
+                        preserve_existing_config
+                        and (
+                            rollback_secrets is not None
+                            or rollback_secrets_sha256 is not None
+                        )
+                    )
                     or digest(read_regular(
                         worker_entrypoint, "Worker entrypoint", 262144,
                     )) != worker_source_sha256
                 ):
                     raise ContractFailure("staged rollback inputs changed")
                 rollback_inputs_verified = True
-                wrangler(
-                    "restore-previous-image-and-config",
+                restore_arguments = [
                     "deploy", "--strict", "--containers-rollout", "immediate",
                     "--message", f"milk automatic resource restore {operation_id}",
-                    "--secrets-file", str(rollback_secrets),
+                ]
+                if not preserve_existing_config:
+                    restore_arguments.extend(["--secrets-file", str(rollback_secrets)])
+                wrangler(
+                    (
+                        "restore-previous-image-preserving-config"
+                        if preserve_existing_config
+                        else "restore-previous-image-and-config"
+                    ),
+                    *restore_arguments,
                     timeout=900, sensitive=True, config=rollback_config,
                 )
                 resource_restore_command_succeeded = True
@@ -2029,6 +2131,13 @@ def main():
                 "worker_rollback_command_succeeded": worker_rollback_command_succeeded,
                 "accepted": rollback_accepted,
             }
+            if preserve_existing_config:
+                rollback_observation.update({
+                    "gateway_config_handling": "preserve-existing-worker-secret",
+                    "gateway_config_supplied": False,
+                    "secrets_file_supplied": False,
+                    "preserved_config_verified": rollback_accepted,
+                })
         try:
             if rollback_observation is not None:
                 evidence.write("rollback.json", rollback_observation)
