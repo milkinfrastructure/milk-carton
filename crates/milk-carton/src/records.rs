@@ -179,6 +179,10 @@ struct HarnessSummaryVersion {
     schema_version: String,
     scope_id: Uuid,
     profile: HarnessProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    harness_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_sha256: Option<String>,
     structural: Box<RawValue>,
     classifier_job_id: Option<String>,
     classifier_result_sha256: Option<String>,
@@ -227,6 +231,10 @@ struct HarnessReadiness {
     schema_version: String,
     scope_id: Uuid,
     profile: HarnessProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    harness_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_sha256: Option<String>,
     summary_sha256: String,
     ready: bool,
     statistically_qualified: bool,
@@ -405,6 +413,34 @@ struct HarnessCurrentPointer {
     version_sha256: String,
     version_key: String,
     parent_version_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StudentAdmission {
+    schema_version: String,
+    scope_id: Uuid,
+    profile: HarnessProfile,
+    series_id: String,
+    source_manifest_sha256: String,
+    summary_sha256: String,
+    readiness_sha256: String,
+    eval_sha256: String,
+    eval_validation_sha256: String,
+    held_out_trace_sha256s: Vec<String>,
+    training_partition_prefix: String,
+    partition_policy_id: String,
+    test_only: bool,
+    production_routing_allowed: bool,
+    harness_revision: String,
+    config_sha256: String,
+    code_version: String,
+    parent_version_sha256: Option<String>,
+}
+
+struct VerifiedStudentAdmission {
+    sha256: String,
+    admission: StudentAdmission,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2211,6 +2247,8 @@ struct StudentQualityGates {
 struct StudentJobDefinition {
     schema_version: String,
     teacher_provider_binding_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    student_admission_sha256: Option<String>,
     teacher_results: Vec<StudentTeacherResultRef>,
     input_sha256: String,
     dev_set_sha256: String,
@@ -5526,6 +5564,23 @@ impl RecordStore {
         intent: &VerifiedGpuLaunchIntent,
     ) -> Result<()> {
         match &intent.record.claim {
+            GpuLaunchIntentClaim::StudentTrainMerge { claim } => {
+                let student_job_id = decode_hex_digest(&claim.student_job_id)?;
+                let payload = serde_json::to_vec(claim)?;
+                validate_student_job_claim(scope, &student_job_id, claim, &payload)?;
+                if self
+                    .exists(&student_job_claim_key(scope, &student_job_id))
+                    .await?
+                {
+                    let (stored, stored_payload) = self
+                        .load_verified_student_claim(scope, &student_job_id)
+                        .await?;
+                    if stored != *claim || stored_payload != payload {
+                        bail!("GPU train intent differs from its durable student claim");
+                    }
+                }
+                self.load_verified_student_input(scope, claim).await?;
+            }
             GpuLaunchIntentClaim::StudentFanout { parent, train, .. } => {
                 let student_job_id = decode_hex_digest(&parent.student_job_id)?;
                 let (stored_parent, stored_parent_payload) = self
@@ -5566,8 +5621,7 @@ impl RecordStore {
                     }
                 }
             }
-            GpuLaunchIntentClaim::TeacherRun { .. }
-            | GpuLaunchIntentClaim::StudentTrainMerge { .. } => {}
+            GpuLaunchIntentClaim::TeacherRun { .. } => {}
         }
         Ok(())
     }
@@ -7233,6 +7287,7 @@ impl RecordStore {
         max_gpu_seconds: u64,
         claimed_decisions: u32,
         now: DateTime<Utc>,
+        admission_sha256: Option<&str>,
     ) -> Result<TeacherGpuClaimPreparation> {
         let Some(closed_hour) = self
             .next_snapshot_hour(scope, authorization, source_authorization_sha256, now)
@@ -7277,6 +7332,15 @@ impl RecordStore {
             prepared.definition.expires_at,
             "teacher GPU call claim",
         )?;
+        if let Some(admission_sha256) = admission_sha256 {
+            let current = self
+                .load_current_student_admission(scope)
+                .await?
+                .context("student admission disappeared before teacher claim")?;
+            if current.sha256 != admission_sha256 {
+                bail!("student admission changed before teacher claim");
+            }
+        }
         self.persist_teacher_claim(scope, &prepared, now).await?;
         let claim_payload = self
             .load_bytes(
@@ -7354,36 +7418,42 @@ impl RecordStore {
                 break;
             }
         }
-        let seed = match seed {
-            Some(claim) => claim,
-            None => match self
-                .prepare_next_teacher_gpu_claim(
-                    scope,
-                    &authorization,
-                    &source_authorization_sha256,
-                    &config,
-                    max_gpu_seconds,
-                    claimed_decisions,
-                    now,
-                )
-                .await?
-            {
-                TeacherGpuClaimPreparation::Ready {
-                    claim,
-                    created_decision,
-                } => {
-                    if created_decision {
-                        claimed_decisions = claimed_decisions
-                            .checked_add(1)
-                            .context("teacher decision count overflow")?;
+        let (seed, admission_sha256) = match seed {
+            Some(claim) => (claim, None),
+            None => {
+                let Some(admission) = self.load_current_student_admission(scope).await? else {
+                    return Ok(TeacherGpuTickWrite::Hold);
+                };
+                match self
+                    .prepare_next_teacher_gpu_claim(
+                        scope,
+                        &authorization,
+                        &source_authorization_sha256,
+                        &config,
+                        max_gpu_seconds,
+                        claimed_decisions,
+                        now,
+                        Some(&admission.sha256),
+                    )
+                    .await?
+                {
+                    TeacherGpuClaimPreparation::Ready {
+                        claim,
+                        created_decision,
+                    } => {
+                        if created_decision {
+                            claimed_decisions = claimed_decisions
+                                .checked_add(1)
+                                .context("teacher decision count overflow")?;
+                        }
+                        (*claim, Some(admission.sha256))
                     }
-                    *claim
+                    TeacherGpuClaimPreparation::Advanced(write) => {
+                        return Ok(TeacherGpuTickWrite::Advanced(write));
+                    }
+                    TeacherGpuClaimPreparation::None => return Ok(TeacherGpuTickWrite::Hold),
                 }
-                TeacherGpuClaimPreparation::Advanced(write) => {
-                    return Ok(TeacherGpuTickWrite::Advanced(write));
-                }
-                TeacherGpuClaimPreparation::None => return Ok(TeacherGpuTickWrite::Hold),
-            },
+            }
         };
         let Some(acquired) = self
             .acquire_teacher_gpu_slot(
@@ -7445,7 +7515,7 @@ impl RecordStore {
         }
 
         let mut advanced = None;
-        while calls.len() < usize::from(max_calls) {
+        while admission_sha256.is_some() && calls.len() < usize::from(max_calls) {
             let claim = match self
                 .prepare_next_teacher_gpu_claim(
                     scope,
@@ -7455,6 +7525,7 @@ impl RecordStore {
                     max_gpu_seconds,
                     claimed_decisions,
                     now,
+                    admission_sha256.as_deref(),
                 )
                 .await?
             {
@@ -9192,6 +9263,16 @@ impl RecordStore {
             self.delete(&reservation_key).await?;
             return Ok(None);
         }
+        if let Some(admission_sha256) = frontier
+            .index
+            .claim
+            .definition
+            .student_admission_sha256
+            .as_deref()
+        {
+            self.load_student_admission_version(scope, admission_sha256)
+                .await?;
+        }
         let encoded = encode_json(
             student_job_claim_key(scope, &student_job_id),
             &frontier.index.claim,
@@ -9271,6 +9352,9 @@ impl RecordStore {
                 return Ok(Some(write));
             }
         }
+        let Some(admission) = self.load_current_student_admission(scope).await? else {
+            return Ok(None);
+        };
         let active_teachers = self
             .load_active_teacher_jobs(scope, teacher_provider_binding_sha256, now)
             .await?;
@@ -9278,18 +9362,26 @@ impl RecordStore {
             .into_iter()
             .filter_map(|job| job.result)
             .collect::<Vec<_>>();
-        let Some((claim, _)) = prepare_student_job_claim(
+        let Some((claim, _)) = prepare_student_job_claim_with_admission(
             scope,
             teacher_provider_binding_sha256,
             recipe_sha256,
             student_train_runtime_image_reference,
             student_branch_runtime_image_reference,
             now,
+            Some(&admission),
             &verified,
         )?
         else {
             return Ok(None);
         };
+        if self
+            .load_current_student_admission(scope)
+            .await?
+            .is_none_or(|current| current.sha256 != admission.sha256)
+        {
+            return Ok(None);
+        }
         let student_job_id = decode_hex_digest(&claim.student_job_id)?;
         let encoded = encode_json(student_job_claim_key(scope, &student_job_id), &claim)?;
         if encoded.payload.len() > MAX_STUDENT_CLAIM_BYTES {
@@ -9520,6 +9612,10 @@ impl RecordStore {
         let claim: StudentJobClaim = serde_json::from_slice(&payload)
             .context("student job claim is not strict typed JSON")?;
         validate_student_job_claim(scope, student_job_id, &claim, &payload)?;
+        if let Some(admission_sha256) = claim.definition.student_admission_sha256.as_deref() {
+            self.load_student_admission_version(scope, admission_sha256)
+                .await?;
+        }
         Ok((claim, payload))
     }
 
@@ -9564,6 +9660,24 @@ impl RecordStore {
                 observed_cost_microusd: artifact.observed_cost_microusd,
                 result: artifact.result,
             });
+        }
+        if let Some(admission_sha256) = claim.definition.student_admission_sha256.as_deref() {
+            let admission = self
+                .load_student_admission_version(scope, admission_sha256)
+                .await?;
+            let held_out = admission
+                .admission
+                .held_out_trace_sha256s
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            for source in &mut verified {
+                source
+                    .result
+                    .entries
+                    .retain(|entry| !held_out.contains(entry.trace_payload_sha256.as_str()));
+            }
+            verified.retain(|source| !source.result.entries.is_empty());
         }
         let bundle = student_input_bundle(
             scope,
@@ -11257,6 +11371,328 @@ impl RecordStore {
         Ok((value, bytes))
     }
 
+    async fn verify_harness_current_pointer(
+        &self,
+        pointer_key: &str,
+        kind: &str,
+        version_sha256: &str,
+        version_key: &str,
+    ) -> Result<HarnessCurrentPointer> {
+        let bytes = self
+            .load_bytes(pointer_key, MAX_HARNESS_ARTIFACT_BYTES)
+            .await?;
+        let pointer: HarnessCurrentPointer = parse_harness_canonical_json_line(
+            &bytes,
+            MAX_HARNESS_ARTIFACT_BYTES,
+            "harness current pointer",
+        )?;
+        if pointer.schema_version != "milk.current-pointer.v1"
+            || pointer.kind != kind
+            || pointer.version_sha256 != version_sha256
+            || pointer.version_key != version_key
+            || !valid_optional_harness_digest(pointer.parent_version_sha256.as_deref())
+        {
+            bail!("harness current pointer has the wrong typed identity");
+        }
+        Ok(pointer)
+    }
+
+    async fn load_student_admission_version(
+        &self,
+        scope: &Scope,
+        admission_sha256: &str,
+    ) -> Result<VerifiedStudentAdmission> {
+        if !valid_lowercase_hex(admission_sha256, 64) {
+            bail!("student admission digest is invalid");
+        }
+        let prefix = scope_prefix(scope);
+        let admission_key = format!("{prefix}/student-admissions/versions/{admission_sha256}.json");
+        let (admission, _): (StudentAdmission, _) = self
+            .load_harness_artifact(&admission_key, admission_sha256, "student admission")
+            .await?;
+        self.verify_student_admission_lineage(scope, &admission)
+            .await?;
+        Ok(VerifiedStudentAdmission {
+            sha256: admission_sha256.to_owned(),
+            admission,
+        })
+    }
+
+    async fn load_current_student_admission(
+        &self,
+        scope: &Scope,
+    ) -> Result<Option<VerifiedStudentAdmission>> {
+        let prefix = scope_prefix(scope);
+        let pointer_key = format!("{prefix}/student-admissions/current.json");
+        if !self.exists(&pointer_key).await? {
+            return Ok(None);
+        }
+        let pointer_bytes = self
+            .load_bytes(&pointer_key, MAX_HARNESS_ARTIFACT_BYTES)
+            .await?;
+        let pointer: HarnessCurrentPointer = parse_harness_canonical_json_line(
+            &pointer_bytes,
+            MAX_HARNESS_ARTIFACT_BYTES,
+            "student admission current pointer",
+        )?;
+        let admission_key = format!(
+            "{prefix}/student-admissions/versions/{}.json",
+            pointer.version_sha256
+        );
+        self.verify_harness_current_pointer(
+            &pointer_key,
+            "student_admission",
+            &pointer.version_sha256,
+            &admission_key,
+        )
+        .await?;
+        let verified = self
+            .load_student_admission_version(scope, &pointer.version_sha256)
+            .await?;
+        if verified.admission.parent_version_sha256 != pointer.parent_version_sha256 {
+            bail!("student admission differs from its current pointer parent");
+        }
+        self.verify_current_student_admission_lineage(scope, &verified.admission)
+            .await?;
+        self.verify_harness_current_pointer(
+            &pointer_key,
+            "student_admission",
+            &verified.sha256,
+            &admission_key,
+        )
+        .await?;
+        self.verify_current_student_admission_lineage(scope, &verified.admission)
+            .await?;
+        Ok(Some(verified))
+    }
+
+    async fn verify_current_student_admission_lineage(
+        &self,
+        scope: &Scope,
+        admission: &StudentAdmission,
+    ) -> Result<()> {
+        let prefix = scope_prefix(scope);
+        let series = &admission.series_id;
+        for (pointer_path, kind, root, digest) in [
+            (
+                "summaries/current.json".to_owned(),
+                "summary",
+                "summaries".to_owned(),
+                admission.summary_sha256.as_str(),
+            ),
+            (
+                "readiness/current.json".to_owned(),
+                "readiness",
+                "readiness".to_owned(),
+                admission.readiness_sha256.as_str(),
+            ),
+            (
+                format!("evals/{series}/current.json"),
+                "eval",
+                format!("evals/{series}"),
+                admission.eval_sha256.as_str(),
+            ),
+            (
+                format!("eval-validations/{series}/current.json"),
+                "eval_validation",
+                format!("eval-validations/{series}"),
+                admission.eval_validation_sha256.as_str(),
+            ),
+        ] {
+            self.verify_harness_current_pointer(
+                &format!("{prefix}/{pointer_path}"),
+                kind,
+                digest,
+                &format!("{prefix}/{root}/versions/{digest}.json"),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_student_admission_lineage(
+        &self,
+        scope: &Scope,
+        admission: &StudentAdmission,
+    ) -> Result<()> {
+        let prefix = scope_prefix(scope);
+        let series = &admission.series_id;
+        let (source, source_bytes): (HarnessSourceManifest, _) = self
+            .load_harness_artifact(
+                &format!(
+                    "{prefix}/pending-source/versions/{}.json",
+                    admission.source_manifest_sha256
+                ),
+                &admission.source_manifest_sha256,
+                "student admission source manifest",
+            )
+            .await?;
+        let (summary, _): (HarnessSummaryVersion, _) = self
+            .load_harness_artifact(
+                &format!(
+                    "{prefix}/summaries/versions/{}.json",
+                    admission.summary_sha256
+                ),
+                &admission.summary_sha256,
+                "student admission summary",
+            )
+            .await?;
+        let (readiness, _): (HarnessReadiness, _) = self
+            .load_harness_artifact(
+                &format!(
+                    "{prefix}/readiness/versions/{}.json",
+                    admission.readiness_sha256
+                ),
+                &admission.readiness_sha256,
+                "student admission readiness",
+            )
+            .await?;
+        let (eval, _): (HarnessEvalRevision, _) = self
+            .load_harness_artifact(
+                &format!(
+                    "{prefix}/evals/{series}/versions/{}.json",
+                    admission.eval_sha256
+                ),
+                &admission.eval_sha256,
+                "student admission eval",
+            )
+            .await?;
+        let (validation, _): (HarnessEvalValidationRevision, _) = self
+            .load_harness_artifact(
+                &format!(
+                    "{prefix}/eval-validations/{series}/versions/{}.json",
+                    admission.eval_validation_sha256
+                ),
+                &admission.eval_validation_sha256,
+                "student admission eval validation",
+            )
+            .await?;
+        let structural: HarnessStructuralBinding =
+            serde_json::from_str(summary.structural.get())
+                .context("student admission structural summary is not typed JSON")?;
+        let source_body = source_bytes
+            .strip_suffix(b"\n")
+            .context("student admission source manifest has no canonical LF")?;
+        let checks = readiness.checks;
+        let all_ready = [
+            checks.minimum_independent_sessions,
+            checks.minimum_classified_sessions,
+            checks.independence_verified,
+            checks.pairing_at_least_99_percent,
+            checks.parse_at_least_99_5_percent,
+            checks.unknown_items_at_most_1_percent,
+            checks.duplicates_at_most_0_1_percent,
+            checks.other_plus_abstain_at_most_15_percent,
+            checks.represented_classes_meet_minimum,
+            checks.representative_eval_capacity,
+            checks.production_text_reference_capacity,
+            checks.closed_watermark_without_capture_gap,
+            checks.eval_generation_budget_available,
+        ]
+        .into_iter()
+        .all(|passed| passed);
+        let mut held_out = eval
+            .cases
+            .iter()
+            .map(|case| case.source_trace_sha256.clone())
+            .collect::<Vec<_>>();
+        held_out.sort();
+        held_out.dedup();
+        let profile_flags_valid = match admission.profile {
+            HarnessProfile::Mechanics => admission.test_only && !readiness.statistically_qualified,
+            HarnessProfile::Production => !admission.test_only && readiness.statistically_qualified,
+        };
+        let identity_valid = admission.schema_version == "milk.student-admission.v1"
+            && admission.scope_id == scope.scope_id
+            && valid_analysis_identifier(series, 128)
+            && source.schema_version == "milk.summary-source-manifest.v1"
+            && source.scope_id == scope.scope_id
+            && source.profile == admission.profile
+            && source.code_version == admission.code_version
+            && summary.schema_version == "milk.summary-version.v1"
+            && summary.scope_id == scope.scope_id
+            && summary.profile == admission.profile
+            && summary
+                .harness_revision
+                .as_deref()
+                .is_some_and(|revision| valid_lowercase_hex(revision, 40))
+            && summary.config_sha256.as_deref() == Some(admission.config_sha256.as_str())
+            && summary.code_version == admission.code_version
+            && structural.schema_version == "milk.structural-summary.v1"
+            && structural.scope_id == scope.scope_id
+            && structural.profile == admission.profile
+            && structural.source_manifest_sha256 == admission.source_manifest_sha256
+            && structural.source.get().as_bytes() == source_body
+            && readiness.schema_version == "milk.readiness.v1"
+            && readiness.scope_id == scope.scope_id
+            && readiness.profile == admission.profile
+            && readiness.harness_revision == summary.harness_revision
+            && readiness.config_sha256.as_deref() == Some(admission.config_sha256.as_str())
+            && readiness.summary_sha256 == admission.summary_sha256
+            && readiness.ready
+            && all_ready
+            && !readiness.represented_classes.is_empty()
+            && readiness.class_failures.is_empty()
+            && profile_flags_valid
+            && eval.schema_version == "milk.eval-revision.v1"
+            && eval.scope_id == scope.scope_id
+            && eval.profile == admission.profile
+            && eval.series_id == *series
+            && eval.summary_sha256 == admission.summary_sha256
+            && eval.readiness_sha256 == admission.readiness_sha256
+            && eval.code_version == admission.code_version
+            && !eval.cases.is_empty()
+            && validation.schema_version == "milk.eval-validation-revision.v1"
+            && validation.scope_id == scope.scope_id
+            && validation.profile == admission.profile
+            && validation.series_id == *series
+            && validation.eval_sha256 == admission.eval_sha256
+            && summary.harness_revision.as_deref() == Some(validation.harness_revision.as_str())
+            && validation.config_sha256 == admission.config_sha256
+            && validation.code_version == admission.code_version
+            && validation.accepted
+            && validation.output.schema_version == "milk.eval-validation-output.v1"
+            && validation.output.accepted
+            && validation.output.case_count == eval.cases.len() as u64
+            && validation.output.accepted_cases == validation.output.case_count
+            && validation.output.verdicts.len() == eval.cases.len()
+            && validation.output.rejections.is_empty()
+            && validation
+                .output
+                .verdicts
+                .iter()
+                .zip(&eval.cases)
+                .all(|(verdict, case)| {
+                    verdict.accepted
+                        && verdict.reason == "accepted"
+                        && verdict.case_id == case.case_id
+                })
+            && held_out == admission.held_out_trace_sha256s
+            && held_out
+                .iter()
+                .all(|digest| valid_lowercase_hex(digest, 64))
+            && admission.training_partition_prefix == format!("{prefix}/jobs/teacher")
+            && admission.partition_policy_id == "milk.teacher-partition.v1"
+            && !admission.production_routing_allowed
+            && valid_lowercase_hex(&admission.harness_revision, 40)
+            && valid_lowercase_hex(&admission.config_sha256, 64)
+            && valid_optional_harness_digest(admission.parent_version_sha256.as_deref())
+            && valid_optional_harness_digest(summary.parent_version_sha256.as_deref())
+            && valid_optional_harness_digest(eval.parent_version_sha256.as_deref())
+            && valid_optional_harness_digest(validation.parent_version_sha256.as_deref());
+        if !identity_valid {
+            bail!("student admission evidence identity or linkage is invalid");
+        }
+        for reference in source.stats.iter().chain(&source.traces) {
+            if !reference.key.starts_with(&format!("{prefix}/"))
+                || !valid_lowercase_hex(&reference.sha256, 64)
+            {
+                bail!("student admission source reference is outside its scope or invalid");
+            }
+        }
+        Ok(())
+    }
+
     async fn load_operator_route_proposal(
         &self,
         scope: &Scope,
@@ -11299,22 +11735,13 @@ impl RecordStore {
         let proposal_sha256 = hex_digest(proposal_sha256);
         let proposal_key = format!("{prefix}/route-proposals/versions/{proposal_sha256}.json");
         let current_key = format!("{prefix}/route-proposals/current.json");
-        let current_bytes = self
-            .load_bytes(&current_key, MAX_HARNESS_ARTIFACT_BYTES)
-            .await?;
-        let current: HarnessCurrentPointer = parse_harness_canonical_json_line(
-            &current_bytes,
-            MAX_HARNESS_ARTIFACT_BYTES,
-            "route proposal current pointer",
-        )?;
-        if current.schema_version != "milk.current-pointer.v1"
-            || current.kind != "route_proposal"
-            || current.version_sha256 != proposal_sha256
-            || current.version_key != proposal_key
-            || !valid_optional_harness_digest(current.parent_version_sha256.as_deref())
-        {
-            bail!("operator route proposal is not the current qualified proposal");
-        }
+        self.verify_harness_current_pointer(
+            &current_key,
+            "route_proposal",
+            &proposal_sha256,
+            &proposal_key,
+        )
+        .await?;
         Ok(())
     }
 
@@ -14397,13 +14824,14 @@ fn validate_teacher_result(result: &TeacherResult, sources: &[CompleteSnapshot])
     Ok(())
 }
 
-fn prepare_student_job_claim(
+fn prepare_student_job_claim_with_admission(
     scope: &Scope,
     teacher_provider_binding_sha256: &[u8; 32],
     recipe_sha256: &[u8; 32],
     student_train_runtime_image_reference: &str,
     student_branch_runtime_image_reference: &str,
     now: DateTime<Utc>,
+    admission: Option<&VerifiedStudentAdmission>,
     verified: &[VerifiedTeacherResultObject],
 ) -> Result<Option<(StudentJobClaim, Vec<u8>)>> {
     validate_distinct_runtime_image_references(
@@ -14411,10 +14839,22 @@ fn prepare_student_job_claim(
         student_branch_runtime_image_reference,
     )?;
     let provider_binding = hex_digest(teacher_provider_binding_sha256);
+    let held_out = admission
+        .into_iter()
+        .flat_map(|verified| verified.admission.held_out_trace_sha256s.iter())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let mut current = verified
         .iter()
         .filter(|source| source.expires_at > now)
         .cloned()
+        .filter_map(|mut source| {
+            source
+                .result
+                .entries
+                .retain(|entry| !held_out.contains(entry.trace_payload_sha256.as_str()));
+            (!source.result.entries.is_empty()).then_some(source)
+        })
         .collect::<Vec<_>>();
     current.sort_by(|left, right| {
         left.reference
@@ -14525,8 +14965,14 @@ fn prepare_student_job_claim(
         .min()
         .context("student job has no teacher expiry")?;
     let definition = StudentJobDefinition {
-        schema_version: "milk.student-job-definition.v4".to_owned(),
+        schema_version: if admission.is_some() {
+            "milk.student-job-definition.v5"
+        } else {
+            "milk.student-job-definition.v4"
+        }
+        .to_owned(),
         teacher_provider_binding_sha256: provider_binding,
+        student_admission_sha256: admission.map(|verified| verified.sha256.clone()),
         teacher_results: current.into_iter().map(|source| source.reference).collect(),
         input_sha256: hex_digest(&Sha256::digest(&input).into()),
         dev_set_sha256: student_dev_set_sha256(&bundle.dev)?,
@@ -14546,7 +14992,12 @@ fn prepare_student_job_claim(
     };
     let student_job_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
     let claim = StudentJobClaim {
-        schema_version: "milk.student-job-claim.v4".to_owned(),
+        schema_version: if admission.is_some() {
+            "milk.student-job-claim.v5"
+        } else {
+            "milk.student-job-claim.v4"
+        }
+        .to_owned(),
         scope: scope.clone(),
         student_job_id: hex_digest(&student_job_id),
         definition,
@@ -14555,6 +15006,28 @@ fn prepare_student_job_claim(
     let claim_payload = serde_json::to_vec(&claim)?;
     validate_student_job_claim(scope, &student_job_id, &claim, &claim_payload)?;
     Ok(Some((claim, input)))
+}
+
+#[cfg(test)]
+fn prepare_student_job_claim(
+    scope: &Scope,
+    teacher_provider_binding_sha256: &[u8; 32],
+    recipe_sha256: &[u8; 32],
+    student_train_runtime_image_reference: &str,
+    student_branch_runtime_image_reference: &str,
+    now: DateTime<Utc>,
+    verified: &[VerifiedTeacherResultObject],
+) -> Result<Option<(StudentJobClaim, Vec<u8>)>> {
+    prepare_student_job_claim_with_admission(
+        scope,
+        teacher_provider_binding_sha256,
+        recipe_sha256,
+        student_train_runtime_image_reference,
+        student_branch_runtime_image_reference,
+        now,
+        None,
+        verified,
+    )
 }
 
 fn student_input_bundle(
@@ -14746,8 +15219,16 @@ fn validate_student_job_claim(
         .teacher_results
         .windows(2)
         .all(|pair| pair[0].teacher_job_id < pair[1].teacher_job_id);
-    let valid_version = claim.schema_version == "milk.student-job-claim.v4"
+    let valid_version = ((claim.schema_version == "milk.student-job-claim.v4"
         && claim.definition.schema_version == "milk.student-job-definition.v4"
+        && claim.definition.student_admission_sha256.is_none())
+        || (claim.schema_version == "milk.student-job-claim.v5"
+            && claim.definition.schema_version == "milk.student-job-definition.v5"
+            && claim
+                .definition
+                .student_admission_sha256
+                .as_deref()
+                .is_some_and(valid_lowercase_sha256)))
         && claim.definition.max_train_gpu_seconds == STUDENT_MAX_TRAIN_GPU_SECONDS
         && claim.definition.max_branch_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
         && claim.definition.max_total_gpu_seconds == STUDENT_MAX_TOTAL_GPU_SECONDS;
@@ -18741,6 +19222,7 @@ mod tests {
         let definition = StudentJobDefinition {
             schema_version: "milk.student-job-definition.v4".to_owned(),
             teacher_provider_binding_sha256: hex_digest(&[1; 32]),
+            student_admission_sha256: None,
             teacher_results: vec![StudentTeacherResultRef {
                 teacher_job_id: hex_digest(&[2; 32]),
                 object_sha256: hex_digest(&[3; 32]),
@@ -23442,6 +23924,7 @@ mod tests {
                     60,
                     0,
                     now,
+                    None,
                 )
                 .await
                 .unwrap(),
