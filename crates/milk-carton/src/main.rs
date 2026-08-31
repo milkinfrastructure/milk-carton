@@ -2498,7 +2498,10 @@ fn api_endpoint_url(base: &Url, endpoint: RouteEndpoint) -> Result<Url> {
 }
 
 fn required_env(name: &str) -> Result<String> {
-    std::env::var(name).with_context(|| format!("{name} is required"))
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => bail!("{name} cannot be empty"),
+        value => value.with_context(|| format!("{name} is required")),
+    }
 }
 
 fn optional_env(name: &str) -> Result<Option<String>> {
