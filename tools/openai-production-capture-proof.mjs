@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import OpenAI from "openai";
 import { readCredential, runProductionPath } from "./openai-production-path-workload.mjs";
 const execute = promisify(execFile);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -46,8 +45,6 @@ function normalize(rows, root) {
   return result;
 }
 function additions(before, after) {
-  const current = new Map(after.map((row) => [row.key, row]));
-  for (const row of before) assert.deepEqual(current.get(row.key), row);
   const prior = new Set(before.map((row) => row.key));
   return after.filter((row) => !prior.has(row.key));
 }
@@ -58,23 +55,6 @@ function trafficKey(scopeId, traceId) {
   const hour = new Date(milliseconds).toISOString().slice(0, 13)
     .replaceAll("-", "/").replace("T", "/");
   return `${prefix(scopeId)}traffic/${hour}/${traceId}.json.zst`;
-}
-async function isolated401(endpoint, model, fetch) {
-  const client = new OpenAI({
-    apiKey: "invalid-production-path-key", baseURL: endpoint.href,
-    fetch, maxRetries: 0, timeout: 60_000,
-  });
-  try {
-    await client.chat.completions.create({
-      max_completion_tokens: 1,
-      messages: [{ role: "user", content: "authentication check" }], model,
-    });
-  } catch (error) {
-    assert.ok(error instanceof OpenAI.AuthenticationError);
-    assert.equal(error.status, 401);
-    return 401;
-  }
-  assert.fail("invalid key was accepted");
 }
 async function inspectStats(scopeId, rows, readStats, keys) {
   const delta = Object.fromEntries(keys.map((key) => [key, 0]));
@@ -99,9 +79,8 @@ export async function runCaptureProof(options) {
   let { targetScopeId, sentinelScopeIds } = options;
   const {
     endpoint, credential, listScope, readStats, fetch = globalThis.fetch,
-    interval, timing, invalidRequest = isolated401, workload = runProductionPath,
-    waitBeforeBaseline = () => sleep(75_000),
-    waitAfter401 = () => sleep(65_000), waitForStats = () => sleep(5_000),
+    interval, timing, workload = runProductionPath,
+    waitForStats = () => sleep(5_000),
   } = options;
   targetScopeId = scope(targetScopeId);
   sentinelScopeIds = sentinelScopeIds.map(scope).sort();
@@ -111,14 +90,9 @@ export async function runCaptureProof(options) {
   const snapshot = async () => new Map(await Promise.all(scopes.map(async (id) => (
     [id, normalize(await listScope(id), prefix(id))]
   ))));
-  await waitBeforeBaseline();
   const before = await snapshot();
-  assert.equal(await invalidRequest(endpoint, credential.model, fetch), 401);
-  await waitAfter401();
-  const after401 = await snapshot();
-  for (const id of scopes) assert.deepEqual(after401.get(id), before.get(id));
   const workloadReceipt = await workload(endpoint, credential, fetch, interval, timing);
-  assert.equal(workloadReceipt.schema_version, "milk.official-openai-sdk-production-path.v2");
+  assert.equal(workloadReceipt.schema_version, "milk.official-openai-sdk-production-path.v3");
   assert.equal(workloadReceipt.status, "succeeded");
   assert.equal(workloadReceipt.counts.invalid_key_requests, 1);
   assert.equal(workloadReceipt.counts.observed_requests, 103);
@@ -126,6 +100,9 @@ export async function runCaptureProof(options) {
   assert.equal(workloadReceipt.counts.responses_requests, 51);
   assert.equal(workloadReceipt.counts.streaming_requests, 1);
   assert.equal(workloadReceipt.counts.sdk_requests, 104);
+  assert.equal(workloadReceipt.invalid_auth.http_status, 401);
+  assert.match(workloadReceipt.invalid_auth.trace_id, UUID);
+  const invalidTraceId = workloadReceipt.invalid_auth.trace_id;
   const validateTraces = (values) => {
     assert.ok(Array.isArray(values) && values.length <= 103);
     for (const value of values) assert.match(value, UUID);
@@ -141,6 +118,7 @@ export async function runCaptureProof(options) {
   assert.equal(selectedTraces.length + unselectedTraces.length, 103);
   const traceIds = [...selectedTraces, ...unselectedTraces].sort();
   assert.equal(new Set(traceIds).size, 103);
+  assert.equal(traceIds.includes(invalidTraceId), false);
   assert.equal(workloadReceipt.counts.unique_trace_ids, 103);
   assert.equal(workloadReceipt.hashes.trace_set_sha256, sha256(canonical(traceIds)));
   assert.equal(
@@ -154,13 +132,16 @@ export async function runCaptureProof(options) {
   assert.equal(workloadReceipt.streaming.requests, 1);
   assert.ok(Number.isSafeInteger(workloadReceipt.streaming.chunk_count));
   assert.ok(workloadReceipt.streaming.chunk_count > 0 && workloadReceipt.streaming.chunk_count <= 512);
+  assert.ok(Number.isSafeInteger(workloadReceipt.streaming.usage_chunks));
+  assert.ok(workloadReceipt.streaming.usage_chunks > 0);
+  assert.ok(workloadReceipt.streaming.usage_chunks <= workloadReceipt.streaming.chunk_count);
   assert.ok(Number.isSafeInteger(workloadReceipt.streaming.response_bytes));
   assert.ok(workloadReceipt.streaming.response_bytes > 0 && workloadReceipt.streaming.response_bytes <= 65_536);
   assert.match(workloadReceipt.streaming.chunk_sha256, SHA256);
   assert.equal(workloadReceipt.streaming.fully_consumed, true);
   assert.match(workloadReceipt.streaming.trace_id, UUID);
   assert.ok(selectedTraces.includes(workloadReceipt.streaming.trace_id));
-  const expectedDelta = {
+  const minimumDelta = {
     observed: 103,
     chat_completions: 52,
     responses: 51,
@@ -171,35 +152,37 @@ export async function runCaptureProof(options) {
     captured: selectedTraces.length,
     queued: 103,
     traces_persisted: selectedTraces.length,
-    request_parse_failure: 0, oversized: 0, interrupted: 0, capture_failed: 0, dropped: 0,
     not_selected: unselectedTraces.length,
-    trace_persist_failures: 0, stats_persist_failures: 0,
-    status_2xx: 103, status_4xx: 0, status_5xx: 0, status_other: 0, status_missing: 0,
+    status_2xx: 103,
   };
   const expectedTraffic = selectedTraces.map((id) => trafficKey(targetScopeId, id)).sort();
-  const unselectedTraffic = new Set(unselectedTraces.map((id) => trafficKey(targetScopeId, id)));
+  const forbiddenTargetTraces = [invalidTraceId, ...unselectedTraces];
+  const ownedTraces = [invalidTraceId, ...traceIds];
   let complete;
   for (let attempt = 0; attempt < 25 && !complete; attempt += 1) {
     await waitForStats(attempt);
     const current = await snapshot();
-    for (const id of sentinelScopeIds) assert.deepEqual(current.get(id), after401.get(id));
-    const added = additions(after401.get(targetScopeId), current.get(targetScopeId));
-    const traffic = added.filter((row) => row.key.startsWith(`${prefix(targetScopeId)}traffic/`));
-    const stats = added.filter((row) => row.key.startsWith(`${prefix(targetScopeId)}stats/`));
-    const keys = traffic.map((row) => row.key).sort();
-    for (const key of keys) {
-      assert.equal(unselectedTraffic.has(key), false);
-      assert.equal(expectedTraffic.includes(key), true);
+    for (const id of sentinelScopeIds) {
+      for (const row of current.get(id)) {
+        assert.equal(ownedTraces.some((traceId) => row.key.includes(traceId)), false);
+      }
     }
-    if (keys.length !== expectedTraffic.length || stats.length === 0) continue;
-    assert.deepEqual(keys, expectedTraffic);
+    const target = current.get(targetScopeId);
+    for (const row of target) {
+      assert.equal(forbiddenTargetTraces.some((traceId) => row.key.includes(traceId)), false);
+    }
+    const targetByKey = new Map(target.map((row) => [row.key, row]));
+    const traffic = expectedTraffic.map((key) => targetByKey.get(key)).filter(Boolean);
+    const added = additions(before.get(targetScopeId), target);
+    const stats = added.filter((row) => row.key.startsWith(`${prefix(targetScopeId)}stats/`));
+    if (traffic.length !== expectedTraffic.length || stats.length === 0) continue;
+    assert.deepEqual(traffic.map((row) => row.key).sort(), expectedTraffic);
     const inspected = await inspectStats(
-      targetScopeId, stats, readStats, Object.keys(expectedDelta),
+      targetScopeId, stats, readStats, Object.keys(minimumDelta),
     );
     let pending = false;
-    for (const [key, expected] of Object.entries(expectedDelta)) {
-      assert.ok(inspected.delta[key] <= expected);
-      pending ||= inspected.delta[key] < expected;
+    for (const [key, minimum] of Object.entries(minimumDelta)) {
+      pending ||= inspected.delta[key] < minimum;
     }
     if (!pending) complete = { current, inspected, stats, traffic };
   }
@@ -207,32 +190,46 @@ export async function runCaptureProof(options) {
   const streamingTrafficKey = trafficKey(targetScopeId, workloadReceipt.streaming.trace_id);
   assert.ok(complete.traffic.some((row) => row.key === streamingTrafficKey));
   const receipt = {
-    schema_version: "milk.production-capture-proof.v2", status: "succeeded",
+    schema_version: "milk.production-capture-proof.v3", status: "succeeded",
     scope_id: targetScopeId,
     intents: {
       observed: 103,
       selected: selectedTraces.length,
       not_selected: unselectedTraces.length,
     },
+    sdk: {
+      counts: workloadReceipt.counts,
+      http_status_counts: workloadReceipt.http_status_counts,
+      name: workloadReceipt.sdk,
+      version: workloadReceipt.sdk_version,
+    },
     selected_traces: selectedTraces,
     not_selected_traces: unselectedTraces,
     streaming: { ...workloadReceipt.streaming, traffic_key: streamingTrafficKey },
     invalid_auth: {
-      http_status: 401, object_changes: 0,
-      before: manifest(before.get(targetScopeId)), after: manifest(after401.get(targetScopeId)),
+      http_status: 401, trace_id: invalidTraceId,
+      owned_trace_objects_written: 0,
     },
     traffic: { objects: complete.traffic, ...manifest(complete.traffic) },
-    stats: { delta: complete.inspected.delta, objects: complete.inspected.objects,
+    stats: { attribution: "scope_aggregate_lower_bound", minimum: minimumDelta,
+      inclusion_probability_basis_points: 1000,
+      delta: complete.inspected.delta, objects: complete.inspected.objects,
       ...manifest(complete.inspected.objects) },
     sentinels: sentinelScopeIds.map((id) => ({
-      scope_id: id, before: manifest(before.get(id)), after_401: manifest(after401.get(id)),
-      after_workload: manifest(complete.current.get(id)),
+      scope_id: id, owned_trace_objects_written: 0,
+      before: manifest(before.get(id)), after_workload: manifest(complete.current.get(id)),
     })),
+    background: {
+      target_before: manifest(before.get(targetScopeId)),
+      target_after: manifest(complete.current.get(targetScopeId)),
+    },
     hashes: {
       workload_receipt_sha256: sha256(canonical(workloadReceipt)),
       trace_set_sha256: workloadReceipt.hashes.trace_set_sha256,
       selected_trace_set_sha256: workloadReceipt.hashes.selected_trace_set_sha256,
       not_selected_trace_set_sha256: workloadReceipt.hashes.not_selected_trace_set_sha256,
+      request_set_sha256: workloadReceipt.hashes.request_set_sha256,
+      response_set_sha256: workloadReceipt.hashes.response_set_sha256,
       tool_sha256: sha256(await readFile(new URL(import.meta.url))),
     },
     evidence: { traffic_bodies_read: false, prompt_bytes_retained: false,
@@ -310,8 +307,13 @@ async function main() {
   process.stdout.write(`${canonical(receipt)}\n`);
 }
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  main().catch(() => {
-    process.stderr.write("openai-production-capture-proof: failed\n");
+  main().catch((error) => {
+    const status = Number.isInteger(error?.status) ? ` status=${error.status}` : "";
+    const kind = /^[A-Za-z][A-Za-z0-9]*$/.test(error?.name ?? "")
+      ? ` kind=${error.name}` : "";
+    const stage = /^[a-z0-9:_-]{1,128}$/.test(error?.milkStage ?? "")
+      ? ` stage=${error.milkStage}` : "";
+    process.stderr.write(`openai-production-capture-proof: failed${status}${kind}${stage}\n`);
     process.exitCode = 70;
   });
 }

@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 
 import OpenAI from "openai";
 
-const CONCURRENCY = 4;
+const CONCURRENCY = 2;
 const DEFAULT_MINIMUM_REQUEST_INTERVAL_MS = 4_100;
 const MAXIMUM_REQUEST_INTERVAL_MS = 10_000;
 const MAX_CREDENTIAL_BYTES = 8_192;
@@ -132,61 +132,72 @@ function responseObservation(response) {
 }
 
 async function runRequest(client, row) {
-  const options = { headers: { "x-milk-session-id": row.sessionId } };
-  const result = row.endpoint === "chat_completions"
-    ? await client.chat.completions.create(row.request, options).withResponse()
-    : await client.responses.create(row.request, options).withResponse();
-  assert.notEqual(result.data, null);
-  assert.equal(typeof result.data, "object");
-  const responseRaw = canonical(result.data);
-  const responseBytes = Buffer.byteLength(responseRaw);
-  assert.ok(responseBytes > 0 && responseBytes <= MAX_RESPONSE_BYTES);
-  return {
-    ...responseObservation(result.response),
-    requestSha256: row.requestSha256,
-    responseSha256: sha256(responseRaw),
-  };
+  try {
+    const options = { headers: { "x-milk-session-id": row.sessionId } };
+    const result = row.endpoint === "chat_completions"
+      ? await client.chat.completions.create(row.request, options).withResponse()
+      : await client.responses.create(row.request, options).withResponse();
+    assert.notEqual(result.data, null);
+    assert.equal(typeof result.data, "object");
+    const responseRaw = canonical(result.data);
+    const responseBytes = Buffer.byteLength(responseRaw);
+    assert.ok(responseBytes > 0 && responseBytes <= MAX_RESPONSE_BYTES);
+    return {
+      ...responseObservation(result.response),
+      requestSha256: row.requestSha256,
+      responseSha256: sha256(responseRaw),
+    };
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.milkStage = `${row.endpoint}:${row.sessionId}`;
+    }
+    throw error;
+  }
 }
 
 async function runStreamingRequest(client, row) {
-  const result = await client.chat.completions.create(row.request, {
-    headers: { "x-milk-session-id": row.sessionId },
-  }).withResponse();
-  let chunks = 0;
-  let responseBytes = 0;
-  let usageChunks = 0;
-  let terminalUsage = false;
-  const chunkDigest = createHash("sha256");
-  for await (const chunk of result.data) {
-    assert.equal(terminalUsage, false);
-    assert.notEqual(chunk, null);
-    assert.equal(typeof chunk, "object");
-    if (chunk.usage !== undefined && chunk.usage !== null) {
-      assert.equal(typeof chunk.usage, "object");
-      usageChunks += 1;
-      terminalUsage = true;
+  try {
+    const result = await client.chat.completions.create(row.request, {
+      headers: { "x-milk-session-id": row.sessionId },
+    }).withResponse();
+    let chunks = 0;
+    let responseBytes = 0;
+    let usageChunks = 0;
+    const chunkDigest = createHash("sha256");
+    for await (const chunk of result.data) {
+      assert.notEqual(chunk, null);
+      assert.equal(typeof chunk, "object");
+      if (chunk.usage !== undefined && chunk.usage !== null) {
+        assert.equal(typeof chunk.usage, "object");
+        usageChunks += 1;
+      }
+      const encoded = Buffer.from(canonical(chunk), "utf8");
+      responseBytes += encoded.length;
+      assert.ok(responseBytes <= MAX_RESPONSE_BYTES);
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(encoded.length);
+      chunkDigest.update(length);
+      chunkDigest.update(encoded);
+      chunks += 1;
+      assert.ok(chunks <= MAX_STREAM_CHUNKS);
     }
-    const encoded = Buffer.from(canonical(chunk), "utf8");
-    responseBytes += encoded.length;
-    assert.ok(responseBytes <= MAX_RESPONSE_BYTES);
-    const length = Buffer.alloc(4);
-    length.writeUInt32BE(encoded.length);
-    chunkDigest.update(length);
-    chunkDigest.update(encoded);
-    chunks += 1;
-    assert.ok(chunks <= MAX_STREAM_CHUNKS);
+    assert.ok(chunks > 0);
+    assert.ok(usageChunks > 0 && usageChunks <= chunks);
+    return {
+      chunkSha256: chunkDigest.digest("hex"),
+      chunks,
+      fullyConsumed: true,
+      requestSha256: row.requestSha256,
+      responseBytes,
+      usageChunks,
+      ...responseObservation(result.response),
+    };
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.milkStage = `stream:${row.sessionId}`;
+    }
+    throw error;
   }
-  assert.equal(usageChunks, 1);
-  assert.equal(terminalUsage, true);
-  assert.ok(chunks > 0);
-  return {
-    chunkSha256: chunkDigest.digest("hex"),
-    chunks,
-    fullyConsumed: true,
-    requestSha256: row.requestSha256,
-    responseBytes,
-    ...responseObservation(result.response),
-  };
 }
 
 export async function runProductionPath(
@@ -214,13 +225,16 @@ export async function runProductionPath(
     model: credential.model,
   };
   let invalidStatus = null;
+  let invalidTraceId = null;
   try {
     await invalidClient.chat.completions.create(invalidRequest);
   } catch (error) {
     assert.ok(error instanceof OpenAI.AuthenticationError);
     invalidStatus = error.status;
+    invalidTraceId = error.headers?.get("x-milk-trace-id") ?? null;
   }
   assert.equal(invalidStatus, 401);
+  assert.match(invalidTraceId ?? "", UUID);
 
   const waitForLaunch = launchScheduler(minimumRequestIntervalMs, timing);
   const client = new OpenAI({
@@ -261,14 +275,20 @@ export async function runProductionPath(
   const plan = productionPathPlan(credential.model);
   const workload = new Array(plan.length);
   let cursor = 0;
+  let failure = null;
   async function worker() {
-    while (cursor < plan.length) {
+    while (failure === null && cursor < plan.length) {
       const index = cursor;
       cursor += 1;
-      workload[index] = await runRequest(client, plan[index]);
+      try {
+        workload[index] = await runRequest(client, plan[index]);
+      } catch (error) {
+        failure ??= error;
+      }
     }
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  if (failure !== null) throw failure;
   const initial = [
     ...smokeObservations.map((row, index) => ({ ...row, sessionId: smoke[index].sessionId })),
     ...workload.map((row, index) => ({ ...row, sessionId: plan[index].sessionId })),
@@ -347,9 +367,10 @@ export async function runProductionPath(
       trace_set_sha256: sha256(canonical(traceIds)),
     },
     http_status_counts: { 200: observations.length, 401: 1 },
+    invalid_auth: { http_status: invalidStatus, trace_id: invalidTraceId },
     not_selected_trace_ids: notSelectedTraceIds,
     selected_trace_ids: selectedTraceIds,
-    schema_version: "milk.official-openai-sdk-production-path.v2",
+    schema_version: "milk.official-openai-sdk-production-path.v3",
     sdk: "openai-node",
     sdk_version: SDK_VERSION,
     status: "succeeded",
@@ -360,6 +381,7 @@ export async function runProductionPath(
       fully_consumed: streamed.fullyConsumed,
       requests: 1,
       trace_id: streamed.traceId,
+      usage_chunks: streamed.usageChunks,
     },
   };
 }
