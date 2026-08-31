@@ -56,7 +56,7 @@ jobs:
 
       - name: Authenticate GHCR
         env:
-          GHCR_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.MILK_GHCR_PUBLISH_TOKEN || github.token }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: Build and publish
