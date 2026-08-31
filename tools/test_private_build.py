@@ -358,6 +358,7 @@ class VerifierFixture:
             metadata=self.metadata,
             docker_config=self.docker_config,
             evidence_dir=self.evidence,
+            build_authority="local-socket",
             registry_token_stdin=True,
         )
         self.blobs = {
@@ -587,6 +588,7 @@ class PrivateBuildScriptTests(unittest.TestCase):
                 parser.add_argument("--metadata", required=True)
                 parser.add_argument("--docker-config", required=True)
                 parser.add_argument("--evidence-dir", required=True)
+                parser.add_argument("--build-authority", required=True)
                 parser.add_argument("--registry-token-stdin", action="store_true")
                 arguments = parser.parse_args()
                 if sys.stdin.read().strip() != "ephemeral-test-password":

@@ -37,9 +37,11 @@ jobs:
       - name: Set up pinned Buildx
         env:
           BUILDKIT_IMAGE: moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
+          BUILDKIT_VERSION: v0.23.2
           BUILDX_SHA256: 4104d79a791a8744c0b43fd5bd0a6172dff29040c5229946a1cdb2d27b0b5bfa
           BUILDX_URL: https://github.com/docker/buildx/releases/download/v0.25.0/buildx-v0.25.0.linux-amd64
         run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
           docker_config="$RUNNER_TEMP/docker-config"
           download="$RUNNER_TEMP/buildx-v0.25.0.linux-amd64"
           plugin="$docker_config/cli-plugins/docker-buildx"
@@ -52,7 +54,11 @@ jobs:
           docker buildx version | grep -F ' v0.25.0 '
           docker buildx create --name milk-carton --driver docker-container \
             --driver-opt "image=$BUILDKIT_IMAGE" --use
-          docker buildx inspect --bootstrap
+          builder_log="$RUNNER_TEMP/milk-carton-builder.log"
+          docker buildx inspect --bootstrap | tee "$builder_log"
+          test "$(sed -n 's/^Driver:[[:space:]]*//p' "$builder_log")" = docker-container
+          test "$(sed -n 's/^BuildKit version:[[:space:]]*//p' "$builder_log")" = "$BUILDKIT_VERSION"
+          rm -f "$builder_log"
 
       - name: Authenticate GHCR
         env:
@@ -66,14 +72,23 @@ jobs:
           REPOSITORY: ghcr.io/milkinfrastructure/milk-carton
         run: |
           test "$(git rev-parse --verify 'HEAD^{commit}')" = "$GITHUB_SHA"
+          evidence_dir="$RUNNER_TEMP/milk-carton-release"
+          source_context="$RUNNER_TEMP/milk-carton-source.tar"
+          build_context="$RUNNER_TEMP/milk-carton-context"
+          test ! -e "$evidence_dir"
+          mkdir -m 0700 "$evidence_dir" "$build_context"
+          git archive --format=tar --output="$source_context" "$GITHUB_SHA"
+          context_sha256=$(sha256sum "$source_context" | cut -d ' ' -f 1)
+          tar -xf "$source_context" -C "$build_context"
+          rm -f "$source_context"
           source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
-          context_sha256=$(git archive --format=tar "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)
           build_log="$RUNNER_TEMP/milk-carton-build.log"
+          build_started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           set +e
           docker buildx build \
             --progress=plain \
             --platform linux/amd64 \
-            --file deploy/cloudflare/Dockerfile \
+            --file "$build_context/deploy/cloudflare/Dockerfile" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.source=https://github.com/milkinfrastructure/milk-carton" \
             --provenance=mode=max,version=v1 \
@@ -85,12 +100,50 @@ jobs:
             --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
             --cache-from "type=registry,ref=$REPOSITORY:buildcache" \
             --cache-to "type=registry,ref=$REPOSITORY:buildcache,mode=max" \
-            --metadata-file "$RUNNER_TEMP/milk-carton-image.json" \
+            --metadata-file "$evidence_dir/metadata.json" \
             --tag "$REPOSITORY:source-$GITHUB_SHA" \
             --push \
-            . 2>&1 | tee "$build_log"
+            "$build_context" 2>&1 | tee "$build_log"
           build_status=${PIPESTATUS[0]}
           set -e
+          build_completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          python3 - "$build_log" "$evidence_dir/build-log.json" "$build_status" \
+            "$build_started_at" "$build_completed_at" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          source, target, status, started_at, completed_at = sys.argv[1:]
+          raw = Path(source).read_bytes()
+          Path(target).write_text(json.dumps({
+              "schema_version": "milk.content-free-build-log.v1",
+              "artifact": "gateway",
+              "exit_code": int(status),
+              "started_at": started_at,
+              "completed_at": completed_at,
+              "sha256": hashlib.sha256(raw).hexdigest(),
+              "bytes": len(raw),
+              "content_retained": False,
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          python3 - "$evidence_dir/build-log.json" "$evidence_dir/ops-log-reference.json" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          source, target = map(Path, sys.argv[1:])
+          raw = source.read_bytes()
+          target.write_text(json.dumps({
+              "schema_version": "milk.private-ops-log-reference.v1",
+              "authority": "private-release-evidence",
+              "reference": "build-log.json",
+              "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+              "immutable": True,
+              "content_retained": False,
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
           if [ "$build_status" -ne 0 ]; then
             python3 - "$build_log" <<'PY'
           import pathlib
@@ -102,24 +155,77 @@ jobs:
           PY
             exit "$build_status"
           fi
+          rm -f "$build_log"
 
-      - name: Record immutable manifest
+      - name: Verify and record immutable release
         id: manifest
         env:
+          BUILDKIT_IMAGE: moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
+          DOCKERFILE_FRONTEND: docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+          GHCR_TOKEN: ${{ secrets.MILK_GHCR_PUBLISH_TOKEN || github.token }}
           REPOSITORY: ghcr.io/milkinfrastructure/milk-carton
         run: |
-          digest=$(python3 - "$RUNNER_TEMP/milk-carton-image.json" <<'PY'
+          evidence_dir="$RUNNER_TEMP/milk-carton-release"
+          source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          context_sha256=$(git archive --format=tar "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)
+          verification=$(printf '%s' "$GHCR_TOKEN" | python3 tools/verify-private-gateway.py \
+            --tagged-reference "$REPOSITORY:source-$GITHUB_SHA" \
+            --source-commit "$GITHUB_SHA" \
+            --source-date-epoch "$source_epoch" \
+            --source-context-sha256 "$context_sha256" \
+            --metadata "$evidence_dir/metadata.json" \
+            --docker-config "$DOCKER_CONFIG" \
+            --evidence-dir "$evidence_dir" \
+            --build-authority github-actions \
+            --registry-token-stdin)
+          read -r image_reference admission_sha256 <<< "$verification"
+          python3 - "$evidence_dir/release.json" "$GITHUB_SHA" "$source_epoch" \
+            "$image_reference" "$admission_sha256" "$BUILDKIT_IMAGE" \
+            "$DOCKERFILE_FRONTEND" "$evidence_dir/build-log.json" \
+            "$evidence_dir/ops-log-reference.json" <<'PY'
+          import hashlib
           import json
+          import re
           import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-          with open(sys.argv[1], encoding="utf-8") as source:
-              print(json.load(source)["containerimage.digest"])
+          (
+              target, commit, source_epoch, image_reference, admission_sha256,
+              buildkit, frontend, build_log_path, ops_log_path,
+          ) = sys.argv[1:]
+          if re.fullmatch(r"ghcr\.io/milkinfrastructure/milk-carton@sha256:[0-9a-f]{64}", image_reference) is None:
+              raise SystemExit(1)
+          if re.fullmatch(r"[0-9a-f]{64}", admission_sha256) is None:
+              raise SystemExit(1)
+          build_log = json.loads(Path(build_log_path).read_bytes())
+          ops_log_raw = Path(ops_log_path).read_bytes()
+          Path(target).write_text(json.dumps({
+              "schema_version": "milk.private-gateway-release.v1",
+              "source_commit": commit,
+              "source_date_epoch": int(source_epoch),
+              "source_repository": "https://github.com/milkinfrastructure/milk-carton",
+              "buildkit_image_reference": buildkit,
+              "dockerfile_frontend_reference": frontend,
+              "build_authority": "github-actions",
+              "platform": "linux/amd64",
+              "ops_log_reference_sha256": hashlib.sha256(ops_log_raw).hexdigest(),
+              "image": {
+                  "admission_sha256": admission_sha256,
+                  "artifact": "gateway",
+                  "image_reference": image_reference,
+              },
+              "started_at": build_log["started_at"],
+              "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
           PY
-          )
-          case "$digest" in sha256:*) ;; *) exit 64 ;; esac
-          digest_hex=${digest#sha256:}
-          test "${#digest_hex}" -eq 64
-          case "$digest_hex" in *[!0-9a-f]*) exit 64 ;; esac
-          immutable_reference="$REPOSITORY@$digest"
-          printf 'image_reference=%s\n' "$immutable_reference" >> "$GITHUB_OUTPUT"
-          printf -- '- `%s`\n' "$immutable_reference" >> "$GITHUB_STEP_SUMMARY"
+          chmod 0400 "$evidence_dir"/*
+          printf 'image_reference=%s\n' "$image_reference" >> "$GITHUB_OUTPUT"
+          printf -- '- `%s`\n' "$image_reference" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: milk-carton-release-${{ github.sha }}
+          path: ${{ runner.temp }}/milk-carton-release
+          if-no-files-found: error

@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -42,6 +43,10 @@ MAX_TOKEN_BYTES = 8_192
 MAX_AUTH_BYTES = 1_048_576
 MAX_BLOB_BYTES = 67_108_864
 MAX_RUNNABLE_LAYER_BYTES = 20 * 1024 * 1024
+BUILD_AUTHORITIES = {
+    "local-socket": "local-socket",
+    "github-actions": "github-hosted-runner",
+}
 
 
 def _object(raw, label):
@@ -418,6 +423,16 @@ def _validate_spdx(predicate):
 
 
 def verify(arguments, github_token):
+    endpoint_kind = BUILD_AUTHORITIES.get(arguments.build_authority)
+    if endpoint_kind is None:
+        raise ValueError("build authority is invalid")
+    if arguments.build_authority == "github-actions" and (
+        os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("GITHUB_REPOSITORY") != "milkinfrastructure/milk-carton"
+        or os.environ.get("GITHUB_SHA") != arguments.source_commit
+        or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        raise ValueError("GitHub Actions build authority is invalid")
     if TAGGED.fullmatch(arguments.tagged_reference) is None:
         raise ValueError("tagged reference is invalid")
     if COMMIT.fullmatch(arguments.source_commit) is None:
@@ -668,7 +683,7 @@ def verify(arguments, github_token):
         "ops_log_reference": ops_log_reference,
         "ops_log_reference_sha256": hashlib.sha256(ops_log_raw).hexdigest(),
         "visibility": "private",
-        "build_authority": "local-socket",
+        "build_authority": arguments.build_authority,
         "buildkit_image_reference": BUILDKIT_IMAGE,
         "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
         "platform": "linux/amd64",
@@ -697,9 +712,9 @@ def verify(arguments, github_token):
         "platform": "linux/amd64",
         "visibility": "private",
         "builder": {
-            "authority": "local-socket",
+            "authority": arguments.build_authority,
             "driver": "docker-container",
-            "endpoint_kind": "local-socket",
+            "endpoint_kind": endpoint_kind,
             "buildkit_image_reference": BUILDKIT_IMAGE,
             "buildkit_version": BUILDKIT_VERSION,
             "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
@@ -722,6 +737,9 @@ def _parse_arguments(argv):
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--docker-config", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
+    parser.add_argument(
+        "--build-authority", choices=tuple(BUILD_AUTHORITIES), required=True
+    )
     parser.add_argument("--registry-token-stdin", action="store_true", required=True)
     return parser.parse_args(argv)
 

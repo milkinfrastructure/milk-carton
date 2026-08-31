@@ -462,6 +462,7 @@ verification=$(
       --metadata "$metadata" \
       --docker-config "$docker_config" \
       --evidence-dir "$evidence_dir" \
+      --build-authority local-socket \
       --registry-token-stdin
 ) || fail 'gateway image verification failed' 70
 set -- $verification

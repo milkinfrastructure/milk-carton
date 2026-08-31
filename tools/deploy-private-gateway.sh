@@ -326,7 +326,7 @@ def validate_release(directory):
         or SHA1.fullmatch(release["source_commit"] or "") is None
         or release["platform"] != "linux/amd64"
         or admission["platform"] != "linux/amd64"
-        or release["build_authority"] != "local-socket"
+        or release["build_authority"] not in ("local-socket", "github-actions")
         or release["buildkit_image_reference"] != BUILDKIT_IMAGE
         or release["dockerfile_frontend_reference"] != DOCKERFILE_FRONTEND
         or release["image"]["artifact"] != "gateway"
@@ -380,10 +380,14 @@ def validate_release(directory):
         raise ContractFailure("release content digest is invalid")
 
     builder = admission["builder"]
+    endpoint_kind = {
+        "local-socket": "local-socket",
+        "github-actions": "github-hosted-runner",
+    }[release["build_authority"]]
     if builder != {
-        "authority": "local-socket",
+        "authority": release["build_authority"],
         "driver": "docker-container",
-        "endpoint_kind": "local-socket",
+        "endpoint_kind": endpoint_kind,
         "buildkit_image_reference": BUILDKIT_IMAGE,
         "buildkit_version": "v0.23.2",
         "dockerfile_frontend_reference": DOCKERFILE_FRONTEND,
