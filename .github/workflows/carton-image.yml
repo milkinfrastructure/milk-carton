@@ -1,0 +1,95 @@
+name: Publish Milk Carton image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .dockerignore
+      - .github/workflows/carton-image.yml
+      - Cargo.lock
+      - Cargo.toml
+      - LICENSE
+      - crates/milk-carton/**
+      - deploy/cloudflare/Dockerfile
+      - deploy/licenses/**
+
+concurrency:
+  group: milk-carton-image-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      image_reference: ${{ steps.manifest.outputs.image_reference }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.25.0
+          driver-opts: image=moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
+
+      - name: Authenticate GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish
+        env:
+          BUILDKIT_IMAGE: moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
+          DOCKERFILE_FRONTEND: docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+          REPOSITORY: ghcr.io/milkinfrastructure/milk-carton
+        run: |
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$GITHUB_SHA"
+          source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          context_sha256=$(git archive --format=tar "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)
+          docker buildx build \
+            --platform linux/amd64 \
+            --file deploy/cloudflare/Dockerfile \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/milkinfrastructure/milk-carton" \
+            --provenance=mode=max,version=v1 \
+            --sbom=true \
+            --build-arg "BUILDKIT_SYNTAX=$DOCKERFILE_FRONTEND" \
+            --build-arg "MILK_BUILDKIT_IMAGE_REFERENCE=$BUILDKIT_IMAGE" \
+            --build-arg "MILK_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "MILK_SOURCE_CONTEXT_SHA256=$context_sha256" \
+            --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --cache-from "type=registry,ref=$REPOSITORY:buildcache" \
+            --cache-to "type=registry,ref=$REPOSITORY:buildcache,mode=max" \
+            --metadata-file "$RUNNER_TEMP/milk-carton-image.json" \
+            --tag "$REPOSITORY:source-$GITHUB_SHA" \
+            --push \
+            .
+
+      - name: Record immutable manifest
+        id: manifest
+        env:
+          REPOSITORY: ghcr.io/milkinfrastructure/milk-carton
+        run: |
+          digest=$(python3 - "$RUNNER_TEMP/milk-carton-image.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              print(json.load(source)["containerimage.digest"])
+          PY
+          )
+          case "$digest" in sha256:*) ;; *) exit 64 ;; esac
+          digest_hex=${digest#sha256:}
+          test "${#digest_hex}" -eq 64
+          case "$digest_hex" in *[!0-9a-f]*) exit 64 ;; esac
+          immutable_reference="$REPOSITORY@$digest"
+          printf 'image_reference=%s\n' "$immutable_reference" >> "$GITHUB_OUTPUT"
+          printf -- '- `%s`\n' "$immutable_reference" >> "$GITHUB_STEP_SUMMARY"

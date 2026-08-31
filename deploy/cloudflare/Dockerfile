@@ -9,10 +9,15 @@ ARG SOURCE_DATE_EPOCH
 ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY crates/milk-carton/Cargo.toml ./crates/milk-carton/Cargo.toml
+RUN mkdir -p crates/milk-carton/src && \
+    printf 'fn main() {}\n' > crates/milk-carton/src/main.rs && \
+    cargo build --locked --release --package milk-carton --jobs 4
 COPY LICENSE ./
-COPY crates/milk-carton ./crates/milk-carton
+COPY crates/milk-carton/src ./crates/milk-carton/src
 COPY deploy/licenses/bundle-rust.sh ./deploy/licenses/bundle-rust.sh
-RUN cargo build --locked --release --package milk-carton --jobs 4 && \
+RUN cargo clean --release --package milk-carton && \
+    cargo build --locked --release --package milk-carton --jobs 4 && \
     /bin/sh deploy/licenses/bundle-rust.sh /src/THIRD_PARTY_LICENSES.txt
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a
