@@ -68,7 +68,10 @@ jobs:
           test "$(git rev-parse --verify 'HEAD^{commit}')" = "$GITHUB_SHA"
           source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
           context_sha256=$(git archive --format=tar "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)
+          build_log="$RUNNER_TEMP/milk-carton-build.log"
+          set +e
           docker buildx build \
+            --progress=plain \
             --platform linux/amd64 \
             --file deploy/cloudflare/Dockerfile \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
@@ -85,7 +88,20 @@ jobs:
             --metadata-file "$RUNNER_TEMP/milk-carton-image.json" \
             --tag "$REPOSITORY:source-$GITHUB_SHA" \
             --push \
-            .
+            . 2>&1 | tee "$build_log"
+          build_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$build_status" -ne 0 ]; then
+            python3 - "$build_log" <<'PY'
+          import pathlib
+          import sys
+
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()[-40:]
+          message = "\n".join(lines).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=Carton image build failed::{message}")
+          PY
+            exit "$build_status"
+          fi
 
       - name: Record immutable manifest
         id: manifest
