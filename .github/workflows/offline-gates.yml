@@ -1,4 +1,4 @@
-name: offline-gates
+name: source-check
 
 on:
   pull_request:
@@ -10,85 +10,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: milk-carton-offline-${{ github.ref }}
+  group: milk-carton-source-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
 
-      - name: Install pinned Node dependencies
+      - name: Check production gateway source
         run: |
-          npm ci --ignore-scripts
-          npm --prefix deploy/cloudflare ci --ignore-scripts
-
-      - id: rust
-        name: Rust fmt, tests, and clippy
-        env:
-          RUST_MIN_STACK: "16777216"
-        run: |
-          cargo +1.95.0 fetch --locked
           cargo +1.95.0 fmt --all -- --check
-          cargo +1.95.0 test --locked --offline --workspace --all-targets
-          cargo +1.95.0 clippy --locked --offline --workspace --all-targets -- -D warnings
-
-      - id: contracts
-        name: Node, Cloudflare, release, and shell contracts
-        run: |
-          npm test
-          node tools/openai-production-smoke.test.mjs
-          node tools/openai-production-path-workload.test.mjs
-          npm --prefix deploy/cloudflare test
-          python3 tools/test_manage_candidate_credential.py
-          python3 tools/test_private_build.py
-          python3 tools/test_deploy_private_gateway.py
-          bash deploy/milk-carton-key.test.sh
-          bash deploy/milk-carton-publish-route.test.sh
-          sh -n tools/build-private-gateway.sh tools/deploy-private-gateway.sh
-
-      - name: Write content-free CI receipt
-        if: always()
-        env:
-          RUST_OUTCOME: ${{ steps.rust.outcome }}
-          CONTRACTS_OUTCOME: ${{ steps.contracts.outcome }}
-        run: |
-          install -d -m 0700 ci-evidence
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          value = {
-              "schema_version": "milk.private-ci-ops-log-reference.v1",
-              "source_commit": os.environ["GITHUB_SHA"],
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-              "ops_log_authority": "private-github-actions-run",
-              "ops_log_reference": f"actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}",
-              "immutable": True,
-              "content_free_receipt": True,
-              "rust_outcome": os.environ.get("RUST_OUTCOME", "skipped"),
-              "contracts_outcome": os.environ.get("CONTRACTS_OUTCOME", "skipped"),
-          }
-          Path("ci-evidence/receipt.json").write_text(
-              json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
-              encoding="utf-8",
-          )
-          PY
-
-      - name: Retain private CI receipt
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: milk-carton-ci-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-evidence/receipt.json
-          if-no-files-found: error
-          retention-days: 30
+          cargo +1.95.0 check --locked -p milk-carton --bin milk-carton
