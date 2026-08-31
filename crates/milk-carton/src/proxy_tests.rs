@@ -181,11 +181,6 @@ fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
     let mut no_traffic_key = config(1_024, 1);
     no_traffic_key.traffic_keys.clear();
     assert!(validate_config_identity(&no_traffic_key).is_err());
-    let mut mixed_scope = config(1_024, 1);
-    mixed_scope
-        .traffic_keys
-        .push(traffic_key(SMOKE_KEY, Uuid::new_v4(), false));
-    assert!(validate_config_identity(&mixed_scope).is_err());
     let mut too_many_keys = config(1_024, 1);
     let scope_id = config_scope(&too_many_keys).scope_id;
     too_many_keys.traffic_keys = (0..=super::MAX_TRAFFIC_KEYS)
@@ -214,11 +209,12 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
         None,
     )
     .unwrap();
+    let scope = &gateway.traffic_keys[0].scope;
     let empty = actix_web::http::header::HeaderMap::new();
     let previous_only = br#"{"model":"test","previous_response_id":"resp_previous"}"#;
     let previous = sampling_identity(
         &gateway,
-        &gateway.scope,
+        scope,
         RouteEndpoint::Responses,
         &empty,
         previous_only,
@@ -236,7 +232,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
     );
     let header_root_a = sampling_identity(
         &gateway,
-        &gateway.scope,
+        scope,
         RouteEndpoint::Responses,
         &session_headers,
         previous_only,
@@ -244,7 +240,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
     );
     let header_root_b = sampling_identity(
         &gateway,
-        &gateway.scope,
+        scope,
         RouteEndpoint::Responses,
         &session_headers,
         previous_only,
@@ -260,7 +256,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
 
     let conversation = sampling_identity(
         &gateway,
-        &gateway.scope,
+        scope,
         RouteEndpoint::Responses,
         &empty,
         br#"{"model":"test","conversation":"conv_root","previous_response_id":"resp_previous"}"#,
@@ -272,7 +268,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
 
     let standalone = sampling_identity(
         &gateway,
-        &gateway.scope,
+        scope,
         RouteEndpoint::Responses,
         &empty,
         br#"{"model":"test","input":"standalone"}"#,

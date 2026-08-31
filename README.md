@@ -21,7 +21,7 @@ The public contract is deliberately narrow:
 - The customer supplies one OpenAI-compatible endpoint and one `milk_live_...` key. The official SDK uses Chat Completions or Responses through the standard `Authorization: Bearer` header and receives the normal response.
 - The hosted operator owns the gateway and eval configuration, one S3-compatible bucket with process-scoped logical roles, upstream and Baseten credentials, capture policy, and route policy. The hosted deployment uses Cloudflare R2; self-hosters may use another qualified S3-compatible service.
 
-During the single-tenant pilot, Milk issues, rotates, and revokes `milk_live_...` keys through an atomic config deployment. There is no customer key-management API yet. Milk is the product name; `milk-carton`, `MILK_CARTON_*`, and `milk_live_...` remain the stable binary, environment, and wire identifiers.
+During the pilot, Milk issues, rotates, and revokes `milk_live_...` keys through an atomic config deployment. Baseline-only capture may map keys to distinct scopes; routed and control operation remains single-scope. There is no customer key-management API yet. Milk is the product name; `milk-carton`, `MILK_CARTON_*`, and `milk_live_...` remain the stable binary, environment, and wire identifiers.
 
 The gateway records only completed traffic admitted by the operator's capture policy. It loads one strict startup configuration, reports its SHA-256, and polls signed, revisioned route state while retaining the last verified route after a failed refresh.
 
@@ -46,7 +46,7 @@ The important settings are:
 - request-key records containing the key UUID, exact key hash, stable scope UUID, and capture authority;
 - optional `revocation` metadata, whose presence disables that key without moving its scope history;
 - capture, control, and route object-store roles, which may share one physical bucket;
-- one operator-assigned scope shared by the deployment's request keys, its `milk/v1/scopes/<scope_id>/` object namespace, and its hard decision/call limits;
+- an operator-assigned scope per request key, its `milk/v1/scopes/<scope_id>/` object namespace, and its hard decision/call limits; routed and control deployments use one scope;
 - immutable teacher, student, and image identities.
 
 Secrets stay in environment variables:

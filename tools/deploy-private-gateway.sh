@@ -789,8 +789,8 @@ def parse_gateway_config(raw, allow_legacy=False):
         key_ids.add(traffic_key["key_id"])
         hashes.add(traffic_key["api_key_sha256"])
         scope_ids.add(traffic_key["scope_id"])
-    if len(scope_ids) != 1:
-        raise DeployFailure("gateway traffic keys must map to one scope")
+    if len(scope_ids) > 1 and config.get("route") is not None:
+        raise DeployFailure("multiple gateway traffic scopes require route disabled")
     return config
 
 

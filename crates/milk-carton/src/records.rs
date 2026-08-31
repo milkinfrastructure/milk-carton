@@ -795,7 +795,7 @@ impl Default for StatsCounters {
 }
 
 struct StatsRuntime {
-    scope: Scope,
+    scopes: HashSet<Scope>,
     capture_basis_points: u16,
     capture_policy_version: Option<String>,
     sampling_key_version: String,
@@ -817,6 +817,21 @@ pub(crate) struct RecordsHealth {
 }
 
 impl StatsRuntime {
+    fn single_scope(&self) -> Option<&Scope> {
+        if self.scopes.len() == 1 {
+            self.scopes.iter().next()
+        } else {
+            None
+        }
+    }
+
+    fn accepts(&self, catalog: &TraceCatalog) -> bool {
+        self.scopes.contains(&catalog.scope)
+            && catalog.sampler_id == CAPTURE_SAMPLER_ID
+            && catalog.capture_basis_points == self.capture_basis_points
+            && catalog.sampling_key_version == self.sampling_key_version
+    }
+
     fn health(&self) -> RecordsHealth {
         let writer_alive = self.counters.writer_alive.load(Ordering::Acquire);
         let consecutive_persist_failures = self
@@ -4163,12 +4178,18 @@ impl Records {
         objects: Arc<dyn ObjectStore>,
         queue_max_bytes: usize,
         max_trace_bytes: usize,
-        scope: Scope,
+        scopes: Vec<Scope>,
         capture_basis_points: u16,
         capture_policy_version: Option<String>,
         sampling_key_version: String,
     ) -> Result<Self> {
-        validate_scope(&scope)?;
+        if scopes.is_empty() {
+            bail!("at least one capture scope is required");
+        }
+        for scope in &scopes {
+            validate_scope(scope)?;
+        }
+        let scopes = scopes.into_iter().collect();
         if queue_max_bytes == 0 || queue_max_bytes > u32::MAX as usize {
             bail!("queue_max_bytes must be in 1..=u32::MAX");
         }
@@ -4198,7 +4219,7 @@ impl Records {
         let (sender, receiver) = mpsc::channel(TRACE_QUEUE_RECORDS);
         let queue_budget = Arc::new(Semaphore::new(queue_max_bytes));
         let stats = Arc::new(StatsRuntime {
-            scope,
+            scopes,
             capture_basis_points,
             capture_policy_version,
             sampling_key_version,
@@ -4231,7 +4252,7 @@ impl Records {
             objects,
             queue_max_bytes,
             max_trace_bytes,
-            scope,
+            vec![scope],
             capture_basis_points,
             (capture_basis_points > 0).then(|| "test-policy-v1".to_owned()),
             "test-key-v1".to_owned(),
@@ -4252,9 +4273,9 @@ impl Records {
         });
         let (sender, receiver) = mpsc::channel(TRACE_QUEUE_RECORDS);
         let stats = Arc::new(StatsRuntime {
-            scope: Scope {
+            scopes: HashSet::from([Scope {
                 scope_id: Uuid::new_v4(),
-            },
+            }]),
             capture_basis_points: 0,
             capture_policy_version: None,
             sampling_key_version: "test-v1".to_owned(),
@@ -4781,7 +4802,7 @@ impl RecordStore {
         stats_runtime: Arc<StatsRuntime>,
     ) {
         let mut batch = Vec::with_capacity(256);
-        let mut stats = HashMap::<DateTime<Utc>, StatsValues>::new();
+        let mut stats = HashMap::<(Scope, DateTime<Utc>), StatsValues>::new();
         let mut pending_stats = Vec::new();
         let mut dropped_snapshot = 0;
         let mut stats_failure_snapshot = 0;
@@ -4847,24 +4868,24 @@ impl RecordStore {
         &self,
         batch: &mut Vec<QueuedTrace>,
         stats_runtime: &StatsRuntime,
-        stats: &mut HashMap<DateTime<Utc>, StatsValues>,
+        stats: &mut HashMap<(Scope, DateTime<Utc>), StatsValues>,
     ) {
         let results = futures::stream::iter(batch.drain(..))
             .map(|queued| async move {
-                (
-                    queued.event.catalog().clone(),
-                    self.persist_event(&queued).await,
-                )
+                let catalog = queued.event.catalog().clone();
+                let result = if stats_runtime.accepts(&catalog) {
+                    Some(self.persist_event(&queued).await)
+                } else {
+                    None
+                };
+                (catalog, result)
             })
             .buffer_unordered(OBJECT_WRITE_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
         for (catalog, result) in results {
             let hour = hour_start(catalog.occurred_at);
-            let valid_stats_identity = catalog.scope == stats_runtime.scope
-                && catalog.sampler_id == CAPTURE_SAMPLER_ID
-                && catalog.capture_basis_points == stats_runtime.capture_basis_points;
-            if !valid_stats_identity {
+            let Some(result) = result else {
                 stats_runtime
                     .counters
                     .trace_persist_failures
@@ -4872,7 +4893,7 @@ impl RecordStore {
                 stats_runtime.persist_failed();
                 tracing::error!(trace_id = %catalog.trace_id, "trace stats identity differs from writer");
                 continue;
-            }
+            };
             let (state, captured) = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -4898,7 +4919,7 @@ impl RecordStore {
                     .fetch_add(1, Ordering::Relaxed);
             }
             stats
-                .entry(hour)
+                .entry((catalog.scope.clone(), hour))
                 .or_default()
                 .observe(&catalog, state, captured);
         }
@@ -4971,7 +4992,7 @@ impl RecordStore {
     async fn flush_stats(
         &self,
         runtime: &StatsRuntime,
-        stats: &mut HashMap<DateTime<Utc>, StatsValues>,
+        stats: &mut HashMap<(Scope, DateTime<Utc>), StatsValues>,
         pending: &mut Vec<EncodedObject>,
         dropped_snapshot: &mut u64,
         stats_failure_snapshot: &mut u64,
@@ -4984,8 +5005,12 @@ impl RecordStore {
             .saturating_sub(*stats_failure_snapshot);
         *dropped_snapshot = health.dropped;
         *stats_failure_snapshot = health.stats_persist_failures;
-        if dropped > 0 || stats_failures > 0 {
-            let values = stats.entry(hour_start(Utc::now())).or_default();
+        if let Some(scope) = runtime.single_scope()
+            && (dropped > 0 || stats_failures > 0)
+        {
+            let values = stats
+                .entry((scope.clone(), hour_start(Utc::now())))
+                .or_default();
             values.dropped = values.dropped.saturating_add(dropped);
             values.stats_persist_failures =
                 values.stats_persist_failures.saturating_add(stats_failures);
@@ -4995,14 +5020,14 @@ impl RecordStore {
         }
         let recorded_at = Utc::now();
         let current = std::mem::take(stats);
-        for (hour, values) in current {
+        for ((scope, hour), values) in current {
             if values.is_empty() {
                 continue;
             }
             let flush_id = Uuid::now_v7();
             let shard = StatsShard {
                 schema_version: STATS_SHARD_SCHEMA_VERSION.to_owned(),
-                scope: runtime.scope.clone(),
+                scope: scope.clone(),
                 writer_id: self.writer_id,
                 flush_id,
                 hour,
@@ -5013,10 +5038,7 @@ impl RecordStore {
                 capture_basis_points: runtime.capture_basis_points,
                 values,
             };
-            match encode_json(
-                stats_key(&runtime.scope, hour, self.writer_id, flush_id),
-                &shard,
-            ) {
+            match encode_json(stats_key(&scope, hour, self.writer_id, flush_id), &shard) {
                 Ok(object) => pending.push(object),
                 Err(error) => {
                     runtime
@@ -5025,7 +5047,7 @@ impl RecordStore {
                         .fetch_add(1, Ordering::Relaxed);
                     runtime.persist_failed();
                     tracing::error!(error = %error, "stats encoding failed");
-                    stats.insert(hour, shard.values);
+                    stats.insert((scope, hour), shard.values);
                 }
             }
         }

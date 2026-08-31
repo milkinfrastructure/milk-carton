@@ -442,7 +442,7 @@ struct Gateway {
     traffic_keys: Arc<[TrafficKey]>,
     outcome_key_id: Uuid,
     outcome_key_sha256: [u8; 32],
-    scope: Scope,
+    outcome_scope: Option<Scope>,
     records: Option<Records>,
     capture: CaptureConfig,
     capture_sampling_key: ring::hmac::Key,
@@ -628,6 +628,12 @@ impl Gateway {
             bail!("configured request concurrency exceeds max_active_body_bytes");
         }
         let traffic_keys = configured_traffic_keys(&config.traffic_keys)?;
+        let outcome_scope = single_config_scope(config);
+        if outcome_scope.is_none()
+            && (config.route.is_some() || route.revision() != RoutePolicy::baseline().revision())
+        {
+            bail!("multiple traffic scopes require unconfigured baseline routing");
+        }
         let outcome_key_sha256 = decode_sha256(&config.outcome_key_sha256)?;
         if traffic_keys
             .iter()
@@ -651,7 +657,7 @@ impl Gateway {
             traffic_keys: traffic_keys.into(),
             outcome_key_id: config.outcome_key_id,
             outcome_key_sha256,
-            scope: config_scope(config),
+            outcome_scope,
             records,
             capture: CaptureConfig {
                 mode: config.capture_mode,
@@ -2082,14 +2088,33 @@ fn command_uses_deployment_config(command: Option<&Command>) -> bool {
 }
 
 fn config_scope(config: &FileConfig) -> Scope {
-    Scope {
-        scope_id: config.traffic_keys[0].scope_id,
+    single_config_scope(config).expect("validated control command has exactly one scope")
+}
+
+fn config_scopes(config: &FileConfig) -> Vec<Scope> {
+    let mut scope_ids = HashSet::with_capacity(config.traffic_keys.len());
+    config
+        .traffic_keys
+        .iter()
+        .filter(|key| scope_ids.insert(key.scope_id))
+        .map(|key| Scope {
+            scope_id: key.scope_id,
+        })
+        .collect()
+}
+
+fn single_config_scope(config: &FileConfig) -> Option<Scope> {
+    let scopes = config_scopes(config);
+    if scopes.len() == 1 {
+        scopes.into_iter().next()
+    } else {
+        None
     }
 }
 
 fn config_route_scope(config: &FileConfig) -> RouteScope {
     RouteScope {
-        scope_id: config.traffic_keys[0].scope_id,
+        scope_id: config_scope(config).scope_id,
     }
 }
 
@@ -2205,7 +2230,7 @@ async fn open_records(
         objects,
         config.capture_queue_bytes,
         config.capture_record_bytes,
-        config_scope(config),
+        config_scopes(config),
         config.capture_basis_points,
         (!config.capture_policy_version.is_empty()).then(|| config.capture_policy_version.clone()),
         sampling_key_version,
@@ -2318,13 +2343,12 @@ fn validate_serve_config_owner(config: &FileConfig, owner: InputOwner) -> Result
 
 fn validate_config_identity(config: &FileConfig) -> Result<()> {
     let traffic_keys = configured_traffic_keys(&config.traffic_keys)?;
-    let scope_id = traffic_keys[0].scope.scope_id;
-    let identities = [config.outcome_key_id, scope_id];
-    if identities.iter().any(Uuid::is_nil) {
-        bail!("outcome key ID and scope_id must be non-nil");
-    }
-    if identities.into_iter().collect::<HashSet<_>>().len() != identities.len() {
-        bail!("outcome key ID and scope_id must differ");
+    if config.outcome_key_id.is_nil()
+        || traffic_keys
+            .iter()
+            .any(|key| key.scope.scope_id == config.outcome_key_id)
+    {
+        bail!("outcome key ID must be non-nil and differ from every scope_id");
     }
     if traffic_keys
         .iter()
@@ -2357,7 +2381,13 @@ fn validate_config_identity(config: &FileConfig) -> Result<()> {
 }
 
 fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -> Result<()> {
-    match command.unwrap_or(&Command::Serve) {
+    let command = command.unwrap_or(&Command::Serve);
+    if single_config_scope(config).is_none()
+        && (!matches!(command, Command::Serve) || config.route.is_some())
+    {
+        bail!("multiple traffic scopes require serve with route disabled");
+    }
+    match command {
         Command::Serve => {
             parse_openai_compatible_api_base_url(
                 &config.baseline.api_base_url,
@@ -3250,6 +3280,14 @@ async fn outcome(
             "invalid_outcome_key",
         );
     }
+    let Some(scope) = gateway.outcome_scope.as_ref() else {
+        return local_error(
+            StatusCode::CONFLICT,
+            trace_id,
+            "Outcome scope is ambiguous for this gateway.",
+            "outcome_scope_ambiguous",
+        );
+    };
     let Some(records) = &gateway.records else {
         return local_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3344,7 +3382,7 @@ async fn outcome(
         let retry_deadline = Instant::now() + retry_for;
         loop {
             match records
-                .persist_outcome(&gateway.scope, &submission, retention_until)
+                .persist_outcome(scope, &submission, retention_until)
                 .await
             {
                 Ok(write) => return Ok(Some(write)),
@@ -4207,7 +4245,6 @@ fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<TrafficKey
     }
     let mut key_ids = HashSet::with_capacity(values.len());
     let mut hashes = HashSet::with_capacity(values.len());
-    let mut scope_id = None;
     let mut configured = Vec::with_capacity(values.len());
     for value in values {
         if value.key_id.is_nil() || value.scope_id.is_nil() {
@@ -4219,13 +4256,6 @@ fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<TrafficKey
         let sha256 = decode_lowercase_sha256(&value.api_key_sha256)?;
         if !hashes.insert(sha256) {
             bail!("traffic_keys contains a duplicate API-key SHA-256");
-        }
-        match scope_id {
-            Some(scope_id) if scope_id != value.scope_id => {
-                bail!("traffic_keys must map to one scope_id per gateway configuration")
-            }
-            None => scope_id = Some(value.scope_id),
-            Some(_) => {}
         }
         if let Some(revocation) = &value.revocation {
             if revocation
