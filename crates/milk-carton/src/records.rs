@@ -7207,6 +7207,65 @@ impl RecordStore {
         Ok(None)
     }
 
+    async fn teacher_gpu_capacity_available(
+        &self,
+        scope: &Scope,
+        provider_binding_sha256: &[u8; 32],
+        runtime_image_reference: &str,
+        max_gpu_seconds: u64,
+        max_calls: u8,
+        max_parallel_runs: u8,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let run_indexes = self
+            .load_teacher_gpu_run_indexes(scope, provider_binding_sha256)
+            .await?;
+        for slot_number in 0..max_parallel_runs {
+            let Some((slot, _, _)) = self
+                .load_teacher_gpu_slot(scope, provider_binding_sha256, slot_number)
+                .await?
+            else {
+                return Ok(true);
+            };
+            let matching = run_indexes
+                .iter()
+                .filter(|index| {
+                    index.claim.definition.slot == slot.slot
+                        && index.claim.definition.run_nonce == slot.run_nonce
+                })
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                bail!("teacher GPU slot has multiple canonical runs");
+            }
+            let Some(index) = matching.first() else {
+                if now >= slot.expires_at {
+                    return Ok(true);
+                }
+                continue;
+            };
+            let teacher_run_id = decode_hex_digest(&index.teacher_run_id)?;
+            let terminal = self
+                .load_teacher_gpu_run_result(scope, &teacher_run_id)
+                .await?
+                .is_some();
+            if terminal || now >= index.expires_at {
+                return Ok(true);
+            }
+            let claim_exists = self
+                .exists(&teacher_gpu_run_claim_key(scope, &teacher_run_id))
+                .await?;
+            if !claim_exists
+                && slot.runtime_image_reference == runtime_image_reference
+                && slot.max_gpu_seconds == max_gpu_seconds
+                && slot.max_calls == max_calls
+                && slot.max_parallel_runs == max_parallel_runs
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn resume_pending_teacher_gpu_run(
         &self,
@@ -7387,6 +7446,20 @@ impl RecordStore {
             .await?
         {
             return Ok(write);
+        }
+        if !self
+            .teacher_gpu_capacity_available(
+                scope,
+                &provider_binding_sha256,
+                &runtime_image_reference,
+                max_gpu_seconds,
+                max_calls,
+                max_parallel_runs,
+                now,
+            )
+            .await?
+        {
+            return Ok(TeacherGpuTickWrite::Hold);
         }
         let mut claimed_decisions = self.teacher_decision_count(scope).await?;
         let active = self
