@@ -218,15 +218,18 @@ export class MilkCarton extends Container {
         throw new Error("candidate credential binding changed");
       }
       const previous = await this.getState();
-      await this.stop();
-      let stopped = false;
-      for (let attempt = 0; attempt < 80; attempt += 1) {
-        const state = await this.getState();
-        if (state.status === "stopped" || state.status === "stopped_with_code") {
-          stopped = true;
-          break;
+      let stopped =
+        previous.status === "stopped" || previous.status === "stopped_with_code";
+      if (!stopped) {
+        await this.stop();
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const state = await this.getState();
+          if (state.status === "stopped" || state.status === "stopped_with_code") {
+            stopped = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
         }
-        await new Promise((resolve) => setTimeout(resolve, 250));
       }
       if (!stopped) {
         throw new Error("container did not stop");
