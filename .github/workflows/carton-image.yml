@@ -35,10 +35,24 @@ jobs:
           persist-credentials: false
 
       - name: Set up pinned Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-        with:
-          version: v0.25.0
-          driver-opts: image=moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
+        env:
+          BUILDKIT_IMAGE: moby/buildkit@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e
+          BUILDX_SHA256: 4104d79a791a8744c0b43fd5bd0a6172dff29040c5229946a1cdb2d27b0b5bfa
+          BUILDX_URL: https://github.com/docker/buildx/releases/download/v0.25.0/buildx-v0.25.0.linux-amd64
+        run: |
+          docker_config="$RUNNER_TEMP/docker-config"
+          download="$RUNNER_TEMP/buildx-v0.25.0.linux-amd64"
+          plugin="$docker_config/cli-plugins/docker-buildx"
+          mkdir -p "$docker_config/cli-plugins"
+          curl --fail --location --silent --show-error "$BUILDX_URL" --output "$download"
+          printf '%s  %s\n' "$BUILDX_SHA256" "$download" | sha256sum --check --strict
+          install -m 0755 "$download" "$plugin"
+          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
+          export DOCKER_CONFIG=$docker_config
+          docker buildx version | grep -F ' v0.25.0 '
+          docker buildx create --name milk-carton --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --use
+          docker buildx inspect --bootstrap
 
       - name: Authenticate GHCR
         env:
