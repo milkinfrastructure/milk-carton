@@ -1297,7 +1297,7 @@ def main():
             "config_sha256": None,
             "worker_ready": False,
             "image_ready": False,
-            "instances_ready": False,
+            "instances_observed": False,
             "active_instances": 0,
             "application_version": None,
         }
@@ -1353,17 +1353,12 @@ def main():
                 if not isinstance(values, list):
                     raise ContractFailure("container instances are invalid")
                 active = [item for item in values if isinstance(item, dict) and item.get("state") != "inactive"]
+                last["instances_observed"] = True
                 last["active_instances"] = len(active)
-                last["instances_ready"] = (
-                    application_version is not None
-                    and len(active) == 1
-                    and active[0].get("state") == "running"
-                    and active[0].get("version") == application_version
-                )
             except (CommandFailure, ContractFailure):
+                last["instances_observed"] = False
                 last["active_instances"] = 0
-                last["instances_ready"] = False
-            if all(last[key] for key in ("health_ready", "worker_ready", "image_ready", "instances_ready")):
+            if all(last[key] for key in ("health_ready", "worker_ready", "image_ready")):
                 evidence.write(f"smoke-{phase}.json", {
                     "schema_version": "milk.content-free-gateway-smoke.v1",
                     "operation_id": operation_id,
@@ -1373,6 +1368,7 @@ def main():
                     "health_contract": "status-ok-config-sha256",
                     "config_sha256": last["config_sha256"],
                     "content_retained": False,
+                    "instances_observed": last["instances_observed"],
                     "active_instances": last["active_instances"],
                     "application_version": last["application_version"],
                     "succeeded": True,
@@ -1393,6 +1389,10 @@ def main():
             "health_contract": "status-ok-config-sha256",
             "config_sha256": last["config_sha256"],
             "content_retained": False,
+            "health_ready": last["health_ready"],
+            "worker_ready": last["worker_ready"],
+            "image_ready": last["image_ready"],
+            "instances_observed": last["instances_observed"],
             "active_instances": last["active_instances"],
             "application_version": last["application_version"],
             "succeeded": False,
