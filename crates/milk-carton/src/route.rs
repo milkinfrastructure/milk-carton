@@ -11,7 +11,8 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 pub(crate) const ROUTE_SCHEMA_VERSION: &str = "milk.route.v4";
-pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v2";
+pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v3";
+const LEGACY_OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v2";
 pub(crate) const OPERATOR_ROUTE_SCHEMA_VERSION: &str = "milk.route.v1";
 pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "milk.winner-admission-receipt.v2";
 const ROUTE_LIVE_SCHEMA_VERSION: &str = "milk.route-live.v1";
@@ -51,11 +52,9 @@ const MAX_ROUTE_VALIDITY_HOURS: i64 = 24;
 const MAX_PUBLICATION_START_DELAY_MINUTES: i64 = 5;
 const MAX_HARNESS_CANDIDATE_BASIS_POINTS: u16 = 1_000;
 const MAX_HARNESS_SPEND_MICROUSD: u64 = 25_000_000;
-const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v2";
+const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v4";
+const LEGACY_HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v2";
 const HARNESS_TAXONOMY_VERSION: &str = "milk.semantic-taxonomy.v1";
-const NON_PRODUCTION_MECHANICS_SCOPE_ID: u128 = 0xf7f88ff0_5947_440c_a661_e4e35f1d04e0;
-const NON_PRODUCTION_MECHANICS_EVAL_SHA256: &str =
-    "26b09c53937d80b07bc49f42beeca8562eaa4b303023d13033777da472c04499";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -513,8 +512,10 @@ pub(crate) struct HarnessTeacherBinding {
     pub(crate) timeout_seconds: u64,
     pub(crate) max_input_tokens: u64,
     pub(crate) max_output_tokens: u64,
-    pub(crate) input_rate_microusd_per_million: u64,
-    pub(crate) output_rate_microusd_per_million: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input_rate_microusd_per_million: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_rate_microusd_per_million: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -522,8 +523,10 @@ pub(crate) struct HarnessTeacherBinding {
 pub(crate) struct HarnessScoreTargetBinding {
     pub(crate) api_url: String,
     pub(crate) model: String,
-    pub(crate) input_rate_microusd_per_million: u64,
-    pub(crate) output_rate_microusd_per_million: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input_rate_microusd_per_million: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_rate_microusd_per_million: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -543,6 +546,12 @@ pub(crate) struct HarnessCandidateScoreBinding {
     pub(crate) minimum_reference_pass_delta_basis_points: i16,
     pub(crate) maximum_candidate_error_basis_points: u16,
     pub(crate) maximum_candidate_p95_latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) minimum_fallback_reference_pass_basis_points: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) maximum_fallback_error_basis_points: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) maximum_fallback_p95_latency_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -587,11 +596,13 @@ pub(crate) struct OperatorRouteProvenance {
     pub(crate) prompt_sha256s: HarnessPromptDigests,
     pub(crate) teacher: HarnessTeacherBinding,
     pub(crate) candidate_score: HarnessCandidateScoreBinding,
-    pub(crate) budget: HarnessBudgetBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) budget: Option<HarnessBudgetBinding>,
     pub(crate) job_ids: HarnessJobIds,
     pub(crate) teacher_result_sha256s: HarnessTeacherResultDigests,
     pub(crate) provider_tokens: u64,
-    pub(crate) accounted_cost_microusd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) accounted_cost_microusd: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -615,12 +626,20 @@ pub(crate) struct OperatorRouteProposal {
     pub(crate) provenance: OperatorRouteProvenance,
 }
 
+impl OperatorRouteProposal {
+    pub(crate) fn uses_budget_free_contract(&self) -> bool {
+        self.schema_version == OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorRouteManifest {
     schema_version: String,
     scope: RouteScope,
     proposal_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<HarnessProfile>,
     candidate: Option<OperatorRouteCandidate>,
     candidate_basis_points: u16,
     previous_route_revision: Option<String>,
@@ -753,6 +772,12 @@ impl RoutePublication {
             publication,
             ..
         } = parse_manifest(config, expected_scope, manifest_bytes)?;
+        if now.is_some()
+            && matches!(publication.source, RoutePublicationSource::StudentWinner)
+            && publication.candidate_basis_points > 0
+        {
+            bail!("legacy student winner candidate routes are read-only");
+        }
         if let Some(now) = now
             && (manifest.not_after <= now
                 || manifest.not_after > now + chrono::TimeDelta::hours(MAX_ROUTE_VALIDITY_HOURS)
@@ -793,7 +818,6 @@ pub(crate) fn prepare_route_manifest(
     now: DateTime<Utc>,
     valid_for_seconds: u32,
 ) -> Result<(Vec<u8>, RoutePublication)> {
-    reject_non_production_mechanics_route(scope.scope_id, None)?;
     if !(60..=u32::try_from(MAX_ROUTE_VALIDITY_HOURS * 60 * 60)?).contains(&valid_for_seconds) {
         bail!("route validity must be in 60..=86400 seconds");
     }
@@ -898,6 +922,9 @@ fn prepare_operator_route_manifest_inner(
     zero: bool,
 ) -> Result<(Vec<u8>, RoutePublication)> {
     let proposal = parse_operator_route_proposal(config, scope, proposal_bytes)?;
+    if !zero && !proposal.uses_budget_free_contract() {
+        bail!("legacy operator proposals are read-only except for zero-route rollback");
+    }
     let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
     if zero {
         let previous = previous.context("operator zero route requires a live predecessor")?;
@@ -961,6 +988,7 @@ fn prepare_operator_route_manifest_inner(
         schema_version: OPERATOR_ROUTE_SCHEMA_VERSION.to_owned(),
         scope: scope.clone(),
         proposal_sha256: hex_digest(&proposal_sha256),
+        profile: Some(proposal.profile),
         candidate,
         candidate_basis_points,
         previous_route_revision: previous.map(RoutePublication::revision_hex),
@@ -988,9 +1016,13 @@ pub(crate) fn parse_operator_route_proposal(
     if canonical_proposal != proposal_bytes {
         bail!("route proposal must be canonical key-sorted compact JSON plus one LF");
     }
-    if proposal.schema_version != OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION {
+    if !matches!(
+        proposal.schema_version.as_str(),
+        OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION | LEGACY_OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION
+    ) {
         bail!("route proposal has an unsupported schema version");
     }
+    let budget_free = proposal.uses_budget_free_contract();
     if proposal.scope_id != scope.scope_id {
         bail!("route proposal scope does not match startup configuration");
     }
@@ -1045,11 +1077,18 @@ pub(crate) fn parse_operator_route_proposal(
     ] {
         decode_lowercase_hex_32(value, description)?;
     }
-    reject_non_production_mechanics_route(proposal.scope_id, Some(&proposal.eval_sha256))?;
+    if budget_free && proposal.profile != HarnessProfile::Production {
+        bail!("budget-free candidate proposals require production-qualified evidence");
+    }
     if !valid_harness_identifier(&proposal.series_id)
         || !valid_harness_identifier(&proposal.candidate_id)
         || !valid_model_alias(&proposal.model)
-        || proposal.code_version != HARNESS_CODE_VERSION
+        || proposal.code_version
+            != if budget_free {
+                HARNESS_CODE_VERSION
+            } else {
+                LEGACY_HARNESS_CODE_VERSION
+            }
         || proposal.provenance.taxonomy_version != HARNESS_TAXONOMY_VERSION
         || proposal.provenance.harness_revision.len() != 40
         || !proposal
@@ -1060,16 +1099,77 @@ pub(crate) fn parse_operator_route_proposal(
     {
         bail!("route proposal harness identity is invalid");
     }
-    let budget = proposal.provenance.budget;
-    if budget.starting_spend_microusd > budget.stop_new_spend_microusd
-        || budget.stop_new_spend_microusd > budget.absolute_spend_microusd
-        || budget.absolute_spend_microusd > MAX_HARNESS_SPEND_MICROUSD
-        || proposal.provenance.accounted_cost_microusd
-            > budget
-                .absolute_spend_microusd
-                .saturating_sub(budget.starting_spend_microusd)
-    {
-        bail!("route proposal budget is invalid");
+    let monetary_fields = [
+        proposal.provenance.teacher.input_rate_microusd_per_million,
+        proposal.provenance.teacher.output_rate_microusd_per_million,
+        proposal
+            .provenance
+            .candidate_score
+            .incumbent
+            .input_rate_microusd_per_million,
+        proposal
+            .provenance
+            .candidate_score
+            .incumbent
+            .output_rate_microusd_per_million,
+        proposal
+            .provenance
+            .candidate_score
+            .candidate
+            .input_rate_microusd_per_million,
+        proposal
+            .provenance
+            .candidate_score
+            .candidate
+            .output_rate_microusd_per_million,
+    ];
+    let fallback_fields = [
+        proposal
+            .provenance
+            .candidate_score
+            .minimum_fallback_reference_pass_basis_points
+            .map(u64::from),
+        proposal
+            .provenance
+            .candidate_score
+            .maximum_fallback_error_basis_points
+            .map(u64::from),
+        proposal
+            .provenance
+            .candidate_score
+            .maximum_fallback_p95_latency_ms,
+    ];
+    if budget_free {
+        if monetary_fields.iter().any(Option::is_some)
+            || proposal.provenance.budget.is_some()
+            || proposal.provenance.accounted_cost_microusd.is_some()
+            || fallback_fields.iter().any(Option::is_none)
+        {
+            bail!(
+                "budget-free route proposal contains legacy monetary fields or lacks fallback bounds"
+            );
+        }
+    } else {
+        let budget = proposal
+            .provenance
+            .budget
+            .context("legacy route proposal budget is missing")?;
+        let accounted_cost_microusd = proposal
+            .provenance
+            .accounted_cost_microusd
+            .context("legacy route proposal accounted cost is missing")?;
+        if monetary_fields.iter().any(Option::is_none)
+            || fallback_fields.iter().any(Option::is_some)
+            || budget.starting_spend_microusd > budget.stop_new_spend_microusd
+            || budget.stop_new_spend_microusd > budget.absolute_spend_microusd
+            || budget.absolute_spend_microusd > MAX_HARNESS_SPEND_MICROUSD
+            || accounted_cost_microusd
+                > budget
+                    .absolute_spend_microusd
+                    .saturating_sub(budget.starting_spend_microusd)
+        {
+            bail!("legacy route proposal budget is invalid");
+        }
     }
     validate_candidate_api_base_url(&proposal.api_base_url, config.allow_private_candidate_http)?;
     Ok(proposal)
@@ -1088,6 +1188,12 @@ pub(crate) fn verify_operator_manifest_proposal_binding(
         bail!("route manifest is not canonical JSON");
     }
     validate_operator_manifest(config, scope, &manifest)?;
+    if manifest.profile != Some(proposal.profile) {
+        bail!("signed route profile differs from its stored proposal");
+    }
+    if manifest.candidate.is_some() && !proposal.uses_budget_free_contract() {
+        bail!("legacy operator proposals cannot activate a new candidate route");
+    }
     let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
     if manifest.proposal_sha256 != hex_digest(&proposal_sha256) {
         bail!("signed route does not reference the exact stored proposal");
@@ -2045,13 +2151,9 @@ fn validate_operator_manifest(
     if &manifest.scope != expected_scope {
         bail!("operator route manifest scope does not match startup configuration");
     }
-    reject_non_production_mechanics_route(
-        manifest.scope.scope_id,
-        manifest
-            .candidate
-            .as_ref()
-            .map(|candidate| candidate.eval_sha256.as_str()),
-    )?;
+    if manifest.candidate.is_some() && manifest.profile != Some(HarnessProfile::Production) {
+        bail!("candidate route requires production-qualified evidence");
+    }
     if config.signing_key_id.is_empty()
         || config.signing_key_id.len() > MAX_KEY_ID_BYTES
         || manifest.signing_key_id != config.signing_key_id
@@ -2086,21 +2188,6 @@ fn validate_operator_manifest(
         (Some(_), 0) => bail!("zero-basis-point route must not contain a candidate"),
         (Some(_), _) => bail!("candidate_basis_points cannot exceed 10000"),
     }
-}
-
-pub(crate) fn reject_non_production_mechanics_scope(scope_id: Uuid) -> Result<()> {
-    if scope_id.as_u128() == NON_PRODUCTION_MECHANICS_SCOPE_ID {
-        bail!("non-production mechanics scope is not route-admissible");
-    }
-    Ok(())
-}
-
-fn reject_non_production_mechanics_route(scope_id: Uuid, eval_sha256: Option<&str>) -> Result<()> {
-    reject_non_production_mechanics_scope(scope_id)?;
-    if eval_sha256.is_some_and(|value| value == NON_PRODUCTION_MECHANICS_EVAL_SHA256) {
-        bail!("non-production mechanics eval is not route-admissible");
-    }
-    Ok(())
 }
 
 fn validate_operator_candidate(
@@ -3048,112 +3135,6 @@ mod tests {
                 now + TimeDelta::seconds(60),
             )
             .is_err()
-        );
-    }
-
-    #[test]
-    fn non_production_mechanics_identities_cannot_prepare_or_publish_operator_routes() {
-        let fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let mechanics_scope = RouteScope {
-            scope_id: "f7f88ff0-5947-440c-a661-e4e35f1d04e0".parse().unwrap(),
-        };
-        let proposal = |scope: &RouteScope, eval_sha256: &str| {
-            operator_proposal(scope, eval_sha256, WINNER_CANARY_BASIS_POINTS)
-        };
-
-        let (winner, admission) = verified_winner(&fixture);
-        let blocked_legacy = prepare_route_manifest(
-            &fixture.config,
-            &mechanics_scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WINNER_CANARY_BASIS_POINTS,
-            None,
-            None,
-            now,
-            WINNER_CANARY_VALID_FOR_SECONDS,
-        )
-        .unwrap_err();
-        assert!(
-            blocked_legacy
-                .to_string()
-                .contains("mechanics scope is not route-admissible")
-        );
-
-        let blocked_scope = prepare_operator_route_manifest(
-            &fixture.config,
-            &mechanics_scope,
-            &proposal(&mechanics_scope, &repeated_digest(0xa3)),
-            None,
-            None,
-            None,
-            now,
-        )
-        .unwrap_err();
-        assert!(
-            blocked_scope
-                .to_string()
-                .contains("mechanics scope is not route-admissible")
-        );
-
-        let blocked_eval = prepare_operator_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &proposal(&fixture.scope, NON_PRODUCTION_MECHANICS_EVAL_SHA256),
-            None,
-            None,
-            None,
-            now,
-        )
-        .unwrap_err();
-        assert!(
-            blocked_eval
-                .to_string()
-                .contains("mechanics eval is not route-admissible")
-        );
-
-        let mut unrelated_eval = NON_PRODUCTION_MECHANICS_EVAL_SHA256.to_owned();
-        unrelated_eval.replace_range(63..64, "8");
-        prepare_operator_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &proposal(&fixture.scope, &unrelated_eval),
-            Some(&fixture.secret_hex),
-            Some(CANDIDATE_API_KEY),
-            None,
-            now,
-        )
-        .unwrap();
-
-        let (manifest_bytes, _) = prepare_operator_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &proposal(&fixture.scope, &repeated_digest(0xa4)),
-            Some(&fixture.secret_hex),
-            Some(CANDIDATE_API_KEY),
-            None,
-            now,
-        )
-        .unwrap();
-        let mut manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        manifest.candidate.as_mut().unwrap().eval_sha256 =
-            NON_PRODUCTION_MECHANICS_EVAL_SHA256.to_owned();
-        let blocked_manifest = serde_json::to_vec(&manifest).unwrap();
-        let signature = signing_key().sign(&blocked_manifest);
-        let error = RoutePublication::parse_for_publication(
-            &fixture.config,
-            &fixture.scope,
-            &blocked_manifest,
-            Some(signature.as_ref()),
-            now,
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("mechanics eval is not route-admissible")
         );
     }
 

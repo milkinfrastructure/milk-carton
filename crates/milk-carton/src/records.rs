@@ -128,6 +128,7 @@ const TEACHER_MAX_CALLS: u8 = 64;
 const TEACHER_MAX_PARALLEL_RUNS: u8 = 16;
 pub(crate) const TEACHER_MAX_DECISIONS: u32 = 4_096;
 const MAX_ACTIVE_GPU_LAUNCHES: usize = 18;
+const LEGACY_PROVIDER_CLAIM_CREATION_ENABLED: bool = false;
 pub(crate) const TICK_LEASE_TTL_SECONDS: u64 = 10 * 60;
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
@@ -223,7 +224,10 @@ struct HarnessReadinessChecks {
     representative_eval_capacity: bool,
     production_text_reference_capacity: bool,
     closed_watermark_without_capture_gap: bool,
-    eval_generation_budget_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_generation_budget_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_generation_capacity_available: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -287,7 +291,8 @@ struct HarnessEvalRevision {
     generation_job_id: String,
     provider_request_id: String,
     token_usage: HarnessTokenUsage,
-    cost_microusd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_microusd: Option<u64>,
     cases: Vec<HarnessEvalCase>,
     code_version: String,
     parent_version_sha256: Option<String>,
@@ -336,7 +341,8 @@ struct HarnessEvalValidationRevision {
     prompt_sha256: String,
     teacher: HarnessTeacherBinding,
     token_usage: HarnessTokenUsage,
-    cost_microusd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_microusd: Option<u64>,
     code_version: String,
     parent_version_sha256: Option<String>,
 }
@@ -365,7 +371,8 @@ struct HarnessScoreTargetResult {
     p95_latency_ms: Option<u64>,
     input_tokens: u64,
     output_tokens: u64,
-    calculated_cost_microusd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calculated_cost_microusd: Option<u64>,
     cases: Vec<HarnessScoreCase>,
 }
 
@@ -376,6 +383,12 @@ struct HarnessScoreChecks {
     reference_pass_delta: bool,
     candidate_errors: bool,
     candidate_p95_latency: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incumbent_reference_pass_rate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incumbent_errors: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incumbent_p95_latency: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -390,8 +403,10 @@ struct HarnessCandidateScoreResult {
     candidate: HarnessScoreTargetResult,
     provider_calls: u64,
     provider_tokens: u64,
-    calculated_cost_microusd: u64,
-    accounted_cost_microusd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calculated_cost_microusd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accounted_cost_microusd: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -4711,9 +4726,15 @@ impl Records {
         scope: &Scope,
         proposal: &OperatorRouteProposal,
         proposal_bytes: &[u8],
+        baseline_chat_completions_url: &str,
     ) -> Result<()> {
         self.store
-            .verify_operator_route_preflight(scope, proposal, proposal_bytes)
+            .verify_operator_route_preflight(
+                scope,
+                proposal,
+                proposal_bytes,
+                baseline_chat_completions_url,
+            )
             .await
     }
 
@@ -8020,6 +8041,9 @@ impl RecordStore {
         {
             return Ok(write);
         }
+        if !LEGACY_PROVIDER_CLAIM_CREATION_ENABLED {
+            return Ok(TeacherGpuTickWrite::Hold);
+        }
         if !self
             .teacher_gpu_capacity_available(
                 scope,
@@ -10607,6 +10631,9 @@ impl RecordStore {
             .await?;
             return Ok(None);
         }
+        if !LEGACY_PROVIDER_CLAIM_CREATION_ENABLED {
+            return Ok(None);
+        }
         let winner = self
             .load_verified_student_winner(scope, &student_job_id)
             .await?;
@@ -12594,7 +12621,23 @@ impl RecordStore {
         let source_body = source_bytes
             .strip_suffix(b"\n")
             .context("student admission source manifest has no canonical LF")?;
+        let budget_free = admission.code_version == "milk.harness-run-once.v4";
         let checks = readiness.checks;
+        let eval_generation_capacity = if budget_free {
+            if checks.eval_generation_budget_available.is_some() {
+                bail!("budget-free student readiness contains the legacy budget gate");
+            }
+            checks
+                .eval_generation_capacity_available
+                .context("budget-free student readiness lacks its capacity gate")?
+        } else {
+            if checks.eval_generation_capacity_available.is_some() {
+                bail!("legacy student readiness contains a budget-free capacity gate");
+            }
+            checks
+                .eval_generation_budget_available
+                .context("legacy student readiness lacks its budget gate")?
+        };
         let all_ready = [
             checks.minimum_independent_sessions,
             checks.minimum_classified_sessions,
@@ -12608,7 +12651,7 @@ impl RecordStore {
             checks.representative_eval_capacity,
             checks.production_text_reference_capacity,
             checks.closed_watermark_without_capture_gap,
-            checks.eval_generation_budget_available,
+            eval_generation_capacity,
         ]
         .into_iter()
         .all(|passed| passed);
@@ -12660,7 +12703,12 @@ impl RecordStore {
             && !readiness.represented_classes.is_empty()
             && readiness.class_failures.is_empty()
             && profile_flags_valid
-            && eval.schema_version == "milk.eval-revision.v1"
+            && eval.schema_version
+                == if budget_free {
+                    "milk.eval-revision.v2"
+                } else {
+                    "milk.eval-revision.v1"
+                }
             && eval.scope_id == scope.scope_id
             && eval.profile == admission.profile
             && eval.series_id == *series
@@ -12668,7 +12716,12 @@ impl RecordStore {
             && eval.readiness_sha256 == admission.readiness_sha256
             && eval.code_version == admission.code_version
             && !eval.cases.is_empty()
-            && validation.schema_version == "milk.eval-validation-revision.v1"
+            && validation.schema_version
+                == if budget_free {
+                    "milk.eval-validation-revision.v2"
+                } else {
+                    "milk.eval-validation-revision.v1"
+                }
             && validation.scope_id == scope.scope_id
             && validation.profile == admission.profile
             && validation.series_id == *series
@@ -12776,6 +12829,7 @@ impl RecordStore {
         scope: &Scope,
         proposal: &OperatorRouteProposal,
         proposal_bytes: &[u8],
+        baseline_chat_completions_url: &str,
     ) -> Result<()> {
         self.verify_operator_route_proposal_identity(scope, proposal, proposal_bytes)
             .await?;
@@ -12844,6 +12898,14 @@ impl RecordStore {
             )
             .await?;
 
+        let budget_free = proposal.uses_budget_free_contract();
+        if budget_free
+            && (proposal.provenance.candidate_score.incumbent.api_url
+                != baseline_chat_completions_url
+                || proposal.provenance.candidate_score.incumbent.model != proposal.model)
+        {
+            bail!("budget-free fallback evidence is not bound to the configured baseline");
+        }
         let structural: HarnessStructuralBinding =
             serde_json::from_str(summary.structural.get())
                 .context("harness structural summary is not typed JSON")?;
@@ -12856,6 +12918,11 @@ impl RecordStore {
             && summary.scope_id == scope.scope_id
             && summary.profile == proposal.profile
             && summary.code_version == proposal.code_version
+            && (!budget_free
+                || (summary.harness_revision.as_deref()
+                    == Some(proposal.provenance.harness_revision.as_str())
+                    && summary.config_sha256.as_deref()
+                        == Some(proposal.provenance.config_sha256.as_str())))
             && structural.schema_version == "milk.structural-summary.v1"
             && structural.scope_id == scope.scope_id
             && structural.profile == proposal.profile
@@ -12864,6 +12931,11 @@ impl RecordStore {
             && readiness.scope_id == scope.scope_id
             && readiness.profile == proposal.profile
             && readiness.summary_sha256 == proposal.summary_sha256
+            && (!budget_free
+                || (readiness.harness_revision.as_deref()
+                    == Some(proposal.provenance.harness_revision.as_str())
+                    && readiness.config_sha256.as_deref()
+                        == Some(proposal.provenance.config_sha256.as_str())))
             && eval.scope_id == scope.scope_id
             && eval.profile == proposal.profile
             && eval.series_id == *series
@@ -12888,8 +12960,18 @@ impl RecordStore {
         if source.schema_version != "milk.summary-source-manifest.v1"
             || summary.schema_version != "milk.summary-version.v1"
             || readiness.schema_version != "milk.readiness.v1"
-            || eval.schema_version != "milk.eval-revision.v1"
-            || validation.schema_version != "milk.eval-validation-revision.v1"
+            || eval.schema_version
+                != if budget_free {
+                    "milk.eval-revision.v2"
+                } else {
+                    "milk.eval-revision.v1"
+                }
+            || validation.schema_version
+                != if budget_free {
+                    "milk.eval-validation-revision.v2"
+                } else {
+                    "milk.eval-validation-revision.v1"
+                }
             || score.schema_version != "milk.candidate-score-revision.v1"
             || !same_identity
             || !valid_optional_harness_digest(summary.parent_version_sha256.as_deref())
@@ -12908,6 +12990,21 @@ impl RecordStore {
         }
 
         let checks = readiness.checks;
+        let eval_generation_capacity = if budget_free {
+            if checks.eval_generation_budget_available.is_some() {
+                bail!("budget-free readiness contains the legacy budget gate");
+            }
+            checks
+                .eval_generation_capacity_available
+                .context("budget-free readiness lacks its capacity gate")?
+        } else {
+            if checks.eval_generation_capacity_available.is_some() {
+                bail!("legacy readiness contains a budget-free capacity gate");
+            }
+            checks
+                .eval_generation_budget_available
+                .context("legacy readiness lacks its budget gate")?
+        };
         let all_ready = [
             checks.minimum_independent_sessions,
             checks.minimum_classified_sessions,
@@ -12921,7 +13018,7 @@ impl RecordStore {
             checks.representative_eval_capacity,
             checks.production_text_reference_capacity,
             checks.closed_watermark_without_capture_gap,
-            checks.eval_generation_budget_available,
+            eval_generation_capacity,
         ]
         .into_iter()
         .all(|passed| passed);
@@ -12988,8 +13085,23 @@ impl RecordStore {
     ) -> Result<()> {
         let binding = &proposal.provenance.candidate_score;
         let result = &score.result;
+        let budget_free = proposal.uses_budget_free_contract();
         validate_harness_teacher(&proposal.provenance.teacher)?;
         validate_harness_candidate_score(binding)?;
+        if budget_free {
+            let expected_case_ids =
+                budget_free_harness_score_case_ids(&eval.cases, binding.held_out_cases)?;
+            validate_budget_free_harness_score_target(
+                &result.incumbent,
+                &expected_case_ids,
+                binding.case_reference_similarity_basis_points,
+            )?;
+            validate_budget_free_harness_score_target(
+                &result.candidate,
+                &expected_case_ids,
+                binding.case_reference_similarity_basis_points,
+            )?;
+        }
         let candidate_url = format!("{}chat/completions", proposal.api_base_url);
         let result_payload = harness_canonical_json_line(result)?;
         let result_sha256 = hex_digest(&Sha256::digest(&result_payload).into());
@@ -13005,11 +13117,9 @@ impl RecordStore {
             .and_then(|value| value.checked_add(result.candidate.input_tokens))
             .and_then(|value| value.checked_add(result.candidate.output_tokens))
             .context("candidate score token count overflow")?;
-        let cost = result
-            .incumbent
-            .calculated_cost_microusd
-            .checked_add(result.candidate.calculated_cost_microusd)
-            .context("candidate score cost overflow")?;
+        let fallback_reference = binding.minimum_fallback_reference_pass_basis_points;
+        let fallback_errors = binding.maximum_fallback_error_basis_points;
+        let fallback_latency = binding.maximum_fallback_p95_latency_ms;
         let expected_checks = HarnessScoreChecks {
             candidate_reference_pass_rate: result.candidate.reference_pass_basis_points
                 >= binding.minimum_candidate_reference_pass_basis_points,
@@ -13022,19 +13132,39 @@ impl RecordStore {
                 .candidate
                 .p95_latency_ms
                 .is_some_and(|latency| latency <= binding.maximum_candidate_p95_latency_ms),
+            incumbent_reference_pass_rate: fallback_reference
+                .map(|minimum| result.incumbent.reference_pass_basis_points >= minimum),
+            incumbent_errors: fallback_errors
+                .map(|maximum| result.incumbent.error_basis_points <= maximum),
+            incumbent_p95_latency: fallback_latency.map(|maximum| {
+                result
+                    .incumbent
+                    .p95_latency_ms
+                    .is_some_and(|latency| latency <= maximum)
+            }),
         };
         let qualified = [
             expected_checks.candidate_reference_pass_rate,
             expected_checks.reference_pass_delta,
             expected_checks.candidate_errors,
             expected_checks.candidate_p95_latency,
+            expected_checks
+                .incumbent_reference_pass_rate
+                .unwrap_or(true),
+            expected_checks.incumbent_errors.unwrap_or(true),
+            expected_checks.incumbent_p95_latency.unwrap_or(true),
         ]
         .into_iter()
         .all(|passed| passed);
         if score.score_job_id != proposal.provenance.job_ids.candidate_score
             || score.provider_result_sha256 != result_sha256
             || !score.qualified
-            || result.schema_version != "milk.candidate-score-job-result.v1"
+            || result.schema_version
+                != if budget_free {
+                    "milk.candidate-score-job-result.v2"
+                } else {
+                    "milk.candidate-score-job-result.v1"
+                }
             || result.job_id != score.score_job_id
             || result.outcome != "succeeded"
             || !result.qualified
@@ -13042,8 +13172,6 @@ impl RecordStore {
             || !qualified
             || result.provider_calls != calls
             || result.provider_tokens != tokens
-            || result.calculated_cost_microusd != cost
-            || result.accounted_cost_microusd != cost
             || binding.candidate.api_url != candidate_url
             || binding.candidate.model != proposal.model
             || binding.max_calls_per_run != binding.held_out_cases.saturating_mul(2)
@@ -13071,31 +13199,6 @@ impl RecordStore {
             bail!("harness candidate score is not qualified or candidate-bound");
         }
 
-        let incumbent_cost = harness_score_target_cost(&result.incumbent, &binding.incumbent)?;
-        let candidate_cost = harness_score_target_cost(&result.candidate, &binding.candidate)?;
-        let eval_cost = harness_token_cost(
-            eval.token_usage.input_tokens,
-            proposal.provenance.teacher.input_rate_microusd_per_million,
-        )?
-        .checked_add(harness_token_cost(
-            eval.token_usage.output_tokens,
-            proposal.provenance.teacher.output_rate_microusd_per_million,
-        )?)
-        .context("harness eval cost overflow")?;
-        let validation_cost = harness_token_cost(
-            validation.token_usage.input_tokens,
-            proposal.provenance.teacher.input_rate_microusd_per_million,
-        )?
-        .checked_add(harness_token_cost(
-            validation.token_usage.output_tokens,
-            proposal.provenance.teacher.output_rate_microusd_per_million,
-        )?)
-        .context("harness validation cost overflow")?;
-        let known_cost = eval_cost
-            .checked_add(validation_cost)
-            .and_then(|value| value.checked_add(incumbent_cost))
-            .and_then(|value| value.checked_add(candidate_cost))
-            .context("harness known cost overflow")?;
         let known_tokens = eval
             .token_usage
             .input_tokens
@@ -13111,18 +13214,79 @@ impl RecordStore {
             .and_then(|value| value.checked_mul(3))
             .and_then(|value| value.checked_add(binding.max_total_tokens_per_run))
             .context("harness maximum token count overflow")?;
-        if eval.cost_microusd != eval_cost
-            || validation.cost_microusd != validation_cost
-            || cost != incumbent_cost.saturating_add(candidate_cost)
-            || eval.token_usage.input_tokens > teacher.max_input_tokens
+        if eval.token_usage.input_tokens > teacher.max_input_tokens
             || validation.token_usage.input_tokens > teacher.max_input_tokens
             || eval.token_usage.output_tokens > teacher.max_output_tokens
             || validation.token_usage.output_tokens > teacher.max_output_tokens
-            || proposal.provenance.accounted_cost_microusd < known_cost
             || proposal.provenance.provider_tokens < known_tokens
             || proposal.provenance.provider_tokens > maximum_tokens
         {
-            bail!("harness route proposal budget or token accounting is invalid");
+            bail!("harness route proposal token accounting is invalid");
+        }
+        if budget_free {
+            if eval.cost_microusd.is_some()
+                || validation.cost_microusd.is_some()
+                || result.calculated_cost_microusd.is_some()
+                || result.accounted_cost_microusd.is_some()
+                || result.incumbent.calculated_cost_microusd.is_some()
+                || result.candidate.calculated_cost_microusd.is_some()
+                || fallback_reference.is_none()
+                || fallback_errors.is_none()
+                || fallback_latency.is_none()
+            {
+                bail!(
+                    "budget-free route evidence contains monetary fields or lacks fallback checks"
+                );
+            }
+        } else {
+            if fallback_reference.is_some()
+                || fallback_errors.is_some()
+                || fallback_latency.is_some()
+                || expected_checks.incumbent_reference_pass_rate.is_some()
+                || expected_checks.incumbent_errors.is_some()
+                || expected_checks.incumbent_p95_latency.is_some()
+            {
+                bail!("legacy route evidence contains budget-free fallback checks");
+            }
+            let incumbent_cost = harness_score_target_cost(&result.incumbent, &binding.incumbent)?;
+            let candidate_cost = harness_score_target_cost(&result.candidate, &binding.candidate)?;
+            let input_rate = teacher
+                .input_rate_microusd_per_million
+                .context("legacy teacher input rate is missing")?;
+            let output_rate = teacher
+                .output_rate_microusd_per_million
+                .context("legacy teacher output rate is missing")?;
+            let eval_cost = harness_token_cost(eval.token_usage.input_tokens, input_rate)?
+                .checked_add(harness_token_cost(
+                    eval.token_usage.output_tokens,
+                    output_rate,
+                )?)
+                .context("harness eval cost overflow")?;
+            let validation_cost =
+                harness_token_cost(validation.token_usage.input_tokens, input_rate)?
+                    .checked_add(harness_token_cost(
+                        validation.token_usage.output_tokens,
+                        output_rate,
+                    )?)
+                    .context("harness validation cost overflow")?;
+            let score_cost = incumbent_cost
+                .checked_add(candidate_cost)
+                .context("candidate score cost overflow")?;
+            let known_cost = eval_cost
+                .checked_add(validation_cost)
+                .and_then(|value| value.checked_add(score_cost))
+                .context("harness known cost overflow")?;
+            if eval.cost_microusd != Some(eval_cost)
+                || validation.cost_microusd != Some(validation_cost)
+                || result.calculated_cost_microusd != Some(score_cost)
+                || result.accounted_cost_microusd != Some(score_cost)
+                || proposal
+                    .provenance
+                    .accounted_cost_microusd
+                    .is_none_or(|accounted| accounted < known_cost)
+            {
+                bail!("legacy route proposal cost accounting is invalid");
+            }
         }
         Ok(())
     }
@@ -13136,6 +13300,9 @@ impl RecordStore {
         signature: Vec<u8>,
         published_at: DateTime<Utc>,
     ) -> Result<RoutePublicationWrite> {
+        if !publication.is_operator_proposal() && publication.candidate_basis_points > 0 {
+            bail!("legacy student winner candidate routes are read-only");
+        }
         let manifest_sha256: [u8; 32] = Sha256::digest(&manifest).into();
         if manifest.len() > MAX_ROUTE_MANIFEST_BYTES
             || manifest_sha256 != publication.revision
@@ -15505,8 +15672,12 @@ fn validate_harness_score_target(binding: &HarnessScoreTargetBinding) -> Result<
         || endpoint.fragment().is_some()
         || !endpoint.path().ends_with("/v1/chat/completions")
         || !valid_harness_model(&binding.model)
-        || binding.input_rate_microusd_per_million > 1_000_000_000
-        || binding.output_rate_microusd_per_million > 1_000_000_000
+        || binding
+            .input_rate_microusd_per_million
+            .is_some_and(|rate| rate > 1_000_000_000)
+        || binding
+            .output_rate_microusd_per_million
+            .is_some_and(|rate| rate > 1_000_000_000)
     {
         bail!("harness score target binding is invalid");
     }
@@ -15528,10 +15699,138 @@ fn validate_harness_teacher(binding: &HarnessTeacherBinding) -> Result<()> {
         || !(1..=120).contains(&binding.timeout_seconds)
         || !(128..=100_000).contains(&binding.max_input_tokens)
         || !(64..=16_384).contains(&binding.max_output_tokens)
-        || binding.input_rate_microusd_per_million > 1_000_000_000
-        || binding.output_rate_microusd_per_million > 1_000_000_000
+        || binding
+            .input_rate_microusd_per_million
+            .is_some_and(|rate| rate > 1_000_000_000)
+        || binding
+            .output_rate_microusd_per_million
+            .is_some_and(|rate| rate > 1_000_000_000)
     {
         bail!("harness teacher binding is invalid");
+    }
+    Ok(())
+}
+
+fn budget_free_harness_score_case_ids(
+    cases: &[HarnessEvalCase],
+    held_out_cases: u64,
+) -> Result<Vec<String>> {
+    let held_out_cases = usize::try_from(held_out_cases)
+        .context("budget-free score held-out case count is too large")?;
+    if cases
+        .iter()
+        .any(|case| !valid_lowercase_hex(&case.case_id, 64))
+        || cases
+            .iter()
+            .map(|case| &case.case_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != cases.len()
+    {
+        bail!("budget-free eval case IDs are invalid or not unique");
+    }
+    let mut ranked = cases
+        .iter()
+        .map(|case| {
+            let mut digest = Sha256::new();
+            digest.update(b"milk.candidate-score-case.v1\0");
+            digest.update(case.case_id.as_bytes());
+            (<[u8; 32]>::from(digest.finalize()), case.case_id.clone())
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable();
+    let selected = ranked
+        .into_iter()
+        .take(held_out_cases)
+        .map(|(_, case_id)| case_id)
+        .collect::<Vec<_>>();
+    if selected.len() != held_out_cases {
+        bail!("budget-free score held-out case IDs are incomplete");
+    }
+    Ok(selected)
+}
+
+fn harness_score_rate_basis_points(numerator: u64, denominator: u64) -> Result<u16> {
+    if denominator == 0 {
+        return Ok(0);
+    }
+    let basis_points = numerator
+        .checked_mul(10_000)
+        .and_then(|value| value.checked_add(denominator / 2))
+        .context("budget-free score rate overflow")?
+        / denominator;
+    u16::try_from(basis_points.min(10_000)).context("budget-free score rate is invalid")
+}
+
+fn validate_budget_free_harness_score_target(
+    target: &HarnessScoreTargetResult,
+    expected_case_ids: &[String],
+    reference_pass_threshold_basis_points: u16,
+) -> Result<()> {
+    if target.cases.len() != expected_case_ids.len()
+        || target
+            .cases
+            .iter()
+            .zip(expected_case_ids)
+            .any(|(case, expected)| case.case_id.as_str() != expected)
+    {
+        bail!("budget-free score rows differ from the deterministic held-out case order");
+    }
+
+    let mut reference_passes = 0_u64;
+    let mut errors = 0_u64;
+    let mut latencies = Vec::with_capacity(target.cases.len());
+    for case in &target.cases {
+        if case.reference_similarity_basis_points > 10_000 {
+            bail!("budget-free score row similarity is invalid");
+        }
+        match (
+            case.error_class.as_deref(),
+            case.latency_ms,
+            case.provider_request_id_sha256.as_deref(),
+        ) {
+            (Some(error), None, None)
+                if !error.is_empty()
+                    && error.len() <= 128
+                    && !error.contains('\r')
+                    && !error.contains('\n')
+                    && case.reference_similarity_basis_points == 0 =>
+            {
+                errors = errors
+                    .checked_add(1)
+                    .context("budget-free score error count overflow")?;
+            }
+            (None, Some(latency), Some(provider_request_id_sha256))
+                if latency <= 120_000 && valid_lowercase_hex(provider_request_id_sha256, 64) =>
+            {
+                if case.reference_similarity_basis_points >= reference_pass_threshold_basis_points {
+                    reference_passes = reference_passes
+                        .checked_add(1)
+                        .context("budget-free score pass count overflow")?;
+                }
+                latencies.push(latency);
+            }
+            _ => bail!("budget-free score row evidence is inconsistent"),
+        }
+    }
+    latencies.sort_unstable();
+    let p95_latency_ms = if latencies.is_empty() {
+        None
+    } else {
+        let index = ((latencies.len() - 1) * 95 + 99) / 100;
+        Some(latencies[index])
+    };
+    let attempted =
+        u64::try_from(target.cases.len()).context("budget-free score row count is too large")?;
+    if target.attempted != attempted
+        || target.reference_passes != reference_passes
+        || target.reference_pass_basis_points
+            != harness_score_rate_basis_points(reference_passes, attempted)?
+        || target.errors != errors
+        || target.error_basis_points != harness_score_rate_basis_points(errors, attempted)?
+        || target.p95_latency_ms != p95_latency_ms
+    {
+        bail!("budget-free score aggregates differ from their row evidence");
     }
     Ok(())
 }
@@ -15553,7 +15852,7 @@ fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> R
         .context("harness candidate score token bound overflow")?;
     if !(1..=32).contains(&binding.held_out_cases)
         || !(1..=120).contains(&binding.timeout_seconds)
-        || !(1..=60_000).contains(&binding.minimum_request_interval_ms)
+        || binding.minimum_request_interval_ms > 60_000
         || binding.max_calls_per_run != expected_calls
         || !(128..=100_000).contains(&binding.max_input_tokens_per_call)
         || !(16..=16_384).contains(&binding.max_output_tokens_per_call)
@@ -15564,6 +15863,15 @@ fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> R
         || !(-10_000..=10_000).contains(&binding.minimum_reference_pass_delta_basis_points)
         || binding.maximum_candidate_error_basis_points > 10_000
         || !(1..=120_000).contains(&binding.maximum_candidate_p95_latency_ms)
+        || binding
+            .minimum_fallback_reference_pass_basis_points
+            .is_some_and(|value| !(1..=10_000).contains(&value))
+        || binding
+            .maximum_fallback_error_basis_points
+            .is_some_and(|value| value > 10_000)
+        || binding
+            .maximum_fallback_p95_latency_ms
+            .is_some_and(|value| !(1..=120_000).contains(&value))
     {
         bail!("harness candidate score binding is invalid");
     }
@@ -15583,12 +15891,19 @@ fn harness_score_target_cost(
     binding: &HarnessScoreTargetBinding,
 ) -> Result<u64> {
     validate_harness_score_target(binding)?;
-    let minimum = harness_token_cost(target.input_tokens, binding.input_rate_microusd_per_million)?
-        .checked_add(harness_token_cost(
-            target.output_tokens,
-            binding.output_rate_microusd_per_million,
-        )?)
-        .context("harness score target cost overflow")?;
+    let minimum = harness_token_cost(
+        target.input_tokens,
+        binding
+            .input_rate_microusd_per_million
+            .context("legacy score target input rate is missing")?,
+    )?
+    .checked_add(harness_token_cost(
+        target.output_tokens,
+        binding
+            .output_rate_microusd_per_million
+            .context("legacy score target output rate is missing")?,
+    )?)
+    .context("harness score target cost overflow")?;
     // Harness bills each call with integer ceiling. Only aggregate tokens are
     // retained, so each token category can add at most attempted - 1 microusd
     // beyond the ceiling of its aggregate.
@@ -15596,10 +15911,13 @@ fn harness_score_target_cost(
     let maximum = minimum
         .checked_add(rounding_allowance)
         .context("harness score target cost overflow")?;
-    if !(minimum..=maximum).contains(&target.calculated_cost_microusd) {
+    let calculated_cost_microusd = target
+        .calculated_cost_microusd
+        .context("legacy score target cost is missing")?;
+    if !(minimum..=maximum).contains(&calculated_cost_microusd) {
         bail!("harness score target cost is inconsistent with its token accounting");
     }
-    Ok(target.calculated_cost_microusd)
+    Ok(calculated_cost_microusd)
 }
 
 fn scope_prefix(scope: &Scope) -> String {

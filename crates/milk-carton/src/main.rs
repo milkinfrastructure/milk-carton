@@ -49,7 +49,7 @@ use route::{
     WINNER_ZERO_VALID_FOR_SECONDS, WinnerRouteAdvanceAction, WinnerRoutePhase,
     advance_winner_route, parse_operator_route_proposal, prepare_operator_route_manifest,
     prepare_operator_zero_route_manifest, prepare_route_manifest,
-    reject_non_production_mechanics_scope, verify_operator_manifest_proposal_binding,
+    verify_operator_manifest_proposal_binding,
 };
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -1622,6 +1622,7 @@ async fn main() -> Result<()> {
                 .route
                 .as_ref()
                 .context("route proposal preparation requires startup route configuration")?;
+            let baseline_chat_completions_url = baseline_chat_completions_url(&config)?;
             let mut proposal =
                 OperatorInput::open(&proposal, MAX_ROUTE_MANIFEST_BYTES, "route proposal")?;
             let records = tokio::time::timeout(
@@ -1663,6 +1664,7 @@ async fn main() -> Result<()> {
                         &config_scope(&config),
                         &parsed_proposal,
                         &proposal_bytes,
+                        &baseline_chat_completions_url,
                     )
                     .await?;
             }
@@ -1705,6 +1707,7 @@ async fn main() -> Result<()> {
                 .route
                 .as_ref()
                 .context("route publication requires startup route configuration")?;
+            let baseline_chat_completions_url = baseline_chat_completions_url(&config)?;
             let mut manifest =
                 OperatorInput::open(&manifest, MAX_ROUTE_MANIFEST_BYTES, "route manifest")?;
             let mut signature = signature
@@ -1762,6 +1765,7 @@ async fn main() -> Result<()> {
                             &config_scope(&config),
                             &proposal,
                             &proposal_bytes,
+                            &baseline_chat_completions_url,
                         )
                         .await?;
                 }
@@ -1817,7 +1821,6 @@ async fn tick_once_with_records(
     records: Records,
 ) -> Result<String> {
     let scope = config_scope(config);
-    reject_non_production_mechanics_scope(scope.scope_id)?;
     let lease = tokio::time::timeout(
         TICK_LEASE_IO_TIMEOUT,
         records.acquire_tick_lease(&scope, now),
@@ -2495,6 +2498,14 @@ fn parse_openai_compatible_api_base_url(value: &str, allow_loopback_http: bool) 
 fn api_endpoint_url(base: &Url, endpoint: RouteEndpoint) -> Result<Url> {
     base.join(endpoint.relative_path())
         .context("OpenAI-compatible endpoint could not be derived from API base URL")
+}
+
+fn baseline_chat_completions_url(config: &FileConfig) -> Result<String> {
+    let base = parse_openai_compatible_api_base_url(
+        &config.baseline.api_base_url,
+        config.baseline.allow_loopback_http,
+    )?;
+    Ok(api_endpoint_url(&base, RouteEndpoint::ChatCompletions)?.into())
 }
 
 fn required_env(name: &str) -> Result<String> {
