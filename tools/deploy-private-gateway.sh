@@ -711,7 +711,7 @@ def parse_secret_names(raw):
     return set(names)
 
 
-def parse_gateway_config(raw):
+def parse_gateway_config(raw, allow_legacy=False):
     config = parse_json(raw, "gateway config", 65536)
     traffic_keys = config.get("traffic_keys") if isinstance(config, dict) else None
     if (
@@ -720,6 +720,28 @@ def parse_gateway_config(raw):
         or not 1 <= len(traffic_keys) <= 64
     ):
         raise DeployFailure("gateway config is invalid")
+    if "scope_id" in config:
+        scope_id = config["scope_id"]
+        if (
+            not allow_legacy
+            or not isinstance(scope_id, str)
+            or UUID.fullmatch(scope_id) is None
+            or scope_id == "00000000-0000-0000-0000-000000000000"
+        ):
+            raise DeployFailure("gateway config is invalid")
+        hashes = set()
+        for traffic_key in traffic_keys:
+            if (
+                not isinstance(traffic_key, dict)
+                or set(traffic_key) != {"api_key_sha256", "capture_allowed"}
+                or not isinstance(traffic_key["api_key_sha256"], str)
+                or SHA256.fullmatch(traffic_key["api_key_sha256"]) is None
+                or not isinstance(traffic_key["capture_allowed"], bool)
+                or traffic_key["api_key_sha256"] in hashes
+            ):
+                raise DeployFailure("gateway traffic keys are invalid")
+            hashes.add(traffic_key["api_key_sha256"])
+        return config
     key_ids = set()
     hashes = set()
     scope_ids = set()
@@ -761,7 +783,7 @@ def parse_gateway_config(raw):
     return config
 
 
-def validate_gateway_config_file(path, repository):
+def validate_gateway_config_file(path, repository, allow_legacy=False):
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise DeployFailure("gateway config must be an absolute regular file")
     metadata = path.stat()
@@ -774,7 +796,7 @@ def validate_gateway_config_file(path, repository):
     ):
         raise DeployFailure("gateway config file must be owner-only mode 0600 outside the checkout")
     raw = read_regular(path, "gateway config", 65536)
-    return raw, parse_gateway_config(raw)
+    return raw, parse_gateway_config(raw, allow_legacy)
 
 
 def validate_bootstrap_secrets(path, repository, materialize=False):
@@ -978,7 +1000,7 @@ def main():
             Path(arguments[4]), repository,
         )
         previous_gateway_config_raw, _ = validate_gateway_config_file(
-            previous_gateway_config_file, repository,
+            previous_gateway_config_file, repository, allow_legacy=True,
         )
         expected_bootstrap_secret_names = None
     if not requested_evidence.is_absolute() or requested_evidence.exists():
