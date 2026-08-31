@@ -206,6 +206,7 @@ export async function runProductionPath(
   fetch = globalThis.fetch,
   minimumRequestIntervalMs = DEFAULT_MINIMUM_REQUEST_INTERVAL_MS,
   timing,
+  smokeOnly = false,
 ) {
   minimumRequestIntervalMs = productionPathRequestInterval(minimumRequestIntervalMs);
   const packageMetadata = JSON.parse(
@@ -272,7 +273,8 @@ export async function runProductionPath(
     await runRequest(client, smoke[0]),
     await runRequest(client, smoke[1]),
   ];
-  const plan = productionPathPlan(credential.model);
+  assert.equal(typeof smokeOnly, "boolean");
+  const plan = smokeOnly ? [] : productionPathPlan(credential.model);
   const workload = new Array(plan.length);
   let cursor = 0;
   let failure = null;
@@ -293,8 +295,10 @@ export async function runProductionPath(
     ...smokeObservations.map((row, index) => ({ ...row, sessionId: smoke[index].sessionId })),
     ...workload.map((row, index) => ({ ...row, sessionId: plan[index].sessionId })),
   ];
-  const selectedInitial = initial.find((row) => row.intent === "selected");
-  assert.ok(selectedInitial);
+  const streamParent = smokeOnly
+    ? initial[0]
+    : initial.find((row) => row.intent === "selected");
+  assert.ok(streamParent);
   const streamRow = {
     endpoint: "chat_completions",
     request: {
@@ -304,11 +308,11 @@ export async function runProductionPath(
       stream: true,
       stream_options: { include_usage: true },
     },
-    sessionId: selectedInitial.sessionId,
+    sessionId: streamParent.sessionId,
   };
   streamRow.requestSha256 = sha256(canonical(streamRow));
   const streamed = await runStreamingRequest(client, streamRow);
-  assert.equal(streamed.intent, "selected");
+  assert.equal(streamed.intent, streamParent.intent);
   const observations = [...initial, streamed];
 
   const traceIds = observations.map((row) => row.traceId).sort();
@@ -321,7 +325,7 @@ export async function runProductionPath(
     .filter((row) => row.intent === "not_selected")
     .map((row) => row.traceId)
     .sort();
-  assert.ok(selectedTraceIds.includes(streamed.traceId));
+  if (!smokeOnly) assert.ok(selectedTraceIds.includes(streamed.traceId));
   const requestSet = [
     sha256(canonical({ endpoint: "chat_completions", request: invalidRequest })),
     ...smoke.map((row) => row.requestSha256),
@@ -370,7 +374,9 @@ export async function runProductionPath(
     invalid_auth: { http_status: invalidStatus, trace_id: invalidTraceId },
     not_selected_trace_ids: notSelectedTraceIds,
     selected_trace_ids: selectedTraceIds,
-    schema_version: "milk.official-openai-sdk-production-path.v3",
+    schema_version: smokeOnly
+      ? "milk.official-openai-sdk-ingress-smoke.v1"
+      : "milk.official-openai-sdk-production-path.v3",
     sdk: "openai-node",
     sdk_version: SDK_VERSION,
     status: "succeeded",
@@ -400,7 +406,9 @@ function productionEndpoint(value) {
 }
 
 async function main() {
-  assert.equal(process.argv.length, 4);
+  assert.ok(process.argv.length === 4 || process.argv.length === 5);
+  const smokeOnly = process.argv[4] === "--smoke-only";
+  assert.equal(process.argv.length === 5, smokeOnly);
   const endpoint = productionEndpoint(process.argv[2]);
   const credential = await readCredential(process.argv[3]);
   const interval = productionPathRequestInterval(
@@ -411,6 +419,8 @@ async function main() {
     credential,
     globalThis.fetch,
     interval,
+    undefined,
+    smokeOnly,
   );
   process.stdout.write(`${canonical(receipt)}\n`);
 }
