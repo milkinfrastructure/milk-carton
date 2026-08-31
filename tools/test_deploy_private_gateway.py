@@ -16,7 +16,7 @@ SCRIPT = ROOT / "tools/deploy-private-gateway.sh"
 ACCOUNT = "a" * 32
 APPLICATION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 APPLICATION_NAME = "milk-carton-milkcarton"
-API_BASE_URL = "https://carton.example/v1"
+API_BASE_URL = "https://carton.milkinfrastructure.com/v1"
 COMMIT = "1" * 40
 PREVIOUS_WORKER = "11111111-1111-1111-1111-111111111111"
 CURRENT_WORKER = "22222222-2222-2222-2222-222222222222"
@@ -52,7 +52,6 @@ BOOTSTRAP_SECRETS = {
     "MILK_CARTON_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
     "MILK_CARTON_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",
     "MILK_CARTON_OPENAI_API_KEY": "bootstrap-openai-private",
-    "MILK_CARTON_ROUTE_SECRET_HEX": "0" * 64,
     "MILK_CAPTURE_SAMPLING_KEY_HEX": "1" * 64,
     "MILK_CAPTURE_SAMPLING_KEY_VERSION": "pilot-v1",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID": "bootstrap-capture-access-private",
@@ -441,13 +440,14 @@ if name == "wrangler":
         if state.get("bootstrap", False):
             required = {
                 "MILK_CARTON_CONFIG_JSON", "MILK_CARTON_CONTAINER_ADMIN_KEY",
-                "MILK_CARTON_OPENAI_API_KEY", "MILK_CARTON_ROUTE_SECRET_HEX",
+                "MILK_CARTON_OPENAI_API_KEY",
                 "MILK_CAPTURE_SAMPLING_KEY_HEX", "MILK_CAPTURE_SAMPLING_KEY_VERSION",
                 "MILK_CAPTURE_STORE_ACCESS_KEY_ID", "MILK_CAPTURE_STORE_SECRET_ACCESS_KEY",
                 "MILK_ROUTE_STORE_ACCESS_KEY_ID", "MILK_ROUTE_STORE_SECRET_ACCESS_KEY",
             }
             optional = {
-                "MILK_CAPTURE_STORE_SESSION_TOKEN", "MILK_ROUTE_STORE_SESSION_TOKEN",
+                "MILK_CARTON_ROUTE_SECRET_HEX", "MILK_CAPTURE_STORE_SESSION_TOKEN",
+                "MILK_ROUTE_STORE_SESSION_TOKEN",
             }
             if not required.issubset(supplied) or not set(supplied).issubset(required | optional):
                 done(2)
@@ -632,7 +632,11 @@ class DeployPrivateGatewayTests(unittest.TestCase):
     def test_api_base_url_is_explicit_and_strict(self):
         self.assertEqual(
             DEPLOY_CONTRACT.validate_api_base_url(API_BASE_URL),
-            (API_BASE_URL, "carton.example", "https://carton.example/healthz"),
+            (
+                API_BASE_URL,
+                "carton.milkinfrastructure.com",
+                "https://carton.milkinfrastructure.com/healthz",
+            ),
         )
         for invalid in (
             "http://carton.example/v1",
@@ -659,7 +663,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         self.assertEqual(
             set(value["secrets"]),
             DEPLOY_CONTRACT.BOOTSTRAP_REQUIRED_SECRET_NAMES
-            | DEPLOY_CONTRACT.BOOTSTRAP_OPTIONAL_SECRET_NAMES,
+            | {"MILK_CAPTURE_STORE_SESSION_TOKEN", "MILK_ROUTE_STORE_SESSION_TOKEN"},
         )
         fixture.bootstrap_secrets.write_bytes(canonical(value))
         result = fixture.run()
@@ -855,7 +859,7 @@ class DeployPrivateGatewayTests(unittest.TestCase):
         )
         self.assertEqual(
             deployed_config["routes"],
-            [{"pattern": "carton.example", "custom_domain": True}],
+            [{"pattern": "carton.milkinfrastructure.com", "custom_domain": True}],
         )
         self.assertRegex(
             deployed_config["containers"][0]["image"],

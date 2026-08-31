@@ -22,8 +22,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WORKER = "milk-carton"
-APPLICATION_NAME = "milk-carton-milkcarton"
+DEPLOYMENT_TARGETS = {
+    "production": ("milk-carton", "milk-carton-milkcarton", "carton.milkinfrastructure.com"),
+    "mechanics": (
+        "milk-carton-mechanics",
+        "milk-carton-mechanics-milkcarton",
+        "mechanics-carton.milkinfrastructure.com",
+    ),
+}
+WORKER, APPLICATION_NAME, EXPECTED_HOSTNAME = DEPLOYMENT_TARGETS["production"]
 SOURCE_REPOSITORY = "https://github.com/milkinfrastructure/milk-carton"
 GHCR_REPOSITORY = "ghcr.io/milkinfrastructure/milk-carton"
 REGISTRY = "registry.cloudflare.com"
@@ -87,7 +94,6 @@ BOOTSTRAP_REQUIRED_SECRET_NAMES = {
     "MILK_CARTON_CONFIG_JSON",
     "MILK_CARTON_CONTAINER_ADMIN_KEY",
     "MILK_CARTON_OPENAI_API_KEY",
-    "MILK_CARTON_ROUTE_SECRET_HEX",
     "MILK_CAPTURE_SAMPLING_KEY_HEX",
     "MILK_CAPTURE_SAMPLING_KEY_VERSION",
     "MILK_CAPTURE_STORE_ACCESS_KEY_ID",
@@ -96,6 +102,7 @@ BOOTSTRAP_REQUIRED_SECRET_NAMES = {
     "MILK_ROUTE_STORE_SECRET_ACCESS_KEY",
 }
 BOOTSTRAP_OPTIONAL_SECRET_NAMES = {
+    "MILK_CARTON_ROUTE_SECRET_HEX",
     "MILK_CAPTURE_STORE_SESSION_TOKEN",
     "MILK_ROUTE_STORE_SESSION_TOKEN",
 }
@@ -831,6 +838,8 @@ def validate_bootstrap_secrets(path, repository, materialize=False):
         raise DeployFailure("bootstrap secrets file is invalid")
     gateway_config_raw = secrets_value["MILK_CARTON_CONFIG_JSON"].encode("utf-8")
     gateway_config = parse_gateway_config(gateway_config_raw)
+    if gateway_config.get("route") is not None and "MILK_CARTON_ROUTE_SECRET_HEX" not in secrets_value:
+        raise DeployFailure("bootstrap route config requires its route secret")
     secret_input = bytearray(canonical_json(secrets_value)) if materialize else None
     return secret_input, digest(raw), set(secrets_value), gateway_config_raw, gateway_config
 
@@ -889,7 +898,7 @@ def validate_base_config(path):
     config = parse_json(raw, "Wrangler config")
     containers = config.get("containers") if isinstance(config, dict) else None
     if (
-        config.get("name") != WORKER
+        config.get("name") != DEPLOYMENT_TARGETS["production"][0]
         or config.get("main") != MAIN_SENTINEL
         or config.get("observability") != {"enabled": True}
         or config.get("routes") != [{
@@ -924,6 +933,7 @@ def write_private(path, raw, mode=0o600):
 
 def make_deploy_config(base, path, image, entrypoint, api_hostname):
     config = copy.deepcopy(base)
+    config["name"] = WORKER
     config["main"] = str(entrypoint)
     config["containers"][0]["image"] = image
     config["routes"][0]["pattern"] = api_hostname
@@ -940,15 +950,19 @@ def make_deploy_config(base, path, image, entrypoint, api_hostname):
 
 
 def main():
+    global WORKER, APPLICATION_NAME, EXPECTED_HOSTNAME
     arguments = sys.argv[2:]
     registry_token_file = None
     registry_token_stdin = False
     previous_gateway_config_file = None
     wrangler_oauth = False
+    deployment_target = None
     while arguments and arguments[0].startswith("--") and arguments[0] != "--bootstrap":
         option = arguments.pop(0)
         if option == "--wrangler-oauth" and not wrangler_oauth:
             wrangler_oauth = True
+        elif option == "--target" and arguments and deployment_target is None:
+            deployment_target = arguments.pop(0)
         elif option == "--registry-token-file" and arguments and registry_token_file is None and not registry_token_stdin:
             registry_token_file = Path(arguments.pop(0))
         elif option == "--registry-token-stdin" and registry_token_file is None and not registry_token_stdin:
@@ -957,6 +971,10 @@ def main():
             previous_gateway_config_file = Path(arguments.pop(0))
         else:
             raise DeployFailure("unsupported or duplicate deploy option")
+    selected_target = deployment_target or "production"
+    if selected_target not in DEPLOYMENT_TARGETS:
+        raise DeployFailure("deployment target must be production or mechanics")
+    WORKER, APPLICATION_NAME, EXPECTED_HOSTNAME = DEPLOYMENT_TARGETS[selected_target]
     if registry_token_file is None and not registry_token_stdin:
         raise DeployFailure("registry credential input must be selected exactly once")
     bootstrap = len(arguments) == 6 and arguments[0] == "--bootstrap"
@@ -965,10 +983,12 @@ def main():
         or (not bootstrap and (len(arguments) != 6 or previous_gateway_config_file is None))
     ):
         raise DeployFailure(
-            "usage: deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --previous-gateway-config-file ABSOLUTE_FILE RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
-            "       deploy-private-gateway.sh [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
+            "usage: deploy-private-gateway.sh [--target production|mechanics] [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --previous-gateway-config-file ABSOLUTE_FILE RELEASE_EVIDENCE_DIR APPLICATION_ID NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE GATEWAY_CONFIG_FILE API_BASE_URL\n"
+            "       deploy-private-gateway.sh [--target production|mechanics] [--wrangler-oauth] (--registry-token-file ABSOLUTE_FILE | --registry-token-stdin) --bootstrap RELEASE_EVIDENCE_DIR NEW_DEPLOY_EVIDENCE_DIR GATEWAY_CREDENTIAL_FILE BOOTSTRAP_SECRETS_FILE API_BASE_URL"
         )
     api_base_url, api_hostname, health_url = validate_api_base_url(arguments.pop())
+    if api_hostname != EXPECTED_HOSTNAME:
+        raise DeployFailure("API hostname does not match the deployment target")
     script = Path(sys.argv[1]).resolve(strict=True)
     repository = script.parent.parent.resolve(strict=True)
     sys.path.insert(0, str(repository / "tools"))
