@@ -778,6 +778,16 @@ impl RoutePublication {
         {
             bail!("legacy student winner candidate routes are read-only");
         }
+        if now.is_some()
+            && publication.is_operator_proposal()
+            && publication.candidate_basis_points > 0
+        {
+            let operator: OperatorRouteManifest = serde_json::from_slice(manifest_bytes)
+                .context("operator route manifest is not strict typed JSON")?;
+            if operator.profile != Some(HarnessProfile::Production) {
+                bail!("legacy or non-production operator candidate routes are read-only");
+            }
+        }
         if let Some(now) = now
             && (manifest.not_after <= now
                 || manifest.not_after > now + chrono::TimeDelta::hours(MAX_ROUTE_VALIDITY_HOURS)
@@ -2150,9 +2160,6 @@ fn validate_operator_manifest(
     }
     if &manifest.scope != expected_scope {
         bail!("operator route manifest scope does not match startup configuration");
-    }
-    if manifest.candidate.is_some() && manifest.profile != Some(HarnessProfile::Production) {
-        bail!("candidate route requires production-qualified evidence");
     }
     if config.signing_key_id.is_empty()
         || config.signing_key_id.len() > MAX_KEY_ID_BYTES
