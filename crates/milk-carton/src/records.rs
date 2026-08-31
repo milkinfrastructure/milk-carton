@@ -12,7 +12,9 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
-use chrono::{DateTime, NaiveDateTime, TimeDelta, Timelike, Utc};
+#[cfg(test)]
+use chrono::NaiveDateTime;
+use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use futures::stream::{BoxStream, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
@@ -66,6 +68,7 @@ const MAX_STUDENT_CLAIM_BYTES: usize = 1_024 * 1_024;
 const MAX_STUDENT_INDEX_BYTES: usize = MAX_STUDENT_CLAIM_BYTES + METADATA_RECORD_BYTES;
 const MAX_GPU_LAUNCH_OUTBOX_BYTES: usize = 16 * 1_024;
 const MAX_GPU_LAUNCH_FRONTIER_BYTES: usize = 4 * 1_024;
+const MAX_GPU_DISPATCH_NOT_STARTED_BYTES: usize = 2 * 1_024;
 const MAX_WINNER_DEPLOYMENT_CLAIM_BYTES: usize = 32 * 1_024;
 pub(crate) const MAX_WINNER_DEPLOYMENT_RESULT_BYTES: usize = 32 * 1_024;
 const MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES: usize = 8 * 1_024;
@@ -142,6 +145,7 @@ pub(crate) const ANALYZER_OPERATION_TIMEOUT: Duration = Duration::from_secs(210)
 const STUDENT_MAX_MESSAGES: usize = 256;
 const STUDENT_CALIBRATION_ROWS: usize = 128;
 const STUDENT_MIN_TRAIN_ROWS: usize = 50;
+const STUDENT_DEV_ROWS: u64 = 73;
 const STUDENT_MAX_SOURCE_BYTES: usize = 1_024 * 1_024;
 const STUDENT_MAX_TARGET_BYTES: usize = 64 * 1_024;
 static TRACE_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -436,6 +440,65 @@ struct StudentAdmission {
     config_sha256: String,
     code_version: String,
     parent_version_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_out_request_sha256s: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_out_sampling_units: Option<Vec<StudentSamplingUnitIdentity>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_plan_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    teacher_quota_plan: Option<StudentQuotaPlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StudentQuotaPlan {
+    schema_version: String,
+    scope_id: Uuid,
+    source_manifest_sha256: String,
+    partition_policy_id: String,
+    primary_quotas: StudentInputCounts,
+    reserve_quotas: StudentInputCounts,
+    candidates: Vec<StudentQuotaCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StudentQuotaCandidate {
+    trace_id: Uuid,
+    trace_object_key: String,
+    trace_payload_sha256: String,
+    request_sha256: String,
+    sampling_unit_kind: SamplingUnitKind,
+    sampling_unit_hmac_sha256: String,
+    sampling_key_version: String,
+    partition: TeacherPartition,
+    role: StudentQuotaRole,
+    rank: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StudentSamplingUnitIdentity {
+    sampling_unit_kind: SamplingUnitKind,
+    sampling_unit_hmac_sha256: String,
+    sampling_key_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StudentQuotaRole {
+    Primary,
+    Reserve,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StudentQuotaSlotBinding {
+    student_admission_sha256: String,
+    quota_plan_sha256: String,
+    partition: TeacherPartition,
+    rank: u32,
 }
 
 struct VerifiedStudentAdmission {
@@ -551,7 +614,7 @@ pub(crate) struct TraceCatalog {
     pub(crate) retention_until: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SamplingUnitKind {
     ChatSessionHeader,
@@ -1324,6 +1387,8 @@ struct SnapshotBatchManifest {
     selection_policy_id: String,
     authorization: SnapshotAnalysisAuthorization,
     entries: Vec<SnapshotBatchEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_slot: Option<StudentQuotaSlotBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1386,6 +1451,7 @@ struct SnapshotLocalRejection {
     reason: SnapshotLocalRejectionReason,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotBatchIndex {
@@ -1761,7 +1827,7 @@ struct CompleteSnapshot {
     response_utf8: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TeacherPartition {
     Train,
@@ -1787,6 +1853,29 @@ struct TextChatMessage {
 struct TeacherSourceChatRequest {
     model: String,
     messages: Vec<TeacherSourceChatMessage>,
+    #[serde(default, rename = "tools", deserialize_with = "reject_present")]
+    _tools: (),
+    #[serde(default, rename = "tool_choice", deserialize_with = "reject_present")]
+    _tool_choice: (),
+    #[serde(default, rename = "functions", deserialize_with = "reject_present")]
+    _functions: (),
+    #[serde(default, rename = "function_call", deserialize_with = "reject_present")]
+    _function_call: (),
+    #[serde(
+        default,
+        rename = "parallel_tool_calls",
+        deserialize_with = "reject_present"
+    )]
+    _parallel_tool_calls: (),
+}
+
+fn reject_present<'de, D>(_: D) -> std::result::Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "root tool/function fields are unsupported",
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1895,6 +1984,8 @@ struct TeacherJobDefinition {
     budget: SnapshotAnalysisBudget,
     reserved_cost_microusd: u64,
     expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_slot: Option<StudentQuotaSlotBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1905,6 +1996,8 @@ struct TeacherJobClaim {
     teacher_job_id: String,
     definition: TeacherJobDefinition,
     claimed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_slot: Option<StudentQuotaSlotBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1916,6 +2009,8 @@ struct TeacherJobIndex {
     teacher_job_id: String,
     expires_at: DateTime<Utc>,
     claim: TeacherJobClaim,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_slot: Option<StudentQuotaSlotBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1965,6 +2060,8 @@ struct TeacherGpuRunDefinition {
     schema_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     student_admission_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_plan_sha256: Option<String>,
     provider_binding_sha256: String,
     slot: u8,
     run_nonce: Uuid,
@@ -2107,6 +2204,8 @@ struct StoredTeacherResult {
     observed_cost_microusd: u64,
     result_sha256: String,
     result: TeacherResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_slot: Option<StudentQuotaSlotBinding>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2674,6 +2773,8 @@ enum GpuLaunchOperation {
         teacher_run_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         student_admission_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quota_plan_sha256: Option<String>,
         provider_binding_sha256: String,
         slot: u8,
         call_count: u64,
@@ -2712,6 +2813,17 @@ struct GpuLaunchOutbox {
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     operation: GpuLaunchOperation,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GpuDispatchNotStartedReceipt {
+    claim_sha256: String,
+    dispatch_id: String,
+    outbox_sha256: String,
+    schema_version: String,
+    scope_id: Uuid,
+    state: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5202,6 +5314,7 @@ impl RecordStore {
         Ok(status)
     }
 
+    #[cfg(test)]
     async fn next_snapshot_hour(
         &self,
         scope: &Scope,
@@ -5533,6 +5646,12 @@ impl RecordStore {
             Err(error) if is_not_found(&error) => {}
             Err(error) => return Err(error),
         }
+        if let GpuLaunchIntentClaim::TeacherRun { claim } = &record.claim
+            && (claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+                || claim.schema_version != "milk.teacher-gpu-run-claim.v2")
+        {
+            bail!("legacy teacher GPU launch intents are read-only");
+        }
         let intent_count = self
             .enforce_gpu_launch_frontier_bound(scope, Some(&dispatch_id), now)
             .await?;
@@ -5626,12 +5745,8 @@ impl RecordStore {
                 }
             }
             GpuLaunchIntentClaim::TeacherRun { claim } => {
-                self.verify_teacher_gpu_run_admission(
-                    scope,
-                    claim,
-                    intent.record.state == GpuLaunchIntentState::Pending,
-                )
-                .await?;
+                self.verify_teacher_gpu_run_admission(scope, claim, false)
+                    .await?;
             }
         }
         Ok(())
@@ -6234,6 +6349,7 @@ impl RecordStore {
         Ok(key)
     }
 
+    #[cfg(test)]
     async fn next_snapshot_trace_frontier_in_hour(
         &self,
         scope: &Scope,
@@ -6305,6 +6421,7 @@ impl RecordStore {
         Ok(None)
     }
 
+    #[cfg(test)]
     async fn load_snapshot_local_rejection(
         &self,
         scope: &Scope,
@@ -6341,6 +6458,7 @@ impl RecordStore {
         Ok(Some(rejection))
     }
 
+    #[cfg(test)]
     async fn load_snapshot_batch_frontier(
         &self,
         scope: &Scope,
@@ -6407,6 +6525,177 @@ impl RecordStore {
         Ok(count)
     }
 
+    async fn next_student_quota_candidate(
+        &self,
+        scope: &Scope,
+        admission: &VerifiedStudentAdmission,
+        now: DateTime<Utc>,
+    ) -> Result<Option<StudentQuotaCandidate>> {
+        let plan = admission
+            .admission
+            .teacher_quota_plan
+            .as_ref()
+            .context("student admission v2 lacks its inline quota plan")?;
+        let plan_sha256 = admission
+            .admission
+            .quota_plan_sha256
+            .as_deref()
+            .context("student admission v2 lacks its quota-plan digest")?;
+        let key_prefix = teacher_job_batch_index_prefix(scope);
+        let prefix = ObjectPath::parse(&key_prefix)?;
+        let mut listed = self.objects.list(Some(&prefix));
+        let mut claimed = BTreeSet::new();
+        let mut accepted = BTreeMap::<TeacherPartition, u64>::new();
+        let mut pending = BTreeMap::<TeacherPartition, u64>::new();
+        let mut listed_count = 0_usize;
+        while let Some(meta) = listed.next().await {
+            let key = meta?.location.to_string();
+            validate_teacher_job_batch_index_path(&key_prefix, &key)?;
+            listed_count = listed_count.saturating_add(1);
+            if listed_count > TEACHER_MAX_DECISIONS as usize {
+                bail!("teacher decision claims exceed {TEACHER_MAX_DECISIONS}");
+            }
+            let index_payload = self.load_bytes(&key, self.max_trace_bytes).await?;
+            let index: TeacherJobIndex = serde_json::from_slice(&index_payload)?;
+            validate_teacher_job_index(scope, &key, &index, &index_payload)?;
+            let Some(slot) = index.quota_slot.as_ref() else {
+                continue;
+            };
+            if slot.student_admission_sha256 != admission.sha256
+                || slot.quota_plan_sha256 != plan_sha256
+            {
+                continue;
+            }
+            if !claimed.insert((slot.partition, slot.rank)) {
+                bail!("student quota slot has more than one teacher claim");
+            }
+            let teacher_job_id = decode_hex_digest(&index.teacher_job_id)?;
+            let claim_object =
+                encode_json(teacher_job_claim_key(scope, &teacher_job_id), &index.claim)?;
+            self.put_create_same(&claim_object).await?;
+            let provider_binding_sha256 =
+                decode_hex_digest(&index.claim.definition.provider_binding_sha256)?;
+            self.put_create_same(&encode_json(
+                teacher_job_frontier_key(
+                    scope,
+                    &provider_binding_sha256,
+                    index.expires_at,
+                    &teacher_job_id,
+                ),
+                &index,
+            )?)
+            .await?;
+            let claim_payload = self
+                .load_bytes(
+                    &teacher_job_claim_key(scope, &teacher_job_id),
+                    self.max_trace_bytes,
+                )
+                .await?;
+            if claim_payload != serde_json::to_vec(&index.claim)?
+                || !self
+                    .teacher_job_is_admitted(scope, &index.claim, admission)
+                    .await?
+            {
+                bail!("student quota teacher index differs from its admitted canonical claim");
+            }
+            let result_key = teacher_job_result_key(scope, &teacher_job_id);
+            let artifact: StoredTeacherResult = match self
+                .load_compressed(&result_key, self.max_artifact_bytes)
+                .await
+            {
+                Ok(artifact) => artifact,
+                Err(error) if is_not_found(&error) => {
+                    let is_pending = match self
+                        .load_teacher_gpu_call_execution(scope, &teacher_job_id)
+                        .await?
+                    {
+                        Some((execution, payload)) => {
+                            self.verify_teacher_gpu_call_execution(
+                                scope,
+                                &index.claim,
+                                &execution,
+                                &payload,
+                            )
+                            .await?;
+                            execution.started()
+                        }
+                        None if now < index.expires_at => true,
+                        None => {
+                            self.teacher_gpu_dispatch_has_run_authority(scope, &teacher_job_id)
+                                .await?
+                        }
+                    };
+                    if is_pending {
+                        *pending.entry(slot.partition).or_default() += 1;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            validate_stored_teacher_result_metadata(scope, &teacher_job_id, &artifact)?;
+            if artifact.quota_slot.as_ref() != Some(slot)
+                || artifact.definition != index.claim.definition
+                || artifact.claim_sha256 != hex_digest(&Sha256::digest(&claim_payload).into())
+            {
+                bail!("student quota teacher result differs from its claimed slot");
+            }
+            self.verify_snapshot_analysis(
+                scope,
+                &decode_hex_digest(&index.snapshot_batch_id)?,
+                &teacher_job_id,
+                index.claim.claimed_at,
+            )
+            .await?;
+            if artifact.result.entries.iter().any(|entry| {
+                matches!(
+                    &entry.output,
+                    TeacherOutput::Train { .. }
+                        | TeacherOutput::Calibration { .. }
+                        | TeacherOutput::Dev {
+                            evaluation: TeacherDevEvaluation::Automatic { .. },
+                            ..
+                        }
+                )
+            }) {
+                *accepted.entry(slot.partition).or_default() += 1;
+            }
+        }
+        for partition in [
+            TeacherPartition::Train,
+            TeacherPartition::Dev,
+            TeacherPartition::Calibration,
+        ] {
+            let quota = student_partition_count(plan.primary_quotas, partition);
+            let accepted_count = accepted.get(&partition).copied().unwrap_or_default();
+            if accepted_count >= quota {
+                continue;
+            }
+            let mut candidates = plan
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.partition == partition)
+                .cloned()
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|candidate| candidate.rank);
+            if let Some(candidate) = candidates.iter().find(|candidate| {
+                candidate.role == StudentQuotaRole::Primary
+                    && !claimed.contains(&(partition, candidate.rank))
+            }) {
+                return Ok(Some(candidate.clone()));
+            }
+            let pending_count = pending.get(&partition).copied().unwrap_or_default();
+            if accepted_count.saturating_add(pending_count) < quota
+                && let Some(candidate) = candidates.iter().find(|candidate| {
+                    candidate.role == StudentQuotaRole::Reserve
+                        && !claimed.contains(&(partition, candidate.rank))
+                })
+            {
+                return Ok(Some(candidate.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     async fn load_teacher_gpu_slot(
         &self,
         scope: &Scope,
@@ -6443,6 +6732,94 @@ impl RecordStore {
         let dispatch: TeacherGpuDispatch = serde_json::from_slice(&payload)?;
         validate_teacher_gpu_dispatch(scope, teacher_job_id, &dispatch, &payload)?;
         Ok(Some((dispatch, payload)))
+    }
+
+    async fn teacher_gpu_dispatch_has_run_authority(
+        &self,
+        scope: &Scope,
+        teacher_job_id: &[u8; 32],
+    ) -> Result<bool> {
+        let Some((dispatch, payload)) = self
+            .load_teacher_gpu_dispatch(scope, teacher_job_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let provider_binding_sha256 = decode_hex_digest(&dispatch.provider_binding_sha256)?;
+        let dispatch_sha256 = hex_digest(&Sha256::digest(&payload).into());
+        let mut referenced_run = false;
+        let mut pending = false;
+        for index in self
+            .load_teacher_gpu_run_indexes(scope, &provider_binding_sha256)
+            .await?
+        {
+            let referenced = index.claim.definition.calls.iter().any(|reference| {
+                reference.teacher_job_id == dispatch.teacher_job_id
+                    && reference.claim_sha256 == dispatch.claim_sha256
+                    && reference.dispatch_sha256 == dispatch_sha256
+            });
+            if !referenced {
+                continue;
+            }
+            if referenced_run {
+                bail!("teacher GPU dispatch is referenced by multiple run authorities");
+            }
+            referenced_run = true;
+            let teacher_run_id = decode_hex_digest(&index.teacher_run_id)?;
+            if !self
+                .exists(&teacher_gpu_run_claim_key(scope, &teacher_run_id))
+                .await?
+            {
+                continue;
+            }
+            let (claim, claim_payload) = self
+                .load_teacher_gpu_run_claim(scope, &teacher_run_id)
+                .await?;
+            if claim != index.claim {
+                bail!("teacher GPU run claim differs from its dispatch frontier");
+            }
+            let (_, outbox) = teacher_gpu_launch_outbox(scope, &claim, &claim_payload)?;
+            if self
+                .gpu_dispatch_is_definitively_not_started(scope, &outbox)
+                .await?
+            {
+                continue;
+            }
+            pending = true;
+        }
+        Ok(pending)
+    }
+
+    async fn gpu_dispatch_is_definitively_not_started(
+        &self,
+        scope: &Scope,
+        outbox: &GpuLaunchOutbox,
+    ) -> Result<bool> {
+        let key = gpu_dispatch_not_started_key(scope, &outbox.dispatch_id);
+        let payload = match self
+            .load_bytes(&key, MAX_GPU_DISPATCH_NOT_STARTED_BYTES)
+            .await
+        {
+            Ok(payload) => payload,
+            Err(error) if is_not_found(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let receipt: GpuDispatchNotStartedReceipt = parse_canonical_json_line(
+            &payload,
+            MAX_GPU_DISPATCH_NOT_STARTED_BYTES,
+            "GPU dispatch not-started receipt",
+        )?;
+        let outbox_sha256 = hex_digest(&Sha256::digest(serde_json::to_vec(outbox)?).into());
+        if receipt.schema_version != "milk.gpu-dispatch-not-started.v1"
+            || receipt.scope_id != scope.scope_id
+            || receipt.dispatch_id != outbox.dispatch_id
+            || receipt.claim_sha256 != outbox.claim_sha256
+            || receipt.outbox_sha256 != outbox_sha256
+            || receipt.state != "not_started"
+        {
+            bail!("GPU dispatch not-started receipt differs from its Carton authority");
+        }
+        Ok(true)
     }
 
     async fn load_teacher_gpu_call_execution(
@@ -6543,7 +6920,19 @@ impl RecordStore {
             TeacherGpuRunCompletion::Terminalized => teacher_gpu_terminalization_deadline(&start)?,
         };
         if serde_json::to_vec(&result)? != payload
-            || result.schema_version != "milk.teacher-gpu-run-result.v2"
+            || !matches!(
+                (
+                    claim.definition.schema_version.as_str(),
+                    result.schema_version.as_str()
+                ),
+                (
+                    "milk.teacher-gpu-run-definition.v1" | "milk.teacher-gpu-run-definition.v2",
+                    "milk.teacher-gpu-run-result.v2"
+                ) | (
+                    "milk.teacher-gpu-run-definition.v3",
+                    "milk.teacher-gpu-run-result.v3"
+                )
+            )
             || result.scope != *scope
             || result.teacher_run_id != hex_digest(teacher_run_id)
             || result.definition != claim.definition
@@ -6719,6 +7108,7 @@ impl RecordStore {
         self.delete(batch_frontier_key).await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn freeze_snapshot_batch_if_present(
         &self,
@@ -6886,6 +7276,7 @@ impl RecordStore {
             selection_policy_id: "active-frontier-singleton-v1".to_owned(),
             authorization,
             entries: vec![entry],
+            quota_slot: None,
         };
         let payload = Bytes::from(serde_json::to_vec(&manifest)?);
         let snapshot_batch_id: [u8; 32] = Sha256::digest(&payload).into();
@@ -6972,6 +7363,139 @@ impl RecordStore {
             entries: manifest.entries.len() as u64,
             state: "ready",
         }))
+    }
+
+    async fn freeze_student_quota_batch(
+        &self,
+        scope: &Scope,
+        authorization: SnapshotAnalysisAuthorization,
+        source_authorization_sha256: [u8; 32],
+        admission: &VerifiedStudentAdmission,
+        candidate: &StudentQuotaCandidate,
+        now: DateTime<Utc>,
+    ) -> Result<SnapshotBatchWrite> {
+        validate_snapshot_analysis_authorization(scope, &authorization)?;
+        let mut authorization_bytes = serde_json::to_vec(&authorization)?;
+        authorization_bytes.push(b'\n');
+        let plan_sha256 = admission
+            .admission
+            .quota_plan_sha256
+            .as_deref()
+            .context("student admission v2 lacks its quota-plan digest")?;
+        if admission.admission.schema_version != "milk.student-admission.v2"
+            || admission
+                .admission
+                .teacher_quota_plan
+                .as_ref()
+                .is_none_or(|plan| !plan.candidates.contains(candidate))
+            || Sha256::digest(&authorization_bytes).as_slice() != source_authorization_sha256
+            || authorization.not_after <= now
+        {
+            bail!("student quota batch authority is invalid");
+        }
+        let payload = self
+            .load_bytes(&candidate.trace_object_key, self.max_trace_bytes)
+            .await?;
+        if hex_digest(&Sha256::digest(&payload).into()) != candidate.trace_payload_sha256 {
+            bail!("student quota candidate payload differs from its admission");
+        }
+        let trace: StoredTraceObject = decode_compressed(&payload, self.max_trace_bytes)?;
+        let request = trace.request.decode()?;
+        let occurred_hour = hour_start(trace.catalog.occurred_at);
+        let sampling = StudentSamplingUnitIdentity {
+            sampling_unit_kind: trace.catalog.sampling_unit_kind,
+            sampling_unit_hmac_sha256: trace.catalog.sampling_unit_hmac_sha256.clone(),
+            sampling_key_version: trace.catalog.sampling_key_version.clone(),
+        };
+        if trace.catalog.scope != *scope
+            || trace.catalog.trace_id != candidate.trace_id
+            || trace_key(scope, candidate.trace_id)? != candidate.trace_object_key
+            || trace.catalog.sampling_independence != SamplingIndependence::Independent
+            || sampling.sampling_unit_kind != candidate.sampling_unit_kind
+            || sampling.sampling_unit_hmac_sha256 != candidate.sampling_unit_hmac_sha256
+            || sampling.sampling_key_version != candidate.sampling_key_version
+            || hex_digest(&Sha256::digest(&request).into()) != candidate.request_sha256
+            || teacher_partition(&candidate.request_sha256)? != candidate.partition
+            || occurred_hour >= hour_start(now)
+            || std::str::from_utf8(&request)
+                .ok()
+                .and_then(text_chat_projection)
+                .is_none()
+        {
+            bail!("student quota candidate differs from its captured independent text request");
+        }
+        let frontier_key = snapshot_trace_frontier_key(scope, candidate.trace_id)?;
+        let frontier_payload = self
+            .load_bytes(&frontier_key, self.max_trace_bytes)
+            .await
+            .context("student quota candidate lacks its live trace frontier")?;
+        let frontier: SnapshotTraceFrontier = serde_json::from_slice(&frontier_payload)?;
+        validate_snapshot_trace_frontier(scope, &frontier_key, &frontier, &frontier_payload)?;
+        if frontier.trace_id != candidate.trace_id
+            || frontier.trace_object_key != candidate.trace_object_key
+            || frontier.trace_payload_sha256 != candidate.trace_payload_sha256
+        {
+            bail!("student quota candidate frontier differs from its admission");
+        }
+        let entry = self
+            .snapshot_batch_entry(
+                scope,
+                &authorization,
+                &candidate.trace_object_key,
+                &payload,
+                occurred_hour,
+                occurred_hour,
+                now,
+            )
+            .await?;
+        if entry.trace_id != candidate.trace_id
+            || entry.trace_payload_sha256 != candidate.trace_payload_sha256
+            || entry.request_sha256 != candidate.request_sha256
+        {
+            bail!("student quota batch entry differs from its immutable candidate");
+        }
+        let quota_slot = StudentQuotaSlotBinding {
+            student_admission_sha256: admission.sha256.clone(),
+            quota_plan_sha256: plan_sha256.to_owned(),
+            partition: candidate.partition,
+            rank: candidate.rank,
+        };
+        let manifest = SnapshotBatchManifest {
+            schema_version: "milk.snapshot-batch.v3".to_owned(),
+            scope: scope.clone(),
+            from_hour: occurred_hour,
+            through_hour: occurred_hour,
+            source_authorization_sha256: hex_digest(&source_authorization_sha256),
+            source_trace_count: 1,
+            selection_policy_id: "admission-quota-singleton-v1".to_owned(),
+            authorization,
+            entries: vec![entry],
+            quota_slot: Some(quota_slot),
+        };
+        let payload = Bytes::from(serde_json::to_vec(&manifest)?);
+        let snapshot_batch_id: [u8; 32] = Sha256::digest(&payload).into();
+        validate_snapshot_batch_manifest(scope, &snapshot_batch_id, &manifest, &payload)?;
+        let object = EncodedObject {
+            key: snapshot_batch_key(scope, &snapshot_batch_id),
+            payload,
+            sha256: snapshot_batch_id,
+        };
+        if object.payload.len() > self.max_artifact_bytes {
+            bail!("student quota batch exceeds configured artifact limit");
+        }
+        self.put_create_same(&object).await?;
+        self.ensure_snapshot_entries_live(scope, &manifest.entries, now)
+            .await?;
+        Ok(SnapshotBatchWrite {
+            schema_version: "milk.snapshot-batch-receipt.v3",
+            snapshot_batch_id: hex_digest(&snapshot_batch_id),
+            object_key: object.key,
+            manifest_sha256: hex_digest(&snapshot_batch_id),
+            manifest_bytes: object.payload.len() as u64,
+            source_traces: 1,
+            entries: 1,
+            state: "ready",
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7296,6 +7820,11 @@ impl RecordStore {
             .load_teacher_gpu_run_indexes(scope, provider_binding_sha256)
             .await?
         {
+            if index.claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+                || index.claim.schema_version != "milk.teacher-gpu-run-claim.v2"
+            {
+                continue;
+            }
             let teacher_run_id = decode_hex_digest(&index.teacher_run_id)?;
             if self
                 .exists(&teacher_gpu_run_claim_key(scope, &teacher_run_id))
@@ -7361,28 +7890,33 @@ impl RecordStore {
         max_gpu_seconds: u64,
         claimed_decisions: u32,
         now: DateTime<Utc>,
-        admission_sha256: Option<&str>,
+        admission: &VerifiedStudentAdmission,
     ) -> Result<TeacherGpuClaimPreparation> {
-        let Some(closed_hour) = self
-            .next_snapshot_hour(scope, authorization, source_authorization_sha256, now)
+        let current = self
+            .load_current_student_admission(scope)
+            .await?
+            .context("student admission disappeared before teacher claim")?;
+        if current.sha256 != admission.sha256
+            || current.admission.schema_version != "milk.student-admission.v2"
+        {
+            bail!("only the current student admission v2 may create teacher claims");
+        }
+        let Some(candidate) = self
+            .next_student_quota_candidate(scope, admission, now)
             .await?
         else {
             return Ok(TeacherGpuClaimPreparation::None);
         };
-        let Some(batch) = self
-            .freeze_snapshot_batch_if_present(
+        let batch = self
+            .freeze_student_quota_batch(
                 scope,
                 authorization.clone(),
                 *source_authorization_sha256,
-                closed_hour,
-                closed_hour,
-                1,
+                admission,
+                &candidate,
                 now,
             )
-            .await?
-        else {
-            return Ok(TeacherGpuClaimPreparation::None);
-        };
+            .await?;
         let batch_id = decode_hex_digest(&batch.snapshot_batch_id)?;
         let created_decision = self
             .load_teacher_job_index_by_batch(scope, &batch_id)
@@ -7406,14 +7940,12 @@ impl RecordStore {
             prepared.definition.expires_at,
             "teacher GPU call claim",
         )?;
-        if let Some(admission_sha256) = admission_sha256 {
-            let current = self
-                .load_current_student_admission(scope)
-                .await?
-                .context("student admission disappeared before teacher claim")?;
-            if current.sha256 != admission_sha256 {
-                bail!("student admission changed before teacher claim");
-            }
+        let current = self
+            .load_current_student_admission(scope)
+            .await?
+            .context("student admission disappeared before teacher claim")?;
+        if current.sha256 != admission.sha256 {
+            bail!("student admission changed before teacher claim");
         }
         self.persist_teacher_claim(scope, &prepared, now).await?;
         let claim_payload = self
@@ -7479,6 +8011,9 @@ impl RecordStore {
         let Some(admission) = self.load_current_student_admission(scope).await? else {
             return Ok(TeacherGpuTickWrite::Hold);
         };
+        if admission.admission.schema_version != "milk.student-admission.v2" {
+            return Ok(TeacherGpuTickWrite::Hold);
+        }
         let mut claimed_decisions = self.teacher_decision_count(scope).await?;
         let active = self
             .load_active_teacher_jobs(scope, &provider_binding_sha256, now)
@@ -7524,7 +8059,7 @@ impl RecordStore {
                         max_gpu_seconds,
                         claimed_decisions,
                         now,
-                        Some(&admission.sha256),
+                        &admission,
                     )
                     .await?
                 {
@@ -7636,7 +8171,7 @@ impl RecordStore {
                     max_gpu_seconds,
                     claimed_decisions,
                     now,
-                    Some(&admission.sha256),
+                    &admission,
                 )
                 .await?
             {
@@ -7696,9 +8231,15 @@ impl RecordStore {
             expires_at = expires_at.min(claim.definition.expires_at);
         }
         ensure_teacher_runway(now, max_gpu_seconds, expires_at, "teacher GPU run claim")?;
+        let quota_plan_sha256 = admission
+            .admission
+            .quota_plan_sha256
+            .clone()
+            .context("student admission v2 lacks its quota-plan digest")?;
         let definition = TeacherGpuRunDefinition {
-            schema_version: "milk.teacher-gpu-run-definition.v2".to_owned(),
+            schema_version: "milk.teacher-gpu-run-definition.v3".to_owned(),
             student_admission_sha256: Some(admission.sha256.clone()),
+            quota_plan_sha256: Some(quota_plan_sha256),
             provider_binding_sha256: hex_digest(&provider_binding_sha256),
             slot: acquired.slot.slot,
             run_nonce: acquired.slot.run_nonce,
@@ -7710,7 +8251,7 @@ impl RecordStore {
         };
         let teacher_run_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
         let claim = TeacherGpuRunClaim {
-            schema_version: "milk.teacher-gpu-run-claim.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-claim.v2".to_owned(),
             scope: scope.clone(),
             teacher_run_id: hex_digest(&teacher_run_id),
             definition,
@@ -7833,6 +8374,11 @@ impl RecordStore {
         index: TeacherGpuRunIndex,
         now: DateTime<Utc>,
     ) -> Result<TeacherGpuTickWrite> {
+        if index.claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+            || index.claim.schema_version != "milk.teacher-gpu-run-claim.v2"
+        {
+            bail!("legacy teacher GPU run claims are read-only");
+        }
         ensure_teacher_gpu_slot_policy(
             slot,
             &index.claim.definition.runtime_image_reference,
@@ -8051,10 +8597,12 @@ impl RecordStore {
         let (claim, claim_payload, _) = self
             .verify_teacher_gpu_run_authority(scope, teacher_run_id, &config)
             .await?;
-        if claim.definition.schema_version != "milk.teacher-gpu-run-definition.v2" {
+        if claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+            || claim.schema_version != "milk.teacher-gpu-run-claim.v2"
+        {
             bail!("legacy teacher GPU run claims are read-only");
         }
-        self.verify_teacher_gpu_run_admission(scope, &claim, true)
+        self.verify_teacher_gpu_run_admission(scope, &claim, false)
             .await?;
         if self
             .load_teacher_gpu_run_result(scope, teacher_run_id)
@@ -8172,6 +8720,11 @@ impl RecordStore {
         {
             return teacher_gpu_run_result_write(&result);
         }
+        if claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+            || claim.schema_version != "milk.teacher-gpu-run-claim.v2"
+        {
+            bail!("legacy teacher GPU run claims are read-only");
+        }
         let (start, start_payload) = self
             .load_verified_teacher_gpu_run_start(scope, teacher_run_id, &claim, &claim_payload)
             .await?;
@@ -8257,7 +8810,7 @@ impl RecordStore {
             }
         }
         let result = TeacherGpuRunResult {
-            schema_version: "milk.teacher-gpu-run-result.v2".to_owned(),
+            schema_version: "milk.teacher-gpu-run-result.v3".to_owned(),
             scope: scope.clone(),
             teacher_run_id: claim.teacher_run_id,
             definition: claim.definition.clone(),
@@ -8292,6 +8845,11 @@ impl RecordStore {
             .await?
         {
             return teacher_gpu_run_result_write(&result);
+        }
+        if claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+            || claim.schema_version != "milk.teacher-gpu-run-claim.v2"
+        {
+            bail!("legacy teacher GPU run claims are read-only");
         }
         let (start, start_payload) = self
             .load_verified_teacher_gpu_run_start(scope, teacher_run_id, &claim, &claim_payload)
@@ -8503,7 +9061,7 @@ impl RecordStore {
         }
         let observed_gpu_seconds = elapsed_seconds_ceil(start.started_at, completed_at)?;
         let result = TeacherGpuRunResult {
-            schema_version: "milk.teacher-gpu-run-result.v2".to_owned(),
+            schema_version: "milk.teacher-gpu-run-result.v3".to_owned(),
             scope: scope.clone(),
             teacher_run_id: claim.teacher_run_id,
             definition: claim.definition,
@@ -8652,8 +9210,21 @@ impl RecordStore {
         }
         self.ensure_snapshot_entries_live(scope, &manifest.entries, now)
             .await?;
+        let (definition_schema, quota_slot) = match manifest.schema_version.as_str() {
+            "milk.snapshot-batch.v2" => ("milk.teacher-job-definition.v2", None),
+            "milk.snapshot-batch.v3" => (
+                "milk.teacher-job-definition.v3",
+                Some(
+                    manifest
+                        .quota_slot
+                        .clone()
+                        .context("snapshot batch v3 lacks its quota slot")?,
+                ),
+            ),
+            _ => bail!("snapshot batch schema cannot create a teacher definition"),
+        };
         let definition = TeacherJobDefinition {
-            schema_version: "milk.teacher-job-definition.v2".to_owned(),
+            schema_version: definition_schema.to_owned(),
             snapshot_batch_id: hex_digest(snapshot_batch_id),
             provider_binding_sha256: hex_digest(&provider_binding_sha256),
             execution: config.execution.identity(),
@@ -8664,6 +9235,7 @@ impl RecordStore {
             budget: config.budget.clone(),
             reserved_cost_microusd,
             expires_at,
+            quota_slot,
         };
         let teacher_job_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
         Ok(PreparedTeacherAnalysisLoad::Ready(Box::new(
@@ -8687,6 +9259,14 @@ impl RecordStore {
         let snapshot_batch_id = decode_hex_digest(&prepared.definition.snapshot_batch_id)?;
         let teacher_job_id = prepared.teacher_job_id;
         let expires_at = prepared.definition.expires_at;
+        let quota_slot = prepared
+            .definition
+            .quota_slot
+            .clone()
+            .context("new teacher claims require a quota-slot binding")?;
+        if prepared.definition.schema_version != "milk.teacher-job-definition.v3" {
+            bail!("legacy teacher job definitions are read-only");
+        }
         let index = match self
             .load_teacher_job_index_by_batch(scope, &snapshot_batch_id)
             .await?
@@ -8699,18 +9279,20 @@ impl RecordStore {
             }
             Some(_) => bail!("snapshot batch is already reserved by another teacher job"),
             None => TeacherJobIndex {
-                schema_version: "milk.teacher-job-index.v2".to_owned(),
+                schema_version: "milk.teacher-job-index.v3".to_owned(),
                 scope: scope.clone(),
                 snapshot_batch_id: hex_digest(&snapshot_batch_id),
                 teacher_job_id: hex_digest(&teacher_job_id),
                 expires_at,
                 claim: TeacherJobClaim {
-                    schema_version: "milk.teacher-job-claim.v2".to_owned(),
+                    schema_version: "milk.teacher-job-claim.v3".to_owned(),
                     scope: scope.clone(),
                     teacher_job_id: hex_digest(&teacher_job_id),
                     definition: prepared.definition.clone(),
                     claimed_at: now,
+                    quota_slot: Some(quota_slot.clone()),
                 },
+                quota_slot: Some(quota_slot),
             },
         };
         self.put_create_same(&encode_json(
@@ -8755,6 +9337,11 @@ impl RecordStore {
     ) -> Result<TeacherResultWrite> {
         let artifact_key = teacher_job_result_key(scope, &prepared.teacher_job_id);
         async {
+            if prepared.definition.schema_version != "milk.teacher-job-definition.v3"
+                || prepared.definition.quota_slot.is_none()
+            {
+                bail!("legacy teacher job definitions are read-only");
+            }
             self.ensure_snapshot_entries_live(scope, &prepared.manifest.entries, now)
                 .await?;
             let call = call_snapshot_analyzer(&config, prepared.provider_request).await?;
@@ -8770,8 +9357,9 @@ impl RecordStore {
                 duration_ms: call.duration_ms,
             };
             let result_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(&result)?).into();
+            let quota_slot = prepared.definition.quota_slot.clone();
             let artifact = StoredTeacherResult {
-                schema_version: "milk.teacher-result-artifact.v1".to_owned(),
+                schema_version: "milk.teacher-result-artifact.v2".to_owned(),
                 scope: scope.clone(),
                 teacher_job_id: hex_digest(&prepared.teacher_job_id),
                 definition: prepared.definition,
@@ -8781,6 +9369,7 @@ impl RecordStore {
                 observed_cost_microusd,
                 result_sha256: hex_digest(&result_sha256),
                 result,
+                quota_slot,
             };
             self.ensure_snapshot_entries_live(scope, &prepared.manifest.entries, Utc::now())
                 .await?;
@@ -8924,10 +9513,9 @@ impl RecordStore {
         let claim_key = teacher_job_claim_key(scope, teacher_job_id);
         let claim_payload = self.load_bytes(&claim_key, self.max_trace_bytes).await?;
         let claim: TeacherJobClaim = serde_json::from_slice(&claim_payload)?;
-        if claim.schema_version != "milk.teacher-job-claim.v2"
-            || claim.scope != *scope
-            || claim.teacher_job_id != hex_digest(teacher_job_id)
-            || claim.definition != artifact.definition
+        validate_teacher_job_claim(scope, teacher_job_id, &claim, &claim_payload)?;
+        if claim.definition != artifact.definition
+            || claim.quota_slot != artifact.quota_slot
             || claim.claimed_at >= claim.definition.expires_at
             || hex_digest(&Sha256::digest(&claim_payload).into()) != artifact.claim_sha256
         {
@@ -9050,6 +9638,14 @@ impl RecordStore {
                 }),
                 _ => unsupported_utf8 = true,
             }
+        }
+        if let Some(slot) = manifest.quota_slot.as_ref()
+            && !unsupported_encoding
+            && !unsupported_utf8
+            && !over_projection
+            && !matches!(snapshots.as_slice(), [snapshot] if snapshot.partition == slot.partition)
+        {
+            bail!("snapshot batch quota slot differs from its fixed v1 partition");
         }
         if unsupported_encoding {
             Ok(SnapshotAnalysisInputLoad::UnsupportedEncoding { decoded_bytes })
@@ -9484,82 +10080,7 @@ impl RecordStore {
                 return Ok(Some(write));
             }
         }
-        let Some(admission) = self.load_current_student_admission(scope).await? else {
-            return Ok(None);
-        };
-        let active_teachers = self
-            .load_active_teacher_jobs(scope, teacher_provider_binding_sha256, now)
-            .await?;
-        let verified = active_teachers
-            .into_iter()
-            .filter_map(|job| job.result)
-            .collect::<Vec<_>>();
-        let Some((claim, _)) = prepare_student_job_claim_with_admission(
-            scope,
-            teacher_provider_binding_sha256,
-            recipe_sha256,
-            student_train_runtime_image_reference,
-            student_branch_runtime_image_reference,
-            now,
-            Some(&admission),
-            &verified,
-        )?
-        else {
-            return Ok(None);
-        };
-        if self
-            .load_current_student_admission(scope)
-            .await?
-            .is_none_or(|current| current.sha256 != admission.sha256)
-        {
-            return Ok(None);
-        }
-        let student_job_id = decode_hex_digest(&claim.student_job_id)?;
-        let encoded = encode_json(student_job_claim_key(scope, &student_job_id), &claim)?;
-        if encoded.payload.len() > MAX_STUDENT_CLAIM_BYTES {
-            bail!("student job claim exceeds its hard byte limit");
-        }
-        let source_expires_at = self
-            .verified_student_source_expires_at(scope, &claim)
-            .await?;
-        let index = StudentJobIndex {
-            schema_version: "milk.student-job-index.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: claim.student_job_id.clone(),
-            source_expires_at,
-            claim: claim.clone(),
-        };
-        let index_object = encode_json(
-            student_job_frontier_key(scope, teacher_provider_binding_sha256),
-            &index,
-        )?;
-        if index_object.payload.len() > MAX_STUDENT_INDEX_BYTES {
-            bail!("student job frontier exceeds its hard byte limit");
-        }
-        let frontier = match self
-            .objects
-            .put_opts(
-                &ObjectPath::parse(&index_object.key)?,
-                index_object.payload.into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(_) => VerifiedStudentFrontier {
-                index,
-                canonical: None,
-            },
-            Err(object_store::Error::AlreadyExists { .. }) => self
-                .load_student_reservation(scope, teacher_provider_binding_sha256)
-                .await?
-                .context("student reservation disappeared during contention")?,
-            Err(error) => return Err(error.into()),
-        };
-        self.reconcile_student_reservation(scope, teacher_provider_binding_sha256, frontier, now)
-            .await
+        Ok(None)
     }
 
     async fn status(
@@ -11608,12 +12129,76 @@ impl RecordStore {
         let manifest = self
             .load_verified_snapshot_batch(scope, &snapshot_batch_id, claim.claimed_at)
             .await?;
-        Ok(manifest.entries.iter().all(|entry| {
-            !admission
-                .admission
-                .held_out_trace_sha256s
-                .contains(&entry.trace_payload_sha256)
-        }))
+        if admission.admission.schema_version == "milk.student-admission.v1" {
+            return Ok(claim.schema_version == "milk.teacher-job-claim.v2"
+                && manifest.schema_version == "milk.snapshot-batch.v2"
+                && manifest.entries.iter().all(|entry| {
+                    !admission
+                        .admission
+                        .held_out_trace_sha256s
+                        .contains(&entry.trace_payload_sha256)
+                }));
+        }
+        let plan = admission
+            .admission
+            .teacher_quota_plan
+            .as_ref()
+            .context("student admission v2 lacks its inline quota plan")?;
+        let plan_sha256 = admission
+            .admission
+            .quota_plan_sha256
+            .as_deref()
+            .context("student admission v2 lacks its quota-plan digest")?;
+        let Some(slot) = claim.quota_slot.as_ref() else {
+            return Ok(false);
+        };
+        if claim.schema_version != "milk.teacher-job-claim.v3"
+            || manifest.schema_version != "milk.snapshot-batch.v3"
+            || manifest.quota_slot.as_ref() != Some(slot)
+            || claim.definition.quota_slot.as_ref() != Some(slot)
+            || slot.student_admission_sha256 != admission.sha256
+            || slot.quota_plan_sha256 != plan_sha256
+        {
+            return Ok(false);
+        }
+        let Some(candidate) = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.partition == slot.partition && candidate.rank == slot.rank)
+        else {
+            return Ok(false);
+        };
+        let [entry] = manifest.entries.as_slice() else {
+            return Ok(false);
+        };
+        if entry.trace_id != candidate.trace_id
+            || entry.trace_object_key != candidate.trace_object_key
+            || entry.trace_payload_sha256 != candidate.trace_payload_sha256
+            || entry.request_sha256 != candidate.request_sha256
+            || teacher_partition(&entry.request_sha256)? != slot.partition
+        {
+            return Ok(false);
+        }
+        let payload = self
+            .load_bytes(&entry.trace_object_key, self.max_trace_bytes)
+            .await?;
+        if hex_digest(&Sha256::digest(&payload).into()) != entry.trace_payload_sha256 {
+            return Ok(false);
+        }
+        let trace: StoredTraceObject = decode_compressed(&payload, self.max_trace_bytes)?;
+        let request = trace.request.decode()?;
+        Ok(trace.schema_version == TRACE_SCHEMA_VERSION
+            && trace.catalog.scope == *scope
+            && trace.catalog.trace_id == entry.trace_id
+            && trace_key(scope, trace.catalog.trace_id)? == entry.trace_object_key
+            && trace.catalog.request_bytes == request.len() as u64
+            && hex_digest(&Sha256::digest(&request).into()) == entry.request_sha256
+            && trace.catalog.capture_eligible
+            && trace.catalog.capture_selected
+            && trace.catalog.sampling_independence == SamplingIndependence::Independent
+            && trace.catalog.sampling_unit_kind == candidate.sampling_unit_kind
+            && trace.catalog.sampling_unit_hmac_sha256 == candidate.sampling_unit_hmac_sha256
+            && trace.catalog.sampling_key_version == candidate.sampling_key_version)
     }
 
     async fn verify_teacher_gpu_run_admission(
@@ -11638,6 +12223,12 @@ impl RecordStore {
             self.load_student_admission_version(scope, admission_sha256)
                 .await?
         };
+        if claim.definition.schema_version == "milk.teacher-gpu-run-definition.v3"
+            && (admission.admission.schema_version != "milk.student-admission.v2"
+                || admission.admission.quota_plan_sha256 != claim.definition.quota_plan_sha256)
+        {
+            bail!("teacher GPU run quota plan differs from its addressed admission");
+        }
         for reference in &claim.definition.calls {
             let teacher_job_id = decode_hex_digest(&reference.teacher_job_id)?;
             let payload = self
@@ -11699,6 +12290,92 @@ impl RecordStore {
                 &format!("{prefix}/{root}/versions/{digest}.json"),
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_student_quota_source_membership(
+        &self,
+        scope: &Scope,
+        admission: &StudentAdmission,
+        source: &HarnessSourceManifest,
+    ) -> Result<()> {
+        if admission.schema_version != "milk.student-admission.v2" {
+            return Ok(());
+        }
+        let plan = admission
+            .teacher_quota_plan
+            .as_ref()
+            .context("student admission v2 lacks its inline quota plan")?;
+        let held_out_requests = admission
+            .held_out_request_sha256s
+            .as_ref()
+            .context("student admission v2 lacks held-out request identities")?;
+        let held_out_sampling = admission
+            .held_out_sampling_units
+            .as_ref()
+            .context("student admission v2 lacks held-out sampling identities")?;
+        let mut traces_by_key = BTreeMap::new();
+        let mut traces_by_digest = BTreeMap::new();
+        for reference in &source.traces {
+            if traces_by_key
+                .insert(reference.key.as_str(), reference.sha256.as_str())
+                .is_some()
+                || traces_by_digest
+                    .insert(reference.sha256.as_str(), reference.key.as_str())
+                    .is_some()
+            {
+                bail!("student admission source contains duplicate trace identities");
+            }
+        }
+        if plan.candidates.iter().any(|candidate| {
+            traces_by_key
+                .get(candidate.trace_object_key.as_str())
+                .copied()
+                != Some(candidate.trace_payload_sha256.as_str())
+        }) {
+            bail!("student quota candidate is absent from its sealed source manifest");
+        }
+
+        let mut derived_requests = BTreeSet::new();
+        let mut derived_sampling = BTreeMap::new();
+        for digest in &admission.held_out_trace_sha256s {
+            let key = traces_by_digest
+                .get(digest.as_str())
+                .copied()
+                .context("held-out trace is absent from its sealed source manifest")?;
+            let payload = self.load_bytes(key, self.max_trace_bytes).await?;
+            if hex_digest(&Sha256::digest(&payload).into()) != *digest {
+                bail!("held-out trace differs from its sealed source digest");
+            }
+            let trace: StoredTraceObject = decode_compressed(&payload, self.max_trace_bytes)?;
+            if trace.schema_version != TRACE_SCHEMA_VERSION
+                || trace.catalog.scope != *scope
+                || trace_key(scope, trace.catalog.trace_id)? != key
+                || trace.catalog.sampling_independence != SamplingIndependence::Independent
+            {
+                bail!("held-out trace has the wrong typed source identity");
+            }
+            let request = trace.request.decode()?;
+            derived_requests.insert(hex_digest(&Sha256::digest(&request).into()));
+            let identity = StudentSamplingUnitIdentity {
+                sampling_unit_kind: trace.catalog.sampling_unit_kind,
+                sampling_unit_hmac_sha256: trace.catalog.sampling_unit_hmac_sha256,
+                sampling_key_version: trace.catalog.sampling_key_version,
+            };
+            if !valid_sampling_unit_identity(&identity) {
+                bail!("held-out trace has an invalid sampling identity");
+            }
+            let canonical =
+                serde_json::to_string(&recursively_sorted_json(serde_json::to_value(&identity)?))?;
+            derived_sampling.entry(canonical).or_insert(identity);
+        }
+        let derived_requests = derived_requests.into_iter().collect::<Vec<_>>();
+        let derived_sampling = derived_sampling.into_values().collect::<Vec<_>>();
+        if derived_requests.as_slice() != held_out_requests.as_slice()
+            || derived_sampling.as_slice() != held_out_sampling.as_slice()
+        {
+            bail!("student admission held-out identities differ from its sealed source");
         }
         Ok(())
     }
@@ -11791,12 +12468,17 @@ impl RecordStore {
             .collect::<Vec<_>>();
         held_out.sort();
         held_out.dedup();
+        validate_student_admission_contract(scope, admission, &held_out)?;
+        self.verify_student_quota_source_membership(scope, admission, &source)
+            .await?;
         let profile_flags_valid = match admission.profile {
             HarnessProfile::Mechanics => admission.test_only && !readiness.statistically_qualified,
             HarnessProfile::Production => !admission.test_only && readiness.statistically_qualified,
         };
-        let identity_valid = admission.schema_version == "milk.student-admission.v1"
-            && admission.scope_id == scope.scope_id
+        let identity_valid = matches!(
+            admission.schema_version.as_str(),
+            "milk.student-admission.v1" | "milk.student-admission.v2"
+        ) && admission.scope_id == scope.scope_id
             && valid_analysis_identifier(series, 128)
             && source.schema_version == "milk.summary-source-manifest.v1"
             && source.scope_id == scope.scope_id
@@ -12588,6 +13270,241 @@ impl RecordStore {
         }
         Ok((commit, manifest, signature))
     }
+}
+
+fn student_partition_count(counts: StudentInputCounts, partition: TeacherPartition) -> u64 {
+    match partition {
+        TeacherPartition::Train => counts.train,
+        TeacherPartition::Dev => counts.dev,
+        TeacherPartition::Calibration => counts.calibration,
+    }
+}
+
+fn quota_plan_sha256(plan: &StudentQuotaPlan) -> Result<String> {
+    let canonical = serde_json::to_vec(&recursively_sorted_json(serde_json::to_value(plan)?))?;
+    Ok(hex_digest(&Sha256::digest(canonical).into()))
+}
+
+fn recursively_sorted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(recursively_sorted_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, recursively_sorted_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+fn valid_quota_slot_binding(binding: &StudentQuotaSlotBinding) -> bool {
+    valid_lowercase_sha256(&binding.student_admission_sha256)
+        && valid_lowercase_sha256(&binding.quota_plan_sha256)
+        && binding.rank > 0
+}
+
+fn valid_sampling_unit_identity(identity: &StudentSamplingUnitIdentity) -> bool {
+    valid_lowercase_sha256(&identity.sampling_unit_hmac_sha256)
+        && valid_receipt_string(&identity.sampling_key_version, 128)
+}
+
+fn validate_student_admission_contract(
+    scope: &Scope,
+    admission: &StudentAdmission,
+    eval_held_out: &[String],
+) -> Result<()> {
+    let v2_fields_absent = admission.held_out_request_sha256s.is_none()
+        && admission.held_out_sampling_units.is_none()
+        && admission.quota_plan_sha256.is_none()
+        && admission.teacher_quota_plan.is_none();
+    if admission.schema_version == "milk.student-admission.v1" {
+        if !v2_fields_absent || admission.held_out_trace_sha256s != eval_held_out {
+            bail!("student admission v1 contains v2 quota fields");
+        }
+        return Ok(());
+    }
+    if admission.schema_version != "milk.student-admission.v2" {
+        bail!("student admission schema is unsupported");
+    }
+    let held_out_requests = admission
+        .held_out_request_sha256s
+        .as_ref()
+        .context("student admission v2 lacks held-out request identities")?;
+    let held_out_sampling = admission
+        .held_out_sampling_units
+        .as_ref()
+        .context("student admission v2 lacks held-out sampling identities")?;
+    let expected_plan_sha256 = admission
+        .quota_plan_sha256
+        .as_deref()
+        .context("student admission v2 lacks its quota-plan digest")?;
+    let plan = admission
+        .teacher_quota_plan
+        .as_ref()
+        .context("student admission v2 lacks its inline quota plan")?;
+    if admission.held_out_trace_sha256s != eval_held_out
+        || !valid_lowercase_sha256(expected_plan_sha256)
+        || quota_plan_sha256(plan)? != expected_plan_sha256
+        || plan.schema_version != "milk.teacher-quota-plan.v1"
+        || plan.scope_id != scope.scope_id
+        || plan.source_manifest_sha256 != admission.source_manifest_sha256
+        || plan.partition_policy_id != admission.partition_policy_id
+        || plan.primary_quotas
+            != (StudentInputCounts {
+                train: STUDENT_MIN_TRAIN_ROWS as u64,
+                dev: STUDENT_DEV_ROWS,
+                calibration: STUDENT_CALIBRATION_ROWS as u64,
+            })
+        || plan.reserve_quotas
+            != (StudentInputCounts {
+                train: 13,
+                dev: 18,
+                calibration: 38,
+            })
+    {
+        bail!("student admission v2 quota-plan identity is invalid");
+    }
+    if held_out_requests.is_empty()
+        || held_out_requests
+            .iter()
+            .any(|digest| !valid_lowercase_sha256(digest))
+        || held_out_requests.windows(2).any(|pair| pair[0] >= pair[1])
+        || held_out_sampling.is_empty()
+        || held_out_sampling
+            .iter()
+            .any(|identity| !valid_sampling_unit_identity(identity))
+    {
+        bail!("student admission v2 held-out identities are invalid");
+    }
+    let held_out_sampling_json = held_out_sampling
+        .iter()
+        .map(|identity| {
+            serde_json::to_string(&recursively_sorted_json(serde_json::to_value(identity)?))
+                .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if held_out_sampling_json
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        bail!("student admission v2 held-out sampling identities are not ordered and unique");
+    }
+    let total_candidates = plan
+        .primary_quotas
+        .train
+        .checked_add(plan.primary_quotas.dev)
+        .and_then(|value| value.checked_add(plan.primary_quotas.calibration))
+        .and_then(|value| value.checked_add(plan.reserve_quotas.train))
+        .and_then(|value| value.checked_add(plan.reserve_quotas.dev))
+        .and_then(|value| value.checked_add(plan.reserve_quotas.calibration))
+        .context("student quota count overflow")?;
+    if total_candidates == 0
+        || total_candidates > MAX_ITERATION_SNAPSHOT_ARTIFACTS as u64
+        || plan.candidates.len() as u64 != total_candidates
+    {
+        bail!("student quota plan candidate count is invalid");
+    }
+    let held_out_traces = admission
+        .held_out_trace_sha256s
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let held_out_requests = held_out_requests
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let held_out_sampling_hmacs = held_out_sampling
+        .iter()
+        .map(|identity| identity.sampling_unit_hmac_sha256.as_str())
+        .collect::<HashSet<_>>();
+    let mut trace_ids = HashSet::new();
+    let mut trace_payloads = HashSet::new();
+    let mut requests = HashSet::new();
+    let mut sampling_units = HashSet::new();
+    let mut slots = BTreeSet::new();
+    let mut counts = BTreeMap::<(TeacherPartition, StudentQuotaRole), u64>::new();
+    let mut previous_request = BTreeMap::<TeacherPartition, &str>::new();
+    let expected_order = [
+        TeacherPartition::Train,
+        TeacherPartition::Dev,
+        TeacherPartition::Calibration,
+    ]
+    .into_iter()
+    .flat_map(|partition| {
+        let total = student_partition_count(plan.primary_quotas, partition)
+            + student_partition_count(plan.reserve_quotas, partition);
+        (1..=total).map(move |rank| (partition, rank as u32))
+    });
+    for (candidate, expected_slot) in plan.candidates.iter().zip(expected_order) {
+        let primary = student_partition_count(plan.primary_quotas, candidate.partition);
+        let reserve = student_partition_count(plan.reserve_quotas, candidate.partition);
+        let expected_role = if u64::from(candidate.rank) <= primary {
+            StudentQuotaRole::Primary
+        } else {
+            StudentQuotaRole::Reserve
+        };
+        let sampling = StudentSamplingUnitIdentity {
+            sampling_unit_kind: candidate.sampling_unit_kind,
+            sampling_unit_hmac_sha256: candidate.sampling_unit_hmac_sha256.clone(),
+            sampling_key_version: candidate.sampling_key_version.clone(),
+        };
+        if candidate.rank == 0
+            || u64::from(candidate.rank) > primary.saturating_add(reserve)
+            || candidate.role != expected_role
+            || candidate.trace_id.get_version_num() != 7
+            || candidate.trace_object_key != trace_key(scope, candidate.trace_id)?
+            || !valid_lowercase_sha256(&candidate.trace_payload_sha256)
+            || !valid_lowercase_sha256(&candidate.request_sha256)
+            || candidate.sampling_unit_kind == SamplingUnitKind::Request
+            || !valid_sampling_unit_identity(&sampling)
+            || teacher_partition(&candidate.request_sha256)? != candidate.partition
+            || held_out_traces.contains(candidate.trace_payload_sha256.as_str())
+            || held_out_requests.contains(candidate.request_sha256.as_str())
+            || held_out_sampling_hmacs.contains(candidate.sampling_unit_hmac_sha256.as_str())
+            || (candidate.partition, candidate.rank) != expected_slot
+            || previous_request
+                .get(&candidate.partition)
+                .is_some_and(|previous| *previous >= candidate.request_sha256.as_str())
+            || !trace_ids.insert(candidate.trace_id)
+            || !trace_payloads.insert(candidate.trace_payload_sha256.as_str())
+            || !requests.insert(candidate.request_sha256.as_str())
+            || !sampling_units.insert(candidate.sampling_unit_hmac_sha256.as_str())
+            || !slots.insert((candidate.partition, candidate.rank))
+        {
+            bail!("student quota candidate identity, partition, or independence is invalid");
+        }
+        previous_request.insert(candidate.partition, candidate.request_sha256.as_str());
+        *counts
+            .entry((candidate.partition, candidate.role))
+            .or_default() += 1;
+    }
+    for partition in [
+        TeacherPartition::Train,
+        TeacherPartition::Dev,
+        TeacherPartition::Calibration,
+    ] {
+        if counts
+            .get(&(partition, StudentQuotaRole::Primary))
+            .copied()
+            .unwrap_or_default()
+            != student_partition_count(plan.primary_quotas, partition)
+            || counts
+                .get(&(partition, StudentQuotaRole::Reserve))
+                .copied()
+                .unwrap_or_default()
+                != student_partition_count(plan.reserve_quotas, partition)
+        {
+            bail!("student quota candidates do not fill their declared quotas");
+        }
+    }
+    Ok(())
 }
 
 impl StudentWinnerMaterializationOutput {
@@ -13654,15 +14571,29 @@ fn validate_snapshot_batch_manifest(
     validate_snapshot_analysis_authorization(scope, &manifest.authorization)?;
     let mut authorization_bytes = serde_json::to_vec(&manifest.authorization)?;
     authorization_bytes.push(b'\n');
+    let version_valid = match manifest.schema_version.as_str() {
+        "milk.snapshot-batch.v2" => {
+            manifest.selection_policy_id == "active-frontier-singleton-v1"
+                && manifest.quota_slot.is_none()
+        }
+        "milk.snapshot-batch.v3" => {
+            manifest.selection_policy_id == "admission-quota-singleton-v1"
+                && manifest
+                    .quota_slot
+                    .as_ref()
+                    .is_some_and(valid_quota_slot_binding)
+                && manifest.entries.len() == 1
+        }
+        _ => false,
+    };
     if serde_json::to_vec(manifest)? != payload
         || Sha256::digest(payload).as_slice() != snapshot_batch_id
-        || manifest.schema_version != "milk.snapshot-batch.v2"
+        || !version_valid
         || manifest.scope != *scope
         || manifest.entries.is_empty()
         || manifest.entries.len() > MAX_SNAPSHOT_BATCH_ENTRIES
         || manifest.source_trace_count < manifest.entries.len() as u64
         || manifest.source_trace_count > MAX_STATS_SHARDS as u64
-        || manifest.selection_policy_id != "active-frontier-singleton-v1"
         || manifest.from_hour != hour_start(manifest.from_hour)
         || manifest.through_hour != hour_start(manifest.through_hour)
         || manifest.from_hour > manifest.through_hour
@@ -13679,6 +14610,7 @@ fn validate_snapshot_batch_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn validate_snapshot_batch_index(
     scope: &Scope,
     source_authorization_sha256: &[u8; 32],
@@ -13732,12 +14664,27 @@ fn validate_teacher_job_claim(
     let definition_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(&claim.definition)?).into();
     validate_snapshot_analysis_budget(&claim.definition.budget)?;
     claim.definition.execution.validate()?;
+    let version_valid = match claim.schema_version.as_str() {
+        "milk.teacher-job-claim.v2" => {
+            claim.definition.schema_version == "milk.teacher-job-definition.v2"
+                && claim.definition.quota_slot.is_none()
+                && claim.quota_slot.is_none()
+        }
+        "milk.teacher-job-claim.v3" => {
+            claim.definition.schema_version == "milk.teacher-job-definition.v3"
+                && claim
+                    .quota_slot
+                    .as_ref()
+                    .is_some_and(valid_quota_slot_binding)
+                && claim.quota_slot == claim.definition.quota_slot
+        }
+        _ => false,
+    };
     if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "milk.teacher-job-claim.v2"
+        || !version_valid
         || claim.scope != *scope
         || claim.teacher_job_id != hex_digest(teacher_job_id)
         || definition_sha256 != *teacher_job_id
-        || claim.definition.schema_version != "milk.teacher-job-definition.v2"
         || !valid_lowercase_sha256(&claim.definition.snapshot_batch_id)
         || !valid_lowercase_sha256(&claim.definition.provider_binding_sha256)
         || !valid_lowercase_sha256(&claim.definition.input_sha256)
@@ -13767,8 +14714,22 @@ fn validate_teacher_job_index(
     let expected_batch_key = teacher_job_batch_index_key(scope, &snapshot_batch_id);
     let expected_frontier_key =
         teacher_job_frontier_key(scope, &provider_binding, index.expires_at, &teacher_job_id);
+    let version_valid = match index.schema_version.as_str() {
+        "milk.teacher-job-index.v2" => {
+            index.claim.schema_version == "milk.teacher-job-claim.v2" && index.quota_slot.is_none()
+        }
+        "milk.teacher-job-index.v3" => {
+            index.claim.schema_version == "milk.teacher-job-claim.v3"
+                && index
+                    .quota_slot
+                    .as_ref()
+                    .is_some_and(valid_quota_slot_binding)
+                && index.quota_slot == index.claim.quota_slot
+        }
+        _ => false,
+    };
     if serde_json::to_vec(index)? != payload
-        || index.schema_version != "milk.teacher-job-index.v2"
+        || !version_valid
         || index.scope != *scope
         || index.snapshot_batch_id != index.claim.definition.snapshot_batch_id
         || index.teacher_job_id != index.claim.teacher_job_id
@@ -13838,13 +14799,34 @@ fn validate_teacher_gpu_run_claim(
 ) -> Result<()> {
     let definition_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(&claim.definition)?).into();
     validate_runtime_image_reference(&claim.definition.runtime_image_reference)?;
-    let admission_valid = match claim.definition.schema_version.as_str() {
-        "milk.teacher-gpu-run-definition.v1" => claim.definition.student_admission_sha256.is_none(),
-        "milk.teacher-gpu-run-definition.v2" => claim
-            .definition
-            .student_admission_sha256
-            .as_deref()
-            .is_some_and(valid_lowercase_sha256),
+    let version_valid = match claim.definition.schema_version.as_str() {
+        "milk.teacher-gpu-run-definition.v1" => {
+            claim.schema_version == "milk.teacher-gpu-run-claim.v1"
+                && claim.definition.student_admission_sha256.is_none()
+                && claim.definition.quota_plan_sha256.is_none()
+        }
+        "milk.teacher-gpu-run-definition.v2" => {
+            claim.schema_version == "milk.teacher-gpu-run-claim.v1"
+                && claim
+                    .definition
+                    .student_admission_sha256
+                    .as_deref()
+                    .is_some_and(valid_lowercase_sha256)
+                && claim.definition.quota_plan_sha256.is_none()
+        }
+        "milk.teacher-gpu-run-definition.v3" => {
+            claim.schema_version == "milk.teacher-gpu-run-claim.v2"
+                && claim
+                    .definition
+                    .student_admission_sha256
+                    .as_deref()
+                    .is_some_and(valid_lowercase_sha256)
+                && claim
+                    .definition
+                    .quota_plan_sha256
+                    .as_deref()
+                    .is_some_and(valid_lowercase_sha256)
+        }
         _ => false,
     };
     let sorted = claim
@@ -13853,11 +14835,10 @@ fn validate_teacher_gpu_run_claim(
         .windows(2)
         .all(|pair| pair[0].teacher_job_id < pair[1].teacher_job_id);
     if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "milk.teacher-gpu-run-claim.v1"
         || claim.scope != *scope
         || claim.teacher_run_id != hex_digest(teacher_run_id)
         || definition_sha256 != *teacher_run_id
-        || !admission_valid
+        || !version_valid
         || !valid_lowercase_sha256(&claim.definition.provider_binding_sha256)
         || claim.definition.slot >= TEACHER_MAX_PARALLEL_RUNS
         || claim.definition.run_nonce.is_nil()
@@ -17250,10 +18231,25 @@ fn validate_stored_teacher_result_metadata(
     teacher_job_id: &[u8; 32],
     artifact: &StoredTeacherResult,
 ) -> Result<()> {
-    if artifact.schema_version != "milk.teacher-result-artifact.v1"
+    let version_valid = match artifact.schema_version.as_str() {
+        "milk.teacher-result-artifact.v1" => {
+            artifact.definition.schema_version == "milk.teacher-job-definition.v2"
+                && artifact.definition.quota_slot.is_none()
+                && artifact.quota_slot.is_none()
+        }
+        "milk.teacher-result-artifact.v2" => {
+            artifact.definition.schema_version == "milk.teacher-job-definition.v3"
+                && artifact
+                    .quota_slot
+                    .as_ref()
+                    .is_some_and(valid_quota_slot_binding)
+                && artifact.quota_slot == artifact.definition.quota_slot
+        }
+        _ => false,
+    };
+    if !version_valid
         || artifact.scope != *scope
         || artifact.teacher_job_id != hex_digest(teacher_job_id)
-        || artifact.definition.schema_version != "milk.teacher-job-definition.v2"
         || Sha256::digest(serde_json::to_vec(&artifact.definition)?).as_slice() != teacher_job_id
         || !valid_lowercase_sha256(&artifact.definition.snapshot_batch_id)
         || !valid_lowercase_sha256(&artifact.definition.provider_binding_sha256)
@@ -17299,7 +18295,13 @@ fn validate_stored_snapshot_analysis(
     if artifact.definition.snapshot_batch_id != hex_digest(snapshot_batch_id) {
         bail!("snapshot analysis artifact is bound to another batch");
     }
-    validate_teacher_result(&artifact.result, sources)
+    validate_teacher_result(&artifact.result, sources)?;
+    if let Some(slot) = artifact.quota_slot.as_ref()
+        && !matches!(sources, [source] if source.partition == slot.partition)
+    {
+        bail!("snapshot analysis result differs from its quota partition");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -17643,6 +18645,7 @@ fn snapshot_local_rejection_key(
     )
 }
 
+#[cfg(test)]
 fn snapshot_trace_frontier_hour(scope: &Scope, prefix: &ObjectPath) -> Result<DateTime<Utc>> {
     let root = format!("{}/", snapshot_trace_frontier_root(scope));
     let value = prefix
@@ -17951,6 +18954,13 @@ fn gpu_launch_intent_prefix(scope: &Scope) -> String {
     format!("{}/frontier/gpu-launch-intent", scope_prefix(scope))
 }
 
+fn gpu_dispatch_not_started_key(scope: &Scope, dispatch_id: &str) -> String {
+    format!(
+        "{}/provider-ledger/v1/dispatches/{dispatch_id}/not-started.json",
+        scope_prefix(scope)
+    )
+}
+
 fn canonical_gpu_launch_intent_parts(
     scope: &Scope,
     claim: &GpuLaunchIntentClaim,
@@ -18153,7 +19163,14 @@ fn teacher_gpu_launch_outbox(
     Ok((
         teacher_gpu_run_launch_outbox_key(scope, &teacher_run_id),
         GpuLaunchOutbox {
-            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
+            schema_version: if claim.definition.schema_version
+                == "milk.teacher-gpu-run-definition.v3"
+            {
+                "milk.gpu-launch-outbox.v2"
+            } else {
+                "milk.gpu-launch-outbox.v1"
+            }
+            .to_owned(),
             scope: scope.clone(),
             dispatch_id: claim_sha256.clone(),
             claim_object_key: teacher_gpu_run_claim_key(scope, &teacher_run_id),
@@ -18164,6 +19181,7 @@ fn teacher_gpu_launch_outbox(
             operation: GpuLaunchOperation::TeacherRun {
                 teacher_run_id: claim.teacher_run_id.clone(),
                 student_admission_sha256: claim.definition.student_admission_sha256.clone(),
+                quota_plan_sha256: claim.definition.quota_plan_sha256.clone(),
                 provider_binding_sha256: claim.definition.provider_binding_sha256.clone(),
                 slot: claim.definition.slot,
                 call_count: claim.definition.calls.len() as u64,
@@ -18273,15 +19291,31 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
         GpuLaunchOperation::TeacherRun {
             teacher_run_id,
             student_admission_sha256,
+            quota_plan_sha256,
             provider_binding_sha256,
             slot,
             call_count,
             max_gpu_seconds,
         } => {
             let teacher_run_id = decode_hex_digest(teacher_run_id)?;
-            student_admission_sha256
-                .as_deref()
-                .is_none_or(valid_lowercase_sha256)
+            let lineage_valid = match outbox.schema_version.as_str() {
+                "milk.gpu-launch-outbox.v1" => {
+                    student_admission_sha256
+                        .as_deref()
+                        .is_none_or(valid_lowercase_sha256)
+                        && quota_plan_sha256.is_none()
+                }
+                "milk.gpu-launch-outbox.v2" => {
+                    student_admission_sha256
+                        .as_deref()
+                        .is_some_and(valid_lowercase_sha256)
+                        && quota_plan_sha256
+                            .as_deref()
+                            .is_some_and(valid_lowercase_sha256)
+                }
+                _ => false,
+            };
+            lineage_valid
                 && valid_lowercase_sha256(provider_binding_sha256)
                 && *slot < TEACHER_MAX_PARALLEL_RUNS
                 && (1..=u64::from(TEACHER_MAX_CALLS)).contains(call_count)
@@ -18295,7 +19329,8 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
             max_gpu_seconds,
         } => {
             let student_job_id = decode_hex_digest(student_job_id)?;
-            student_input_ready(*counts)?
+            outbox.schema_version == "milk.gpu-launch-outbox.v1"
+                && student_input_ready(*counts)?
                 && *max_gpu_seconds == STUDENT_MAX_TRAIN_GPU_SECONDS
                 && outbox.claim_object_key == student_job_claim_key(scope, &student_job_id)
                 && key == student_job_launch_outbox_key(scope, &student_job_id)
@@ -18316,7 +19351,8 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
                             && branch.max_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
                             && valid_lowercase_sha256(&branch.branch_id)
                     });
-            *max_total_gpu_seconds == STUDENT_MAX_TOTAL_GPU_SECONDS
+            outbox.schema_version == "milk.gpu-launch-outbox.v1"
+                && *max_total_gpu_seconds == STUDENT_MAX_TOTAL_GPU_SECONDS
                 && branches_valid
                 && outbox.claim_object_key == student_fanout_claim_key(scope, &student_job_id)
                 && key == student_fanout_launch_outbox_key(scope, &student_job_id)
@@ -18331,7 +19367,8 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
             max_cost_microusd,
         } => {
             let student_job_id = decode_hex_digest(student_job_id)?;
-            valid_lowercase_sha256(student_result_sha256)
+            outbox.schema_version == "milk.gpu-launch-outbox.v1"
+                && valid_lowercase_sha256(student_result_sha256)
                 && valid_lowercase_sha256(provider_binding_sha256)
                 && provider_policy.only == crate::route::WINNER_PROVIDER
                 && (60..=crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS)
@@ -18343,8 +19380,10 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
                 && key == student_winner_deployment_launch_outbox_key(scope, &student_job_id)
         }
     };
-    if outbox.schema_version != "milk.gpu-launch-outbox.v1"
-        || outbox.scope != *scope
+    if !matches!(
+        outbox.schema_version.as_str(),
+        "milk.gpu-launch-outbox.v1" | "milk.gpu-launch-outbox.v2"
+    ) || outbox.scope != *scope
         || dispatch_id != claim_sha256
         || validate_runtime_image_reference(&outbox.runtime_image_reference).is_err()
         || outbox.created_at >= outbox.expires_at
