@@ -720,18 +720,44 @@ def parse_gateway_config(raw):
         or not 1 <= len(traffic_keys) <= 64
     ):
         raise DeployFailure("gateway config is invalid")
+    key_ids = set()
     hashes = set()
+    scope_ids = set()
     for traffic_key in traffic_keys:
+        revocation = traffic_key.get("revocation") if isinstance(traffic_key, dict) else None
         if (
             not isinstance(traffic_key, dict)
-            or set(traffic_key) != {"api_key_sha256", "capture_allowed"}
+            or not {"key_id", "api_key_sha256", "scope_id", "capture_allowed"}.issubset(traffic_key)
+            or not set(traffic_key).issubset({
+                "key_id", "api_key_sha256", "scope_id", "capture_allowed", "revocation",
+            })
+            or UUID.fullmatch(traffic_key["key_id"]) is None
+            or traffic_key["key_id"] == "00000000-0000-0000-0000-000000000000"
             or not isinstance(traffic_key["api_key_sha256"], str)
             or SHA256.fullmatch(traffic_key["api_key_sha256"]) is None
+            or UUID.fullmatch(traffic_key["scope_id"]) is None
+            or traffic_key["scope_id"] == "00000000-0000-0000-0000-000000000000"
             or not isinstance(traffic_key["capture_allowed"], bool)
+            or traffic_key["key_id"] in key_ids
             or traffic_key["api_key_sha256"] in hashes
+            or ("revocation" in traffic_key and (
+                not isinstance(revocation, dict)
+                or "revoked_at" not in revocation
+                or not set(revocation).issubset({"revoked_at", "reason"})
+                or not isinstance(revocation["revoked_at"], str)
+                or RFC3339.fullmatch(revocation["revoked_at"]) is None
+                or ("reason" in revocation and (
+                    not isinstance(revocation["reason"], str)
+                    or not 1 <= len(revocation["reason"].encode()) <= 256
+                ))
+            ))
         ):
             raise DeployFailure("gateway traffic keys are invalid")
+        key_ids.add(traffic_key["key_id"])
         hashes.add(traffic_key["api_key_sha256"])
+        scope_ids.add(traffic_key["scope_id"])
+    if len(scope_ids) != 1:
+        raise DeployFailure("gateway traffic keys must map to one scope")
     return config
 
 
@@ -813,10 +839,10 @@ def validate_smoke_credential(path, gateway_config):
     matches = [
         traffic_key
         for traffic_key in gateway_config["traffic_keys"]
-        if traffic_key == {
-            "api_key_sha256": api_key_sha256,
-            "capture_allowed": False,
-        }
+        if traffic_key["key_id"] == key_id
+        and traffic_key["api_key_sha256"] == api_key_sha256
+        and traffic_key["capture_allowed"] is False
+        and "revocation" not in traffic_key
     ]
     if len(matches) != 1:
         raise DeployFailure("gateway smoke credential is not an exact non-capturable traffic key")

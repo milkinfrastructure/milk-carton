@@ -29,10 +29,10 @@ use super::{
     CANDIDATE_API_KEY_SHA256_HEADER, CANDIDATE_CREDENTIAL_PATH, CANDIDATE_CREDENTIAL_STATE_HEADER,
     CONFIG_SHA256_HEADER, CaptureMode, Command, FileConfig, Gateway, ObjectStoreConfig,
     OpenAiCompatibleEndpoint, OutcomeKind, StoreAccessPlan, StoresConfig, TeacherConfig,
-    TraceRecorder, TrafficKeyConfig, authenticate_traffic_key, build_route_runtime, build_server,
-    candidate_health_failure, capture_sample_selected, config_scope, configured_traffic_keys,
-    decode_lowercase_sha256, generation_status_once, is_json_content_type,
-    parse_openai_compatible_api_base_url, parse_openai_compatible_endpoint,
+    TraceRecorder, TrafficKeyConfig, TrafficKeyRevocationConfig, authenticate_traffic_key,
+    build_route_runtime, build_server, candidate_health_failure, capture_sample_selected,
+    config_scope, configured_traffic_keys, decode_lowercase_sha256, generation_status_once,
+    is_json_content_type, parse_openai_compatible_api_base_url, parse_openai_compatible_endpoint,
     records_sampling_key_version, sampling_identity, start_records, start_records_with_timeout,
     status_once, tick_once_with_records, validate_config_for_command, validate_config_identity,
     validate_teacher_config,
@@ -50,6 +50,23 @@ const SMOKE_KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000003_test-smo
 const SESSION_ID: &str = "production-test-session";
 const OUTCOME_KEY: &str = "milk_live_018f3f54-7a5b-7cc0-8000-000000000002_test-outcome-secret-0002";
 const CANDIDATE_KEY: &str = "candidate-test-secret";
+
+fn traffic_key(raw: &str, scope_id: Uuid, capture_allowed: bool) -> TrafficKeyConfig {
+    let key_id = raw
+        .strip_prefix("milk_live_")
+        .and_then(|value| value.split_once('_'))
+        .map(|(key_id, _)| key_id)
+        .unwrap()
+        .parse()
+        .unwrap();
+    TrafficKeyConfig {
+        key_id,
+        api_key_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+        scope_id,
+        capture_allowed,
+        revocation: None,
+    }
+}
 
 fn local_stores(root: &Path) -> StoresConfig {
     let create = |name: &str| {
@@ -101,15 +118,10 @@ fn candidate_fuse_status_contract_covers_every_server_error() {
 
 #[test]
 fn traffic_authentication_returns_only_capture_authority() {
+    let scope_id = Uuid::new_v4();
     let configured = configured_traffic_keys(&[
-        TrafficKeyConfig {
-            api_key_sha256: format!("{:x}", Sha256::digest(KEY.as_bytes())),
-            capture_allowed: true,
-        },
-        TrafficKeyConfig {
-            api_key_sha256: format!("{:x}", Sha256::digest(SMOKE_KEY.as_bytes())),
-            capture_allowed: false,
-        },
+        traffic_key(KEY, scope_id, true),
+        traffic_key(SMOKE_KEY, scope_id, false),
     ])
     .unwrap();
     let mut headers = actix_web::http::header::HeaderMap::new();
@@ -122,6 +134,8 @@ fn traffic_authentication_returns_only_capture_authority() {
         actix_web::http::header::HeaderValue::from_static("caller-choice"),
     );
     let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
+    assert_eq!(authenticated.key_id.to_string(), &KEY[10..46]);
+    assert_eq!(authenticated.scope.scope_id, scope_id);
     assert!(authenticated.capture_allowed);
     headers.insert(
         actix_web::http::header::AUTHORIZATION,
@@ -129,15 +143,35 @@ fn traffic_authentication_returns_only_capture_authority() {
     );
     let authenticated = authenticate_traffic_key(&headers, &configured).unwrap();
     assert!(!authenticated.capture_allowed);
+
+    let mut wrong_id = traffic_key(KEY, scope_id, true);
+    wrong_id.key_id = configured[1].key_id;
+    headers.insert(
+        actix_web::http::header::AUTHORIZATION,
+        actix_web::http::header::HeaderValue::from_str(&format!("Bearer {KEY}")).unwrap(),
+    );
+    assert!(
+        authenticate_traffic_key(&headers, &configured_traffic_keys(&[wrong_id]).unwrap())
+            .is_none()
+    );
+
+    let mut revoked = traffic_key(KEY, scope_id, true);
+    revoked.revocation = Some(TrafficKeyRevocationConfig {
+        revoked_at: "2026-08-31T00:00:00Z".parse().unwrap(),
+        reason: Some("rotated".to_owned()),
+    });
+    assert!(
+        authenticate_traffic_key(&headers, &configured_traffic_keys(&[revoked]).unwrap()).is_none()
+    );
 }
 
 #[test]
 fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
     let mut invalid = config(1_024, 1);
-    invalid.scope_id = Uuid::nil();
+    invalid.traffic_keys[0].scope_id = Uuid::nil();
     assert!(validate_config_identity(&invalid).is_err());
     let mut duplicate_scope = config(1_024, 1);
-    duplicate_scope.scope_id = duplicate_scope.outcome_key_id;
+    duplicate_scope.traffic_keys[0].scope_id = duplicate_scope.outcome_key_id;
     assert!(validate_config_identity(&duplicate_scope).is_err());
     let mut duplicate_key = config(1_024, 1);
     duplicate_key
@@ -147,11 +181,20 @@ fn identities_fail_closed_and_sampling_uses_the_full_u64_threshold() {
     let mut no_traffic_key = config(1_024, 1);
     no_traffic_key.traffic_keys.clear();
     assert!(validate_config_identity(&no_traffic_key).is_err());
+    let mut mixed_scope = config(1_024, 1);
+    mixed_scope
+        .traffic_keys
+        .push(traffic_key(SMOKE_KEY, Uuid::new_v4(), false));
+    assert!(validate_config_identity(&mixed_scope).is_err());
     let mut too_many_keys = config(1_024, 1);
+    let scope_id = config_scope(&too_many_keys).scope_id;
     too_many_keys.traffic_keys = (0..=super::MAX_TRAFFIC_KEYS)
         .map(|index| TrafficKeyConfig {
+            key_id: Uuid::from_u128(index as u128 + 1),
             api_key_sha256: format!("{index:064x}"),
+            scope_id,
             capture_allowed: true,
+            revocation: None,
         })
         .collect();
     assert!(validate_config_identity(&too_many_keys).is_err());
@@ -175,6 +218,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
     let previous_only = br#"{"model":"test","previous_response_id":"resp_previous"}"#;
     let previous = sampling_identity(
         &gateway,
+        &gateway.scope,
         RouteEndpoint::Responses,
         &empty,
         previous_only,
@@ -192,6 +236,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
     );
     let header_root_a = sampling_identity(
         &gateway,
+        &gateway.scope,
         RouteEndpoint::Responses,
         &session_headers,
         previous_only,
@@ -199,6 +244,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
     );
     let header_root_b = sampling_identity(
         &gateway,
+        &gateway.scope,
         RouteEndpoint::Responses,
         &session_headers,
         previous_only,
@@ -214,6 +260,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
 
     let conversation = sampling_identity(
         &gateway,
+        &gateway.scope,
         RouteEndpoint::Responses,
         &empty,
         br#"{"model":"test","conversation":"conv_root","previous_response_id":"resp_previous"}"#,
@@ -225,6 +272,7 @@ fn responses_sampling_uses_provable_roots_and_rejects_previous_only_capture() {
 
     let standalone = sampling_identity(
         &gateway,
+        &gateway.scope,
         RouteEndpoint::Responses,
         &empty,
         br#"{"model":"test","input":"standalone"}"#,
@@ -393,7 +441,7 @@ async fn keyless_tick_holds_without_reading_the_teacher_key() {
 #[actix_web::test]
 async fn non_production_mechanics_tick_rejects_before_any_object_write() {
     let mut config = config(1_024, 1);
-    config.scope_id = "f7f88ff0-5947-440c-a661-e4e35f1d04e0".parse().unwrap();
+    config.traffic_keys[0].scope_id = "f7f88ff0-5947-440c-a661-e4e35f1d04e0".parse().unwrap();
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let records = Records::start(
         Arc::clone(&objects),
@@ -612,7 +660,7 @@ async fn status_contract_is_data_plane_only_and_does_not_require_teacher() {
     let status: StatusContract = serde_json::from_str(&raw).unwrap();
     assert_eq!(status.schema_version, "milk.status.v3");
     assert_eq!(status.records.schema_version, "milk.status-data-plane.v1");
-    assert_eq!(status.records.scope.scope_id, config.scope_id);
+    assert_eq!(status.records.scope, config_scope(&config));
     assert!(status.records.capture.from_hour <= status.records.capture.through_hour);
     assert_eq!(status.records.capture.shards, 0);
     assert_eq!(status.records.capture.failed_shards, 0);
@@ -654,7 +702,7 @@ async fn generation_status_is_content_free_and_scope_bound() {
         .unwrap();
     let status: GenerationStatusContract = serde_json::from_str(&raw).unwrap();
     assert_eq!(status.schema_version, "milk.generation-status.v1");
-    assert_eq!(status.scope_id, config.scope_id);
+    assert_eq!(status.scope_id, config_scope(&config).scope_id);
     assert_eq!(status.max_decisions, 7);
     assert_eq!(status.claimed_decisions, 0);
     assert_eq!(status.remaining_decisions, 7);
@@ -786,15 +834,12 @@ struct StatsValuesProbe {
 }
 
 fn config(max_request_bytes: usize, max_in_flight: usize) -> FileConfig {
+    let scope_id = Uuid::new_v4();
     FileConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        traffic_keys: vec![TrafficKeyConfig {
-            api_key_sha256: format!("{:x}", Sha256::digest(KEY.as_bytes())),
-            capture_allowed: true,
-        }],
+        traffic_keys: vec![traffic_key(KEY, scope_id, true)],
         outcome_key_id: Uuid::parse_str(OUTCOME_KEY_ID).unwrap(),
         outcome_key_sha256: format!("{:x}", Sha256::digest(OUTCOME_KEY.as_bytes())),
-        scope_id: Uuid::new_v4(),
         max_request_bytes,
         max_in_flight,
         max_outcomes_in_flight: 2,
@@ -882,7 +927,7 @@ async fn disabled_capture_still_emits_content_free_statistics() {
     let gateway_config = config(4_096, 2);
     assert_eq!(gateway_config.capture_mode, CaptureMode::Disabled);
     let scope = Scope {
-        scope_id: gateway_config.scope_id,
+        scope_id: config_scope(&gateway_config).scope_id,
     };
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let records = Records::start(
@@ -1700,13 +1745,11 @@ async fn capture_intent_and_immediate_outcome_are_operationally_honest() {
     gateway_config.capture_basis_points = 10_000;
     gateway_config.capture_policy_version = "test-authorized-v1".to_owned();
     gateway_config.capture_rights_state = "authorized".to_owned();
-    gateway_config.traffic_keys.push(TrafficKeyConfig {
-        api_key_sha256: format!("{:x}", Sha256::digest(SMOKE_KEY.as_bytes())),
-        capture_allowed: false,
-    });
-    let scope = Scope {
-        scope_id: gateway_config.scope_id,
-    };
+    let scope_id = config_scope(&gateway_config).scope_id;
+    gateway_config
+        .traffic_keys
+        .push(traffic_key(SMOKE_KEY, scope_id, false));
+    let scope = Scope { scope_id };
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let object_probe = Arc::clone(&objects);
     let records = Records::start(

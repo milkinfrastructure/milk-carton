@@ -65,7 +65,7 @@ main() {
 
   created=0
   trap - EXIT
-  printf '{"api_key_sha256":"%s"}\n' "$sha256"
+  printf '{"key_id":"%s","api_key_sha256":"%s"}\n' "$key_id" "$sha256"
 }
 
 main "$@"

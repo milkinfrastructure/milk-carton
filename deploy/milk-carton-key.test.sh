@@ -23,11 +23,13 @@ readonly UUIDGEN=/usr/bin/uuidgen
 
 mkdir -m 0700 "$TEST_DIR/private"
 metadata=$("$RUNNER" "$OPENSSL" "$UUIDGEN" "$TEST_DIR/private/traffic.token")
-readonly METADATA_RE='^\{"api_key_sha256":"([0-9a-f]{64})"\}$'
+readonly METADATA_RE='^\{"key_id":"([0-9a-f-]{36})","api_key_sha256":"([0-9a-f]{64})"\}$'
 [[ $metadata =~ $METADATA_RE ]] || fail "metadata output changed"
-expected_sha=${BASH_REMATCH[1]}
+expected_id=${BASH_REMATCH[1]}
+expected_sha=${BASH_REMATCH[2]}
 token=$(<"$TEST_DIR/private/traffic.token")
 [[ $token =~ ^milk_live_[0-9a-f-]{36}_[0-9a-f]{64}$ ]] || fail "token format is invalid"
+[[ ${token:10:36} == "$expected_id" ]] || fail "metadata key ID differs from token"
 [[ $metadata != *"$token"* ]] || fail "raw token leaked to stdout"
 actual_sha=$(printf '%s' "$token" | "$OPENSSL" dgst -sha256 -r)
 actual_sha=${actual_sha%% *}

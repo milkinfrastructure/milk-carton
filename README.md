@@ -43,10 +43,10 @@ Hosted customers do not manage this configuration. Self-hosters supply one stric
 The important settings are:
 
 - the upstream OpenAI-compatible URL and model;
-- accepted request-key hashes and capture authority;
-- `capture_allowed` for each request key;
+- request-key records containing the key UUID, exact key hash, stable scope UUID, and capture authority;
+- optional `revocation` metadata, whose presence disables that key without moving its scope history;
 - capture, control, and route object-store roles, which may share one physical bucket;
-- one operator-assigned `scope_id`, its `milk/v1/scopes/<scope_id>/` object namespace, and its hard decision/call limits;
+- one operator-assigned scope shared by the deployment's request keys, its `milk/v1/scopes/<scope_id>/` object namespace, and its hard decision/call limits;
 - immutable teacher, student, and image identities.
 
 Secrets stay in environment variables:

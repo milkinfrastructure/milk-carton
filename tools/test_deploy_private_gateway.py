@@ -39,11 +39,15 @@ SMOKE_GATEWAY_CONFIG = json.loads(
     (ROOT / "deploy/milk-carton-config.example.json").read_text()
 )
 SMOKE_GATEWAY_CONFIG["traffic_keys"] = [{
+    "key_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     "api_key_sha256": sha256(SMOKE_API_KEY.encode()),
+    "scope_id": "00000000-0000-4000-8000-000000000010",
     "capture_allowed": False,
 }]
-PREVIOUS_GATEWAY_CONFIG = dict(SMOKE_GATEWAY_CONFIG)
-PREVIOUS_GATEWAY_CONFIG["scope_id"] = "00000000-0000-4000-8000-000000000011"
+PREVIOUS_GATEWAY_CONFIG = json.loads(json.dumps(SMOKE_GATEWAY_CONFIG))
+PREVIOUS_GATEWAY_CONFIG["traffic_keys"][0]["scope_id"] = (
+    "00000000-0000-4000-8000-000000000011"
+)
 BOOTSTRAP_SECRETS = {
     "MILK_CARTON_CONFIG_JSON": canonical(SMOKE_GATEWAY_CONFIG).decode(),
     "MILK_CARTON_CONTAINER_ADMIN_KEY": "bootstrap-container-admin-private",

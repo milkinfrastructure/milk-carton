@@ -230,7 +230,6 @@ struct FileConfig {
     traffic_keys: Vec<TrafficKeyConfig>,
     outcome_key_id: Uuid,
     outcome_key_sha256: String,
-    scope_id: Uuid,
     max_request_bytes: usize,
     max_in_flight: usize,
     max_outcomes_in_flight: usize,
@@ -261,8 +260,18 @@ struct FileConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrafficKeyConfig {
+    key_id: Uuid,
     api_key_sha256: String,
+    scope_id: Uuid,
     capture_allowed: bool,
+    revocation: Option<TrafficKeyRevocationConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficKeyRevocationConfig {
+    revoked_at: DateTime<Utc>,
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -453,8 +462,11 @@ struct Gateway {
 
 #[derive(Clone)]
 struct TrafficKey {
+    key_id: Uuid,
     api_key_sha256: [u8; 32],
+    scope: Scope,
     capture_allowed: bool,
+    revoked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -1804,8 +1816,8 @@ async fn tick_once_with_records(
     now: DateTime<Utc>,
     records: Records,
 ) -> Result<String> {
-    reject_non_production_mechanics_scope(config.scope_id)?;
     let scope = config_scope(config);
+    reject_non_production_mechanics_scope(scope.scope_id)?;
     let lease = tokio::time::timeout(
         TICK_LEASE_IO_TIMEOUT,
         records.acquire_tick_lease(&scope, now),
@@ -1945,7 +1957,7 @@ async fn generation_status_once(config: &FileConfig, now: DateTime<Utc>) -> Resu
     let generation = status.generation;
     Ok(serde_json::to_string(&GenerationStatusWrite {
         schema_version: "milk.generation-status.v1",
-        scope_id: config.scope_id,
+        scope_id: config_scope(config).scope_id,
         max_decisions: generation.max_decisions,
         claimed_decisions: generation.claimed_decisions,
         remaining_decisions: generation.remaining_decisions,
@@ -2068,13 +2080,13 @@ fn command_uses_deployment_config(command: Option<&Command>) -> bool {
 
 fn config_scope(config: &FileConfig) -> Scope {
     Scope {
-        scope_id: config.scope_id,
+        scope_id: config.traffic_keys[0].scope_id,
     }
 }
 
 fn config_route_scope(config: &FileConfig) -> RouteScope {
     RouteScope {
-        scope_id: config.scope_id,
+        scope_id: config.traffic_keys[0].scope_id,
     }
 }
 
@@ -2302,14 +2314,21 @@ fn validate_serve_config_owner(config: &FileConfig, owner: InputOwner) -> Result
 }
 
 fn validate_config_identity(config: &FileConfig) -> Result<()> {
-    let identities = [config.outcome_key_id, config.scope_id];
+    let traffic_keys = configured_traffic_keys(&config.traffic_keys)?;
+    let scope_id = traffic_keys[0].scope.scope_id;
+    let identities = [config.outcome_key_id, scope_id];
     if identities.iter().any(Uuid::is_nil) {
         bail!("outcome key ID and scope_id must be non-nil");
     }
     if identities.into_iter().collect::<HashSet<_>>().len() != identities.len() {
         bail!("outcome key ID and scope_id must differ");
     }
-    configured_traffic_keys(&config.traffic_keys)?;
+    if traffic_keys
+        .iter()
+        .any(|key| key.key_id == config.outcome_key_id)
+    {
+        bail!("traffic key IDs and outcome key ID must differ");
+    }
     if let Some(route) = &config.route {
         route.validate_common(config.max_in_flight)?;
     }
@@ -3458,7 +3477,14 @@ async fn proxy_openai(
         .ok()
         .and_then(|analytics| analytics.stream)
         .unwrap_or(false);
-    let sampling = sampling_identity(&gateway, endpoint, request.headers(), &body, trace_id);
+    let sampling = sampling_identity(
+        &gateway,
+        &traffic_key.scope,
+        endpoint,
+        request.headers(),
+        &body,
+        trace_id,
+    );
     let route_runtime = gateway.route_runtime();
     let decision = route_runtime.policy.decide(
         &RouteRequest {
@@ -3522,7 +3548,7 @@ async fn proxy_openai(
                 && capture_selected(&sampling.hmac_sha256, gateway.capture.basis_points);
             let request_capture = selected.then(|| body.clone());
             let catalog = TraceCatalog {
-                scope: gateway.scope.clone(),
+                scope: traffic_key.scope.clone(),
                 trace_id,
                 occurred_at,
                 endpoint: endpoint_name(endpoint).to_owned(),
@@ -3898,6 +3924,7 @@ fn endpoint_name(endpoint: RouteEndpoint) -> &'static str {
 
 fn sampling_identity(
     gateway: &Gateway,
+    scope: &Scope,
     endpoint: RouteEndpoint,
     headers: &HeaderMap,
     body: &[u8],
@@ -3911,14 +3938,7 @@ fn sampling_identity(
     let previous_response_hmac_sha256 = previous_response_id
         .as_deref()
         .filter(|value| valid_sampling_identifier(value.as_bytes()))
-        .map(|value| {
-            sampling_hmac(
-                key,
-                &gateway.scope,
-                b"responses_previous_response",
-                value.as_bytes(),
-            )
-        });
+        .map(|value| sampling_hmac(key, scope, b"responses_previous_response", value.as_bytes()));
 
     let (session_id, multiple_session_ids) = one_header(headers, SESSION_ID_HEADER);
     let session_id = (!multiple_session_ids)
@@ -3967,17 +3987,12 @@ fn sampling_identity(
         Some((kind, independence, identifier)) => (
             kind,
             independence,
-            sampling_hmac(
-                key,
-                &gateway.scope,
-                sampling_kind_domain(kind),
-                identifier.as_ref(),
-            ),
+            sampling_hmac(key, scope, sampling_kind_domain(kind), identifier.as_ref()),
         ),
         None => (
             SamplingUnitKind::Request,
             SamplingIndependence::Uncertain,
-            sampling_hmac(key, &gateway.scope, b"request", request_id.as_bytes()),
+            sampling_hmac(key, scope, b"request", request_id.as_bytes()),
         ),
     };
     SamplingIdentity {
@@ -4138,47 +4153,86 @@ fn authenticate_traffic_key<'a>(
 ) -> Option<&'a TrafficKey> {
     let mut values = headers.get_all(header::AUTHORIZATION);
     let raw = values.next()?.to_str().ok()?.strip_prefix("Bearer ")?;
-    if values.next().is_some() || !valid_traffic_key(raw) {
+    let Some(key_id) = traffic_key_id(raw) else {
+        return None;
+    };
+    if values.next().is_some() {
         return None;
     }
     let actual: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
     let mut authenticated = None;
     for key in configured {
-        if key.api_key_sha256.ct_eq(&actual).unwrap_u8() == 1 {
+        let digest_matches = key.api_key_sha256.ct_eq(&actual).unwrap_u8() == 1;
+        if key.revoked_at.is_none() && key.key_id == key_id && digest_matches {
             authenticated = Some(key);
         }
     }
     authenticated
 }
 
-fn valid_traffic_key(raw: &str) -> bool {
+fn traffic_key_id(raw: &str) -> Option<Uuid> {
     let Some(value) = raw.strip_prefix("milk_live_") else {
-        return false;
+        return None;
     };
     let Some((key_id, secret)) = value.split_once('_') else {
-        return false;
+        return None;
     };
-    Uuid::parse_str(key_id).is_ok_and(|value| !value.is_nil())
-        && (16..=256).contains(&secret.len())
+    let key_id = Uuid::parse_str(key_id)
+        .ok()
+        .filter(|value| !value.is_nil())?;
+    ((16..=256).contains(&secret.len())
         && secret
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')))
+    .then_some(key_id)
 }
 
 fn configured_traffic_keys(values: &[TrafficKeyConfig]) -> Result<Vec<TrafficKey>> {
     if values.is_empty() || values.len() > MAX_TRAFFIC_KEYS {
         bail!("traffic_keys must contain 1..={MAX_TRAFFIC_KEYS} entries");
     }
+    let mut key_ids = HashSet::with_capacity(values.len());
     let mut hashes = HashSet::with_capacity(values.len());
+    let mut scope_id = None;
     let mut configured = Vec::with_capacity(values.len());
     for value in values {
+        if value.key_id.is_nil() || value.scope_id.is_nil() {
+            bail!("traffic key IDs and scope IDs must be non-nil UUIDs");
+        }
+        if !key_ids.insert(value.key_id) {
+            bail!("traffic_keys contains a duplicate key_id");
+        }
         let sha256 = decode_lowercase_sha256(&value.api_key_sha256)?;
         if !hashes.insert(sha256) {
             bail!("traffic_keys contains a duplicate API-key SHA-256");
         }
+        match scope_id {
+            Some(scope_id) if scope_id != value.scope_id => {
+                bail!("traffic_keys must map to one scope_id per gateway configuration")
+            }
+            None => scope_id = Some(value.scope_id),
+            Some(_) => {}
+        }
+        if let Some(revocation) = &value.revocation {
+            if revocation
+                .reason
+                .as_ref()
+                .is_some_and(|reason| reason.is_empty() || reason.len() > 256)
+            {
+                bail!("traffic key revocation reason must contain 1..=256 bytes");
+            }
+        }
         configured.push(TrafficKey {
+            key_id: value.key_id,
             api_key_sha256: sha256,
+            scope: Scope {
+                scope_id: value.scope_id,
+            },
             capture_allowed: value.capture_allowed,
+            revoked_at: value
+                .revocation
+                .as_ref()
+                .map(|revocation| revocation.revoked_at),
         });
     }
     Ok(configured)
