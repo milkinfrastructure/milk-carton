@@ -1963,6 +1963,8 @@ struct TeacherGpuRunCallRef {
 #[serde(deny_unknown_fields)]
 struct TeacherGpuRunDefinition {
     schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    student_admission_sha256: Option<String>,
     provider_binding_sha256: String,
     slot: u8,
     run_nonce: Uuid,
@@ -2670,6 +2672,8 @@ impl StudentWinnerDeploymentResult {
 enum GpuLaunchOperation {
     TeacherRun {
         teacher_run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        student_admission_sha256: Option<String>,
         provider_binding_sha256: String,
         slot: u8,
         call_count: u64,
@@ -5621,7 +5625,14 @@ impl RecordStore {
                     }
                 }
             }
-            GpuLaunchIntentClaim::TeacherRun { .. } => {}
+            GpuLaunchIntentClaim::TeacherRun { claim } => {
+                self.verify_teacher_gpu_run_admission(
+                    scope,
+                    claim,
+                    intent.record.state == GpuLaunchIntentState::Pending,
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -6499,6 +6510,8 @@ impl RecordStore {
             .await?;
         let claim: TeacherGpuRunClaim = serde_json::from_slice(&payload)?;
         validate_teacher_gpu_run_claim(scope, teacher_run_id, &claim, &payload)?;
+        self.verify_teacher_gpu_run_admission(scope, &claim, false)
+            .await?;
         Ok((claim, payload))
     }
 
@@ -6685,6 +6698,8 @@ impl RecordStore {
             let payload = self.load_bytes(&key, self.max_artifact_bytes).await?;
             let index: TeacherGpuRunIndex = serde_json::from_slice(&payload)?;
             validate_teacher_gpu_run_index(scope, &key, &index, &payload)?;
+            self.verify_teacher_gpu_run_admission(scope, &index.claim, false)
+                .await?;
             indexes.push(index);
         }
         indexes.sort_by(|left, right| left.teacher_run_id.cmp(&right.teacher_run_id));
@@ -7461,6 +7476,9 @@ impl RecordStore {
         {
             return Ok(TeacherGpuTickWrite::Hold);
         }
+        let Some(admission) = self.load_current_student_admission(scope).await? else {
+            return Ok(TeacherGpuTickWrite::Hold);
+        };
         let mut claimed_decisions = self.teacher_decision_count(scope).await?;
         let active = self
             .load_active_teacher_jobs(scope, &provider_binding_sha256, now)
@@ -7484,6 +7502,9 @@ impl RecordStore {
                     "unassigned teacher GPU call claim",
                 )
                 .is_err()
+                    || !self
+                        .teacher_job_is_admitted(scope, &job.claim, &admission)
+                        .await?
                 {
                     continue;
                 }
@@ -7491,12 +7512,9 @@ impl RecordStore {
                 break;
             }
         }
-        let (seed, admission_sha256) = match seed {
-            Some(claim) => (claim, None),
+        let seed = match seed {
+            Some(claim) => claim,
             None => {
-                let Some(admission) = self.load_current_student_admission(scope).await? else {
-                    return Ok(TeacherGpuTickWrite::Hold);
-                };
                 match self
                     .prepare_next_teacher_gpu_claim(
                         scope,
@@ -7519,7 +7537,13 @@ impl RecordStore {
                                 .checked_add(1)
                                 .context("teacher decision count overflow")?;
                         }
-                        (*claim, Some(admission.sha256))
+                        if !self
+                            .teacher_job_is_admitted(scope, &claim, &admission)
+                            .await?
+                        {
+                            return Ok(TeacherGpuTickWrite::Hold);
+                        }
+                        *claim
                     }
                     TeacherGpuClaimPreparation::Advanced(write) => {
                         return Ok(TeacherGpuTickWrite::Advanced(write));
@@ -7558,7 +7582,14 @@ impl RecordStore {
 
         let mut calls = Vec::new();
         if let Some(reference) = self
-            .assign_teacher_gpu_call(scope, &acquired.slot, &acquired.payload, &seed, now)
+            .assign_teacher_gpu_call(
+                scope,
+                &acquired.slot,
+                &acquired.payload,
+                &seed,
+                &admission,
+                now,
+            )
             .await?
         {
             calls.push(reference);
@@ -7580,7 +7611,14 @@ impl RecordStore {
                 continue;
             }
             if let Some(reference) = self
-                .assign_teacher_gpu_call(scope, &acquired.slot, &acquired.payload, &job.claim, now)
+                .assign_teacher_gpu_call(
+                    scope,
+                    &acquired.slot,
+                    &acquired.payload,
+                    &job.claim,
+                    &admission,
+                    now,
+                )
                 .await?
             {
                 calls.push(reference);
@@ -7588,7 +7626,7 @@ impl RecordStore {
         }
 
         let mut advanced = None;
-        while admission_sha256.is_some() && calls.len() < usize::from(max_calls) {
+        while calls.len() < usize::from(max_calls) {
             let claim = match self
                 .prepare_next_teacher_gpu_claim(
                     scope,
@@ -7598,7 +7636,7 @@ impl RecordStore {
                     max_gpu_seconds,
                     claimed_decisions,
                     now,
-                    admission_sha256.as_deref(),
+                    Some(&admission.sha256),
                 )
                 .await?
             {
@@ -7620,7 +7658,14 @@ impl RecordStore {
                 TeacherGpuClaimPreparation::None => break,
             };
             if let Some(reference) = self
-                .assign_teacher_gpu_call(scope, &acquired.slot, &acquired.payload, &claim, now)
+                .assign_teacher_gpu_call(
+                    scope,
+                    &acquired.slot,
+                    &acquired.payload,
+                    &claim,
+                    &admission,
+                    now,
+                )
                 .await?
             {
                 calls.push(reference);
@@ -7652,7 +7697,8 @@ impl RecordStore {
         }
         ensure_teacher_runway(now, max_gpu_seconds, expires_at, "teacher GPU run claim")?;
         let definition = TeacherGpuRunDefinition {
-            schema_version: "milk.teacher-gpu-run-definition.v1".to_owned(),
+            schema_version: "milk.teacher-gpu-run-definition.v2".to_owned(),
+            student_admission_sha256: Some(admission.sha256.clone()),
             provider_binding_sha256: hex_digest(&provider_binding_sha256),
             slot: acquired.slot.slot,
             run_nonce: acquired.slot.run_nonce,
@@ -7678,6 +7724,8 @@ impl RecordStore {
             expires_at,
             claim,
         };
+        self.verify_teacher_gpu_run_admission(scope, &index.claim, true)
+            .await?;
         self.put_create_same(&encode_json(
             teacher_gpu_run_frontier_key(
                 scope,
@@ -7698,6 +7746,7 @@ impl RecordStore {
         slot: &TeacherGpuSlot,
         slot_payload: &Bytes,
         claim: &TeacherJobClaim,
+        admission: &VerifiedStudentAdmission,
         assigned_at: DateTime<Utc>,
     ) -> Result<Option<TeacherGpuRunCallRef>> {
         let teacher_job_id = decode_hex_digest(&claim.teacher_job_id)?;
@@ -7716,6 +7765,9 @@ impl RecordStore {
                 })
             || assigned_at < stored_claim.claimed_at
             || assigned_at >= stored_claim.definition.expires_at.min(slot.expires_at)
+            || !self
+                .teacher_job_is_admitted(scope, &stored_claim, admission)
+                .await?
         {
             return Ok(None);
         }
@@ -7801,6 +7853,8 @@ impl RecordStore {
             index.expires_at,
             "teacher GPU run launch",
         )?;
+        self.verify_teacher_gpu_run_admission(scope, &index.claim, true)
+            .await?;
         let teacher_run_id = decode_hex_digest(&index.teacher_run_id)?;
         let claim_object = encode_json(
             teacher_gpu_run_claim_key(scope, &teacher_run_id),
@@ -7996,6 +8050,11 @@ impl RecordStore {
         }
         let (claim, claim_payload, _) = self
             .verify_teacher_gpu_run_authority(scope, teacher_run_id, &config)
+            .await?;
+        if claim.definition.schema_version != "milk.teacher-gpu-run-definition.v2" {
+            bail!("legacy teacher GPU run claims are read-only");
+        }
+        self.verify_teacher_gpu_run_admission(scope, &claim, true)
             .await?;
         if self
             .load_teacher_gpu_run_result(scope, teacher_run_id)
@@ -11539,6 +11598,67 @@ impl RecordStore {
         Ok(Some(verified))
     }
 
+    async fn teacher_job_is_admitted(
+        &self,
+        scope: &Scope,
+        claim: &TeacherJobClaim,
+        admission: &VerifiedStudentAdmission,
+    ) -> Result<bool> {
+        let snapshot_batch_id = decode_hex_digest(&claim.definition.snapshot_batch_id)?;
+        let manifest = self
+            .load_verified_snapshot_batch(scope, &snapshot_batch_id, claim.claimed_at)
+            .await?;
+        Ok(manifest.entries.iter().all(|entry| {
+            !admission
+                .admission
+                .held_out_trace_sha256s
+                .contains(&entry.trace_payload_sha256)
+        }))
+    }
+
+    async fn verify_teacher_gpu_run_admission(
+        &self,
+        scope: &Scope,
+        claim: &TeacherGpuRunClaim,
+        require_current: bool,
+    ) -> Result<()> {
+        let Some(admission_sha256) = claim.definition.student_admission_sha256.as_deref() else {
+            return Ok(());
+        };
+        let admission = if require_current {
+            let current = self
+                .load_current_student_admission(scope)
+                .await?
+                .context("teacher GPU run student admission is no longer current")?;
+            if current.sha256 != admission_sha256 {
+                bail!("teacher GPU run student admission is no longer current");
+            }
+            current
+        } else {
+            self.load_student_admission_version(scope, admission_sha256)
+                .await?
+        };
+        for reference in &claim.definition.calls {
+            let teacher_job_id = decode_hex_digest(&reference.teacher_job_id)?;
+            let payload = self
+                .load_bytes(
+                    &teacher_job_claim_key(scope, &teacher_job_id),
+                    self.max_trace_bytes,
+                )
+                .await?;
+            let call_claim: TeacherJobClaim = serde_json::from_slice(&payload)?;
+            validate_teacher_job_claim(scope, &teacher_job_id, &call_claim, &payload)?;
+            if reference.claim_sha256 != hex_digest(&Sha256::digest(&payload).into())
+                || !self
+                    .teacher_job_is_admitted(scope, &call_claim, &admission)
+                    .await?
+            {
+                bail!("teacher GPU run includes a held-out or non-canonical teacher claim");
+            }
+        }
+        Ok(())
+    }
+
     async fn verify_current_student_admission_lineage(
         &self,
         scope: &Scope,
@@ -13718,6 +13838,15 @@ fn validate_teacher_gpu_run_claim(
 ) -> Result<()> {
     let definition_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(&claim.definition)?).into();
     validate_runtime_image_reference(&claim.definition.runtime_image_reference)?;
+    let admission_valid = match claim.definition.schema_version.as_str() {
+        "milk.teacher-gpu-run-definition.v1" => claim.definition.student_admission_sha256.is_none(),
+        "milk.teacher-gpu-run-definition.v2" => claim
+            .definition
+            .student_admission_sha256
+            .as_deref()
+            .is_some_and(valid_lowercase_sha256),
+        _ => false,
+    };
     let sorted = claim
         .definition
         .calls
@@ -13728,7 +13857,7 @@ fn validate_teacher_gpu_run_claim(
         || claim.scope != *scope
         || claim.teacher_run_id != hex_digest(teacher_run_id)
         || definition_sha256 != *teacher_run_id
-        || claim.definition.schema_version != "milk.teacher-gpu-run-definition.v1"
+        || !admission_valid
         || !valid_lowercase_sha256(&claim.definition.provider_binding_sha256)
         || claim.definition.slot >= TEACHER_MAX_PARALLEL_RUNS
         || claim.definition.run_nonce.is_nil()
@@ -18034,6 +18163,7 @@ fn teacher_gpu_launch_outbox(
             expires_at: claim.definition.expires_at,
             operation: GpuLaunchOperation::TeacherRun {
                 teacher_run_id: claim.teacher_run_id.clone(),
+                student_admission_sha256: claim.definition.student_admission_sha256.clone(),
                 provider_binding_sha256: claim.definition.provider_binding_sha256.clone(),
                 slot: claim.definition.slot,
                 call_count: claim.definition.calls.len() as u64,
@@ -18142,13 +18272,17 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
     let operation_valid = match &outbox.operation {
         GpuLaunchOperation::TeacherRun {
             teacher_run_id,
+            student_admission_sha256,
             provider_binding_sha256,
             slot,
             call_count,
             max_gpu_seconds,
         } => {
             let teacher_run_id = decode_hex_digest(teacher_run_id)?;
-            valid_lowercase_sha256(provider_binding_sha256)
+            student_admission_sha256
+                .as_deref()
+                .is_none_or(valid_lowercase_sha256)
+                && valid_lowercase_sha256(provider_binding_sha256)
                 && *slot < TEACHER_MAX_PARALLEL_RUNS
                 && (1..=u64::from(TEACHER_MAX_CALLS)).contains(call_count)
                 && (1..=TEACHER_MAX_GPU_SECONDS).contains(max_gpu_seconds)
@@ -19260,6 +19394,7 @@ mod tests {
         let digest = |label: u8| hex_digest(&Sha256::digest([nonce, label]).into());
         let definition = TeacherGpuRunDefinition {
             schema_version: "milk.teacher-gpu-run-definition.v1".to_owned(),
+            student_admission_sha256: None,
             provider_binding_sha256: digest(1),
             slot: nonce % TEACHER_MAX_PARALLEL_RUNS,
             run_nonce: Uuid::from_u128(u128::from(nonce) + 1),
