@@ -26,14 +26,12 @@ OPERATION_HEADER = "x-milk-candidate-operation"
 WRANGLER_VERSION = "4.126.0"
 DELIVERY_SCHEMA = "milk.baseten-candidate-key-delivery.v1"
 VERIFY_SCHEMA = "milk.baseten-candidate-key-delivery-verify.v1"
-REMOVE_SCHEMA = "milk.baseten-candidate-key-remove.v1"
 OPERATOR_ROUTE_REMOVE_SCHEMA = "milk.baseten-candidate-key-remove-operator-route.v1"
 ACK_SCHEMA = "milk.baseten-candidate-key-delivery-ack.v1"
 RESTART_SCHEMA = "milk.gateway-candidate-container-restart.v1"
 INSPECTION_SCHEMA = "milk.gateway-candidate-container-inspection.v1"
 RELEASE_SCHEMA = "milk.gateway-process-release.v2"
-TEARDOWN_SCHEMA = "milk.provider-teardown-authorization.v1"
-ROUTE_RECEIPT_SCHEMA = "milk.route-publication-receipt.v2"
+ROUTE_RECEIPT_SCHEMA = "milk.route-publication-receipt.v3"
 ACCOUNT_ID = re.compile(r"[0-9a-f]{32}")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -60,10 +58,6 @@ class OperationFailure(Exception):
 
 def canonical_json(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-
-
-def gateway_json(value):
-    return (json.dumps(value, separators=(",", ":")) + "\n").encode()
 
 
 def unique_object(pairs):
@@ -183,18 +177,10 @@ def parse_verify(value):
     return validate_base(value)
 
 
-AUTH_KEYS = (
-    "schema_version", "scope", "student_job_id", "claim_sha256",
-    "winner_result_object_key", "winner_result_sha256",
-    "provider_acceptance_sha256", "run_id", "selected_provider",
-    "execution_id", "trigger", "authorized_at",
-)
-SCOPE_KEYS = ("tenant_id", "project_id", "environment_id", "workload_id", "eval_id")
 ROUTE_RECEIPT_KEYS = (
-    "schema_version", "route_revision", "student_job_id", "student_result_sha256",
-    "model_manifest_sha256", "dev_receipt_sha256", "previous_route_revision",
-    "candidate_basis_points", "manifest_object_key", "signature_object_key",
-    "live_pointer_object_key", "state",
+    "schema_version", "route_revision", "proposal_sha256", "candidate_api_key_sha256",
+    "previous_route_revision", "candidate_basis_points", "manifest_object_key",
+    "signature_object_key", "live_pointer_object_key", "state",
 )
 
 
@@ -203,26 +189,14 @@ def ordered(value, keys, description):
     return {key: value[key] for key in keys}
 
 
-def validate_timestamp(value):
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise OperationFailure("invalid UTC timestamp")
-    try:
-        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError as error:
-        raise OperationFailure("invalid UTC timestamp") from error
-    if parsed.utcoffset() != dt.timedelta(0):
-        raise OperationFailure("invalid UTC timestamp")
-
-
 def ordered_route_receipt(value):
     receipt = ordered(value, ROUTE_RECEIPT_KEYS, "route receipt")
-    digest_fields = (
-        "route_revision", "student_job_id", "student_result_sha256",
-        "model_manifest_sha256", "dev_receipt_sha256",
-    )
     if (
         receipt["schema_version"] != ROUTE_RECEIPT_SCHEMA
-        or any(SHA256.fullmatch(receipt[field] or "") is None for field in digest_fields)
+        or SHA256.fullmatch(receipt["route_revision"] or "") is None
+        or SHA256.fullmatch(receipt["proposal_sha256"] or "") is None
+        or SHA256.fullmatch(receipt["candidate_api_key_sha256"] or "") is None
+        or receipt["candidate_api_key_sha256"] == ZERO_SHA256
         or (
             receipt["previous_route_revision"] is not None
             and SHA256.fullmatch(receipt["previous_route_revision"] or "") is None
@@ -272,8 +246,7 @@ def parse_operator_route_remove(value):
         value,
         BASE_KEYS | {
             "schema_version", "gateway_release_id", "gateway_release_sha256",
-            "proposal_sha256", "candidate_sha256", "canary_route_receipt",
-            "zero_route_receipt",
+            "proposal_sha256", "canary_route_receipt", "zero_route_receipt",
         },
         "operator route remove request",
     )
@@ -282,9 +255,8 @@ def parse_operator_route_remove(value):
         or UUID.fullmatch(value["gateway_release_id"] or "") is None
         or SHA256.fullmatch(value["gateway_release_sha256"] or "") is None
         or SHA256.fullmatch(value["proposal_sha256"] or "") is None
-        or SHA256.fullmatch(value["candidate_sha256"] or "") is None
         or value["proposal_sha256"] == ZERO_SHA256
-        or value["candidate_sha256"] == ZERO_SHA256
+        or value["candidate_key_sha256"] == ZERO_SHA256
     ):
         raise OperationFailure("invalid operator route remove request")
     canary = ordered_route_receipt(value["canary_route_receipt"])
@@ -295,107 +267,13 @@ def parse_operator_route_remove(value):
         or zero["candidate_basis_points"] != 0
         or zero["previous_route_revision"] != canary["route_revision"]
         or zero["route_revision"] == canary["route_revision"]
-        or canary["student_result_sha256"] != value["proposal_sha256"]
-        or zero["student_result_sha256"] != value["proposal_sha256"]
-        or canary["student_job_id"] != value["candidate_sha256"]
-        or canary["model_manifest_sha256"] == ZERO_SHA256
-        or canary["dev_receipt_sha256"] != ZERO_SHA256
-        or zero["student_job_id"] != ZERO_SHA256
-        or zero["model_manifest_sha256"] != ZERO_SHA256
-        or zero["dev_receipt_sha256"] != ZERO_SHA256
+        or canary["proposal_sha256"] != value["proposal_sha256"]
+        or zero["proposal_sha256"] != value["proposal_sha256"]
+        or canary["candidate_api_key_sha256"] != value["candidate_key_sha256"]
+        or zero["candidate_api_key_sha256"] != value["candidate_key_sha256"]
     ):
         raise OperationFailure("invalid operator route receipt sequence")
     metadata = validate_base(value)
-    metadata["gateway_release_id"] = value["gateway_release_id"]
-    metadata["gateway_release_sha256"] = value["gateway_release_sha256"]
-    return metadata
-
-
-def ordered_trigger(value):
-    if not isinstance(value, dict):
-        raise OperationFailure("invalid teardown trigger")
-    if value.get("kind") == "service_expired":
-        trigger = ordered(value, ("kind", "service_not_after"), "service-expired trigger")
-        validate_timestamp(trigger["service_not_after"])
-        return trigger
-    trigger = ordered(
-        value,
-        (
-            "kind", "retirement_object_key", "retirement_sha256", "zero_route_revision",
-            "canary_route_receipt", "zero_route_receipt",
-        ),
-        "route-zero trigger",
-    )
-    if (
-        trigger["kind"] != "route_zero"
-        or not bounded_text(trigger["retirement_object_key"], 1024)
-        or SHA256.fullmatch(trigger["retirement_sha256"] or "") is None
-        or SHA256.fullmatch(trigger["zero_route_revision"] or "") is None
-    ):
-        raise OperationFailure("invalid route-zero trigger")
-    trigger["canary_route_receipt"] = ordered_route_receipt(trigger["canary_route_receipt"])
-    trigger["zero_route_receipt"] = ordered_route_receipt(trigger["zero_route_receipt"])
-    if (
-        trigger["canary_route_receipt"]["candidate_basis_points"] != 100
-        or trigger["zero_route_receipt"]["candidate_basis_points"] != 0
-        or trigger["zero_route_receipt"]["previous_route_revision"]
-        != trigger["canary_route_receipt"]["route_revision"]
-        or trigger["zero_route_receipt"]["route_revision"] != trigger["zero_route_revision"]
-    ):
-        raise OperationFailure("invalid route-zero receipt sequence")
-    return trigger
-
-
-def ordered_authorization(value, metadata):
-    authorization = ordered(value, AUTH_KEYS, "teardown authorization")
-    authorization["scope"] = ordered(authorization["scope"], SCOPE_KEYS, "teardown scope")
-    authorization["trigger"] = ordered_trigger(authorization["trigger"])
-    if (
-        authorization["schema_version"] != TEARDOWN_SCHEMA
-        or any(
-            UUID.fullmatch(authorization["scope"][key] or "") is None
-            for key in SCOPE_KEYS[:-1]
-        )
-        or SHA256.fullmatch(authorization["scope"]["eval_id"] or "") is None
-        or SHA256.fullmatch(authorization["student_job_id"] or "") is None
-        or SHA256.fullmatch(authorization["claim_sha256"] or "") is None
-        or not bounded_text(authorization["winner_result_object_key"], 1024)
-        or SHA256.fullmatch(authorization["winner_result_sha256"] or "") is None
-        or SHA256.fullmatch(authorization["provider_acceptance_sha256"] or "") is None
-        or authorization["run_id"] != metadata["run_id"]
-        or authorization["selected_provider"] != metadata["provider"]
-        or not bounded_text(authorization["execution_id"], 256)
-        or authorization["trigger"] != metadata["trigger"]
-    ):
-        raise OperationFailure("invalid teardown authorization")
-    validate_timestamp(authorization["authorized_at"])
-    return authorization
-
-
-def parse_remove(value):
-    require_exact_keys(
-        value,
-        BASE_KEYS | {
-            "schema_version", "gateway_release_id", "gateway_release_sha256",
-            "gateway_cleanup_authorization", "gateway_cleanup_authorization_sha256", "trigger",
-        },
-        "remove request",
-    )
-    if (
-        value["schema_version"] != REMOVE_SCHEMA
-        or UUID.fullmatch(value["gateway_release_id"] or "") is None
-        or SHA256.fullmatch(value["gateway_release_sha256"] or "") is None
-        or SHA256.fullmatch(value["gateway_cleanup_authorization_sha256"] or "") is None
-    ):
-        raise OperationFailure("invalid remove request")
-    metadata = validate_base(value)
-    metadata["trigger"] = ordered_trigger(value["trigger"])
-    authorization = ordered_authorization(value["gateway_cleanup_authorization"], metadata)
-    if not hmac.compare_digest(
-        hashlib.sha256(gateway_json(authorization)).hexdigest(),
-        value["gateway_cleanup_authorization_sha256"],
-    ):
-        raise OperationFailure("teardown authorization digest mismatch")
     metadata["gateway_release_id"] = value["gateway_release_id"]
     metadata["gateway_release_sha256"] = value["gateway_release_sha256"]
     return metadata
@@ -977,8 +855,6 @@ def handle_request(request, arguments, runner, account_id, admin_key):
         return install(metadata, candidate, arguments, runner, account_id, admin_key)
     if schema == VERIFY_SCHEMA:
         return verify(parse_verify(request), arguments, runner, account_id, admin_key)
-    if schema == REMOVE_SCHEMA:
-        return remove(parse_remove(request), arguments, runner, account_id, admin_key)
     if schema == OPERATOR_ROUTE_REMOVE_SCHEMA:
         return remove(
             parse_operator_route_remove(request),

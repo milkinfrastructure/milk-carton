@@ -36,7 +36,7 @@ if [[ $* == *"publish-route"* && $* == *"--signature"* ]]; then
     esac
   done
   "$FAKE_OPENSSL" pkeyutl -verify -rawin -pubin -inkey "$FAKE_PUBLIC_KEY" -in "$manifest" -sigfile "$signature" >/dev/null
-  printf '{"schema_version":"milk.route-publication-receipt.v2","state":"committed"}\n'
+  printf '{"schema_version":"milk.route-publication-receipt.v3","candidate_api_key_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"active"}\n'
 elif [[ $* == *"publish-route"* && $* == *"--check-only"* && ${MUTATE_MANIFEST:-0} == 1 ]]; then
   chmod 0600 "$FAKE_MANIFEST"
   printf 'x' >>"$FAKE_MANIFEST"
@@ -75,7 +75,7 @@ receipt=$(
     "$TEST_DIR/signing.pem"
 )
 [[ ! -e $POISON_MARKER ]] || fail "route signer used an operator-controlled PATH tool"
-[[ $receipt == '{"schema_version":"milk.route-publication-receipt.v2","state":"committed"}' ]] || fail "publication receipt changed"
+[[ $receipt == '{"schema_version":"milk.route-publication-receipt.v3","candidate_api_key_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"active"}' ]] || fail "publication receipt changed"
 [[ $(wc -c <"$TEST_DIR/route.sig" | tr -d ' ') == 64 ]] || fail "signature is not 64 raw bytes"
 "$TEST_DIR/openssl" pkeyutl -verify -rawin -pubin -inkey "$TEST_DIR/public.pem" -in "$TEST_DIR/route.json" -sigfile "$TEST_DIR/route.sig" >/dev/null || fail "signature does not cover exact manifest bytes"
 [[ $(wc -l <"$FAKE_LOG" | tr -d ' ') == 2 ]] || fail "unexpected Rust command count"

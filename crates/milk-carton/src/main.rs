@@ -31,25 +31,21 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use records::{
-    CAPTURE_SAMPLER_ID, CaptureState, EnqueueResult, MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
-    MAX_STUDENT_ARTIFACT_BYTES, MAX_STUDENT_ARTIFACT_FILES, MAX_STUDENT_RESULT_BYTES,
-    MAX_STUDENT_UPLOAD_BYTES, MAX_WINNER_DEPLOYMENT_RESULT_BYTES, OutcomeDisposition, OutcomeKind,
-    OutcomeSubmission, OutcomeValue, PartitionedObjectStore, ProviderTeardownResult, Records,
-    RouteFallbackReason, RouteObservation, SamplingIndependence, SamplingUnitKind, Scope,
+    CAPTURE_SAMPLER_ID, CaptureState, EnqueueResult, MAX_STUDENT_ARTIFACT_BYTES,
+    MAX_STUDENT_ARTIFACT_FILES, MAX_STUDENT_RESULT_BYTES, MAX_STUDENT_UPLOAD_BYTES,
+    OutcomeDisposition, OutcomeKind, OutcomeSubmission, OutcomeValue, PartitionedObjectStore,
+    Records, RouteFallbackReason, RouteObservation, SamplingIndependence, SamplingUnitKind, Scope,
     SnapshotAnalysisAuthorization, SnapshotAnalyzerConfig, SnapshotAnalyzerExecution,
     SnapshotAnalyzerReasoningEffort, StoreAccess, StorePartition, StudentArtifactInput,
     StudentArtifactSource, StudentBranchMaterialization, StudentBranchResult, StudentTrainResult,
-    StudentUpload, StudentVariant, StudentWinnerDeploymentResult, TICK_LEASE_TTL_SECONDS,
-    TeacherGpuTickWrite, TraceCapture, TraceCatalog, current_effective_uid, is_not_found,
+    StudentUpload, StudentVariant, TICK_LEASE_TTL_SECONDS, TeacherGpuTickWrite, TraceCapture,
+    TraceCatalog, current_effective_uid, is_not_found,
 };
 use route::{
-    CandidateReasoningEffort, CandidateRoute, ED25519_SIGNATURE_BYTES, MAX_ROUTE_MANIFEST_BYTES,
-    RouteDecision, RouteEndpoint, RoutePolicy, RoutePublication, RouteRequest, RouteScope,
-    RouteStartupConfig, RouteTarget, WINNER_CANARY_BASIS_POINTS, WINNER_CANARY_VALID_FOR_SECONDS,
-    WINNER_ZERO_VALID_FOR_SECONDS, WinnerRouteAdvanceAction, WinnerRoutePhase,
-    advance_winner_route, parse_operator_route_proposal, prepare_operator_route_manifest,
-    prepare_operator_zero_route_manifest, prepare_route_manifest,
-    verify_operator_manifest_proposal_binding,
+    CandidateRoute, ED25519_SIGNATURE_BYTES, MAX_ROUTE_MANIFEST_BYTES, RouteDecision,
+    RouteEndpoint, RoutePolicy, RoutePublication, RouteRequest, RouteScope, RouteStartupConfig,
+    RouteTarget, parse_operator_route_proposal, prepare_operator_route_manifest,
+    prepare_operator_zero_route_manifest, verify_operator_manifest_proposal_binding,
 };
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -136,13 +132,6 @@ enum Command {
         stage_dir: PathBuf,
     },
     #[command(hide = true)]
-    MaterializeStudentWinner {
-        #[arg(long)]
-        student_job_id: String,
-        #[arg(long)]
-        stage_dir: PathBuf,
-    },
-    #[command(hide = true)]
     IngestStudentTrainExecution {
         #[arg(long)]
         result: PathBuf,
@@ -168,36 +157,6 @@ enum Command {
         upload: PathBuf,
         #[arg(long)]
         artifact_dir: PathBuf,
-    },
-    #[command(hide = true)]
-    IngestStudentWinnerDeploymentResult {
-        #[arg(long)]
-        result: PathBuf,
-    },
-    #[command(hide = true)]
-    IngestProviderTeardownResult {
-        #[arg(long)]
-        result: PathBuf,
-    },
-    #[command(hide = true)]
-    AdvanceWinnerRoute {
-        #[arg(long)]
-        student_job_id: String,
-        #[arg(long)]
-        phase: WinnerRoutePhase,
-        #[arg(long)]
-        manifest: PathBuf,
-    },
-    #[command(hide = true)]
-    PrepareRoute {
-        #[arg(long)]
-        student_job_id: String,
-        #[arg(long)]
-        rollback: bool,
-        #[arg(long)]
-        reasoning_effort: Option<CandidateReasoningEffort>,
-        #[arg(long)]
-        manifest: PathBuf,
     },
     #[command(hide = true)]
     PrepareRouteProposal {
@@ -349,24 +308,13 @@ impl StoreAccessPlan {
                 control: Some(ReadOnly),
                 ..Self::default()
             },
-            Command::MaterializeStudentWinner { .. } | Command::MaterializeStudentBranch { .. } => {
-                Self {
-                    control: Some(ReadOnly),
-                    ..Self::default()
-                }
-            }
-            Command::IngestStudentTrainExecution { .. }
-            | Command::IngestStudentBranchExecution { .. }
-            | Command::IngestStudentWinnerDeploymentResult { .. }
-            | Command::IngestProviderTeardownResult { .. } => Self {
-                control: Some(ReadWrite),
-                routes: matches!(command, Command::IngestProviderTeardownResult { .. })
-                    .then_some(ReadOnly),
+            Command::MaterializeStudentBranch { .. } => Self {
+                control: Some(ReadOnly),
                 ..Self::default()
             },
-            Command::AdvanceWinnerRoute { .. } | Command::PrepareRoute { .. } => Self {
-                control: Some(ReadOnly),
-                routes: Some(ReadOnly),
+            Command::IngestStudentTrainExecution { .. }
+            | Command::IngestStudentBranchExecution { .. } => Self {
+                control: Some(ReadWrite),
                 ..Self::default()
             },
             Command::PrepareRouteProposal { .. } => Self {
@@ -832,17 +780,8 @@ struct RouteStatusWrite {
     configured: bool,
     state: &'static str,
     route_revision: Option<String>,
-    student_job_id: Option<String>,
     candidate_basis_points: Option<u16>,
     not_after: Option<DateTime<Utc>>,
-}
-
-#[derive(Serialize)]
-struct WinnerRouteAdvanceWrite {
-    schema_version: &'static str,
-    action: WinnerRouteAdvanceAction,
-    route_revision: String,
-    not_after: DateTime<Utc>,
 }
 
 #[derive(Serialize)]
@@ -1319,23 +1258,6 @@ async fn main() -> Result<()> {
             println!("{}", bytes_hex(&student_job_id));
             Ok(())
         }
-        Command::MaterializeStudentWinner {
-            student_job_id,
-            stage_dir,
-        } => {
-            let student_job_id = decode_lowercase_sha256(&student_job_id)?;
-            let records = tokio::time::timeout(
-                Duration::from_millis(config.storage_timeout_ms),
-                start_records(&config, store_access),
-            )
-            .await
-            .context("storage initialization timed out")??;
-            let receipt = records
-                .materialize_student_winner(&config_scope(&config), &student_job_id, &stage_dir)
-                .await?;
-            println!("{}", serde_json::to_string(&receipt)?);
-            Ok(())
-        }
         Command::IngestStudentTrainExecution {
             result,
             upload,
@@ -1440,183 +1362,6 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             println!("{}", serde_json::to_string(&receipt)?);
-            Ok(())
-        }
-        Command::IngestStudentWinnerDeploymentResult { result } => {
-            let mut result_input = OperatorInput::open_private(
-                &result,
-                MAX_WINNER_DEPLOYMENT_RESULT_BYTES,
-                "student winner deployment result",
-            )?;
-            let result = StudentWinnerDeploymentResult::parse(result_input.initial())?;
-            if StudentWinnerDeploymentResult::parse(&result_input.reread_unchanged()?)? != result {
-                bail!("student winner deployment result changed after validation");
-            }
-            let records = tokio::time::timeout(
-                Duration::from_millis(config.storage_timeout_ms),
-                start_records(&config, store_access),
-            )
-            .await
-            .context("storage initialization timed out")??;
-            let receipt = records
-                .ingest_student_winner_deployment_result(&config_scope(&config), result)
-                .await?;
-            println!("{}", serde_json::to_string(&receipt)?);
-            Ok(())
-        }
-        Command::IngestProviderTeardownResult { result } => {
-            let mut result_input = OperatorInput::open_private(
-                &result,
-                MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
-                "provider teardown result",
-            )?;
-            let result = ProviderTeardownResult::parse(result_input.initial())?;
-            if ProviderTeardownResult::parse(&result_input.reread_unchanged()?)? != result {
-                bail!("provider teardown result changed after validation");
-            }
-            let records = tokio::time::timeout(
-                Duration::from_millis(config.storage_timeout_ms),
-                start_records(&config, store_access),
-            )
-            .await
-            .context("storage initialization timed out")??;
-            let receipt = records
-                .ingest_provider_teardown_result(&config_scope(&config), result, Utc::now())
-                .await?;
-            println!("{}", serde_json::to_string(&receipt)?);
-            Ok(())
-        }
-        Command::AdvanceWinnerRoute {
-            student_job_id,
-            phase,
-            manifest,
-        } => {
-            let route_config = config
-                .route
-                .as_ref()
-                .context("winner route advance requires startup route configuration")?;
-            let student_job_id = decode_lowercase_sha256(&student_job_id)?;
-            let records = tokio::time::timeout(
-                Duration::from_millis(config.storage_timeout_ms),
-                start_records(&config, store_access),
-            )
-            .await
-            .context("storage initialization timed out")??;
-            let scope = config_scope(&config);
-            let winner = records
-                .verified_route_winner(&scope, &student_job_id)
-                .await?;
-            let admission_bytes = records
-                .verified_winner_admission(&scope, &student_job_id)
-                .await?;
-            let live = load_verified_live_route(&config, route_config, &records).await?;
-            let (live_publication, live_previous) = match &live {
-                Some((publication, previous)) => (Some(publication), previous.as_ref()),
-                None => (None, None),
-            };
-            let advance = advance_winner_route(
-                route_config,
-                &config_route_scope(&config),
-                &winner,
-                &admission_bytes,
-                &required_env(ROUTE_SECRET_ENV)?,
-                phase,
-                live_publication,
-                live_previous,
-                Utc::now(),
-            )?;
-            if let Some(manifest_bytes) = &advance.manifest {
-                let previous = if advance.publication.previous_route_revision.is_some() {
-                    Some(
-                        live_publication
-                            .context("prepared zero route is missing its live canary")?,
-                    )
-                } else {
-                    None
-                };
-                records
-                    .verify_route_publication(&scope, &advance.publication, previous)
-                    .await?;
-                write_private_output(&manifest, manifest_bytes, "route manifest")?;
-            }
-            println!(
-                "{}",
-                serde_json::to_string(&WinnerRouteAdvanceWrite {
-                    schema_version: "milk.winner-route-advance.v1",
-                    action: advance.action,
-                    route_revision: advance.publication.revision_hex(),
-                    not_after: advance.publication.not_after,
-                })?
-            );
-            Ok(())
-        }
-        Command::PrepareRoute {
-            student_job_id,
-            rollback,
-            reasoning_effort,
-            manifest,
-        } => {
-            let route_config = config
-                .route
-                .as_ref()
-                .context("route preparation requires startup route configuration")?;
-            let student_job_id = decode_lowercase_sha256(&student_job_id)?;
-            let records = tokio::time::timeout(
-                Duration::from_millis(config.storage_timeout_ms),
-                start_records(&config, store_access),
-            )
-            .await
-            .context("storage initialization timed out")??;
-            let scope = config_scope(&config);
-            let winner = records
-                .verified_route_winner(&scope, &student_job_id)
-                .await?;
-            let admission_bytes = records
-                .verified_winner_admission(&scope, &student_job_id)
-                .await?;
-            let previous = match records.load_live_route(&scope).await? {
-                Some((pointer, previous_manifest, previous_signature)) => {
-                    let publication = RoutePublication::parse_archived(
-                        route_config,
-                        &config_route_scope(&config),
-                        &previous_manifest,
-                        &previous_signature,
-                    )?;
-                    if publication.revision != pointer.route_revision {
-                        bail!("live route pointer differs from its verified publication");
-                    }
-                    Some(publication)
-                }
-                None => None,
-            };
-            if rollback && previous.is_none() {
-                bail!("route rollback requires a verified live route");
-            }
-            let (manifest_bytes, publication) = prepare_route_manifest(
-                route_config,
-                &config_route_scope(&config),
-                &winner,
-                &admission_bytes,
-                &required_env(ROUTE_SECRET_ENV)?,
-                if rollback {
-                    0
-                } else {
-                    WINNER_CANARY_BASIS_POINTS
-                },
-                reasoning_effort,
-                previous.as_ref(),
-                Utc::now(),
-                if rollback {
-                    WINNER_ZERO_VALID_FOR_SECONDS
-                } else {
-                    WINNER_CANARY_VALID_FOR_SECONDS
-                },
-            )?;
-            records
-                .verify_route_publication(&scope, &publication, previous.as_ref())
-                .await?;
-            write_private_output(&manifest, &manifest_bytes, "route manifest")?;
-            println!("{}", publication.revision_hex());
             Ok(())
         }
         Command::PrepareRouteProposal {
@@ -1755,26 +1500,25 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            if let Some(proposal_sha256) = publication.operator_proposal_sha256() {
-                let (proposal, proposal_bytes) = records
-                    .load_operator_route_proposal(&config_scope(&config), &proposal_sha256)
+            let proposal_sha256 = publication.operator_proposal_sha256();
+            let (proposal, proposal_bytes) = records
+                .load_operator_route_proposal(&config_scope(&config), &proposal_sha256)
+                .await?;
+            verify_operator_manifest_proposal_binding(
+                route_config,
+                &route_scope,
+                &manifest_bytes,
+                &proposal_bytes,
+            )?;
+            if publication.has_candidate {
+                records
+                    .verify_operator_route_preflight(
+                        &config_scope(&config),
+                        &proposal,
+                        &proposal_bytes,
+                        &baseline_chat_completions_url,
+                    )
                     .await?;
-                verify_operator_manifest_proposal_binding(
-                    route_config,
-                    &route_scope,
-                    &manifest_bytes,
-                    &proposal_bytes,
-                )?;
-                if publication.has_candidate {
-                    records
-                        .verify_operator_route_preflight(
-                            &config_scope(&config),
-                            &proposal,
-                            &proposal_bytes,
-                            &baseline_chat_completions_url,
-                        )
-                        .await?;
-                }
             }
             if check_only {
                 tokio::time::timeout(
@@ -1878,18 +1622,6 @@ async fn tick_action_with_records(
     let recipe_sha256 = decode_lowercase_sha256(&teacher.student_recipe_sha256)?;
     let train_runtime_image_reference = &teacher.student_train_runtime_image_reference;
     let branch_runtime_image_reference = &teacher.student_branch_runtime_image_reference;
-    if let Some(route) = &config.route
-        && let Some(launch) = records
-            .claim_student_winner_deployment(
-                &scope,
-                &provider_binding,
-                route.winner_deployment_authority()?,
-                now,
-            )
-            .await?
-    {
-        return Ok(serde_json::to_string(&launch)?);
-    }
     if let Some(launch) = records
         .advance_student_fanout(
             &scope,
@@ -1984,7 +1716,6 @@ async fn route_status(
             configured: false,
             state: "disabled",
             route_revision: None,
-            student_job_id: None,
             candidate_basis_points: None,
             not_after: None,
         });
@@ -1996,7 +1727,6 @@ async fn route_status(
             configured: true,
             state: "baseline",
             route_revision: None,
-            student_job_id: None,
             candidate_basis_points: None,
             not_after: None,
         });
@@ -2023,11 +1753,6 @@ async fn route_status(
     records
         .verify_route_publication(&config_scope(config), &publication, previous.as_ref())
         .await?;
-    if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
-        records
-            .verify_zero_route_retirement(&config_scope(config), &publication)
-            .await?;
-    }
     let state = if publication.not_after <= now {
         "expired"
     } else if publication.candidate_basis_points == 0 {
@@ -2039,48 +1764,9 @@ async fn route_status(
         configured: true,
         state,
         route_revision: Some(publication.revision_hex()),
-        student_job_id: (!publication.is_operator_proposal())
-            .then(|| bytes_hex(&publication.student_job_id)),
         candidate_basis_points: Some(publication.candidate_basis_points),
         not_after: Some(publication.not_after),
     })
-}
-
-async fn load_verified_live_route(
-    config: &FileConfig,
-    route_config: &RouteStartupConfig,
-    records: &Records,
-) -> Result<Option<(RoutePublication, Option<RoutePublication>)>> {
-    let scope = config_scope(config);
-    let Some((pointer, manifest, signature)) = records.load_live_route(&scope).await? else {
-        return Ok(None);
-    };
-    let route_scope = config_route_scope(config);
-    let publication =
-        RoutePublication::parse_archived(route_config, &route_scope, &manifest, &signature)?;
-    if publication.revision != pointer.route_revision {
-        bail!("live route pointer differs from its verified publication");
-    }
-    let previous = if let Some(revision) = publication.previous_route_revision {
-        let (manifest, signature) = records.load_route_publication(&scope, &revision).await?;
-        Some(RoutePublication::parse_archived(
-            route_config,
-            &route_scope,
-            &manifest,
-            &signature,
-        )?)
-    } else {
-        None
-    };
-    records
-        .verify_route_publication(&scope, &publication, previous.as_ref())
-        .await?;
-    if publication.candidate_basis_points == 0 {
-        records
-            .verify_zero_route_retirement(&scope, &publication)
-            .await?;
-    }
-    Ok(Some((publication, previous)))
 }
 
 fn command_uses_deployment_config(command: Option<&Command>) -> bool {
@@ -2307,9 +1993,6 @@ fn load_selected_config(
         (None, None) => bail!("gateway config path or {CONFIG_JSON_ENV} is required"),
         (Some(path), None) => load_config(path, command),
         (None, Some(bytes)) => {
-            if !command_uses_deployment_config(command) {
-                bail!("{CONFIG_JSON_ENV} is only accepted by serve");
-            }
             if bytes.len() > MAX_CONFIG_BYTES {
                 bail!("{CONFIG_JSON_ENV} exceeds {MAX_CONFIG_BYTES} bytes");
             }
@@ -2401,19 +2084,11 @@ fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -
         | Command::ExecuteTeacherRun { .. }
         | Command::TerminalizeTeacherRun { .. } => validate_teacher_config(config)?,
         Command::MaterializeStudentJob { .. }
-        | Command::MaterializeStudentWinner { .. }
         | Command::IngestStudentTrainExecution { .. }
         | Command::MaterializeStudentBranch { .. }
         | Command::IngestStudentBranchExecution { .. }
-        | Command::IngestStudentWinnerDeploymentResult { .. }
-        | Command::IngestProviderTeardownResult { .. }
         | Command::PrepareRouteProposal { .. }
         | Command::PublishRoute { .. } => {}
-        Command::AdvanceWinnerRoute { .. } | Command::PrepareRoute { .. } => config
-            .route
-            .as_ref()
-            .context("student route operation requires route configuration")?
-            .validate(config.max_in_flight)?,
     }
     Ok(())
 }
@@ -2432,16 +2107,6 @@ fn validate_teacher_config(config: &FileConfig) -> Result<()> {
     snapshot_analyzer_config(config, None)?;
     if let Some(route) = &config.route {
         route.validate_common(config.max_in_flight)?;
-        if route.has_winner_deployment_authority() {
-            if route
-                .authorized_student_branch_runtime_image_reference
-                .as_deref()
-                != Some(teacher.student_branch_runtime_image_reference.as_str())
-            {
-                bail!("student branch runtime image must equal the route-authorized runtime image");
-            }
-            route.validate(config.max_in_flight)?;
-        }
     }
     if teacher.authorization_not_after.nanosecond() != 0 {
         bail!("teacher authorization expiry must use whole seconds");
@@ -4645,12 +4310,9 @@ mod cli_tests {
         for hidden in [
             "generation-status",
             "materialize-student-job",
-            "materialize-student-winner",
             "ingest-student-train-execution",
             "materialize-student-branch",
             "ingest-student-branch-execution",
-            "advance-winner-route",
-            "prepare-route",
             "prepare-route-proposal",
             "publish-route",
         ] {
@@ -4727,21 +4389,6 @@ mod cli_tests {
                 prefix[0],
                 prefix[1],
                 prefix[2],
-                "materialize-student-winner",
-                "--student-job-id",
-                &"b".repeat(64),
-                "--stage-dir",
-                "/run/milk-carton/winner",
-            ])
-            .unwrap()
-            .command,
-            Some(Command::MaterializeStudentWinner { .. })
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                prefix[0],
-                prefix[1],
-                prefix[2],
                 "ingest-student-train-execution",
                 "--result",
                 "/run/milk-carton/train-result.json",
@@ -4793,67 +4440,6 @@ mod cli_tests {
                 prefix[0],
                 prefix[1],
                 prefix[2],
-                "ingest-student-winner-deployment-result",
-                "--result",
-                "/run/milk-carton/winner-deployment-result.json",
-            ])
-            .unwrap()
-            .command,
-            Some(Command::IngestStudentWinnerDeploymentResult { .. })
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                prefix[0],
-                prefix[1],
-                prefix[2],
-                "ingest-provider-teardown-result",
-                "--result",
-                "/run/milk-carton/provider-teardown-result.json",
-            ])
-            .unwrap()
-            .command,
-            Some(Command::IngestProviderTeardownResult { .. })
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                prefix[0],
-                prefix[1],
-                prefix[2],
-                "advance-winner-route",
-                "--student-job-id",
-                &"c".repeat(64),
-                "--phase",
-                "canary",
-                "--manifest",
-                "/run/milk-carton/route.json",
-            ])
-            .unwrap()
-            .command,
-            Some(Command::AdvanceWinnerRoute {
-                phase: WinnerRoutePhase::Canary,
-                ..
-            })
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                prefix[0],
-                prefix[1],
-                prefix[2],
-                "prepare-route",
-                "--student-job-id",
-                &"c".repeat(64),
-                "--manifest",
-                "/run/milk-carton/route.json",
-            ])
-            .unwrap()
-            .command,
-            Some(Command::PrepareRoute { .. })
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                prefix[0],
-                prefix[1],
-                prefix[2],
                 "prepare-route-proposal",
                 "--proposal",
                 "/run/milk-carton/route-proposal.json",
@@ -4881,23 +4467,6 @@ mod cli_tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn winner_route_advance_output_is_strict_and_content_free() {
-        let output = WinnerRouteAdvanceWrite {
-            schema_version: "milk.winner-route-advance.v1",
-            action: WinnerRouteAdvanceAction::Observe,
-            route_revision: "a".repeat(64),
-            not_after: "2026-08-25T12:15:00Z".parse().unwrap(),
-        };
-        assert_eq!(
-            serde_json::to_string(&output).unwrap(),
-            format!(
-                r#"{{"schema_version":"milk.winner-route-advance.v1","action":"observe","route_revision":"{}","not_after":"2026-08-25T12:15:00Z"}}"#,
-                "a".repeat(64)
-            )
-        );
     }
 
     #[test]
@@ -4973,31 +4542,6 @@ mod cli_tests {
             }
         );
         assert_eq!(
-            StoreAccessPlan::for_command(&Command::PrepareRoute {
-                student_job_id: "a".repeat(64),
-                rollback: false,
-                reasoning_effort: None,
-                manifest: "/tmp/manifest".into(),
-            }),
-            StoreAccessPlan {
-                capture: None,
-                control: Some(ReadOnly),
-                routes: Some(ReadOnly),
-            }
-        );
-        assert_eq!(
-            StoreAccessPlan::for_command(&Command::AdvanceWinnerRoute {
-                student_job_id: "a".repeat(64),
-                phase: WinnerRoutePhase::Zero,
-                manifest: "/tmp/manifest".into(),
-            }),
-            StoreAccessPlan {
-                capture: None,
-                control: Some(ReadOnly),
-                routes: Some(ReadOnly),
-            }
-        );
-        assert_eq!(
             StoreAccessPlan::for_command(&Command::PrepareRouteProposal {
                 proposal: "/tmp/proposal".into(),
                 zero: false,
@@ -5030,16 +4574,6 @@ mod cli_tests {
             StoreAccessPlan {
                 capture: None,
                 control: Some(ReadOnly),
-                routes: Some(ReadOnly),
-            }
-        );
-        assert_eq!(
-            StoreAccessPlan::for_command(&Command::IngestProviderTeardownResult {
-                result: "/tmp/teardown.json".into(),
-            }),
-            StoreAccessPlan {
-                capture: None,
-                control: Some(ReadWrite),
                 routes: Some(ReadOnly),
             }
         );
@@ -5124,7 +4658,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn inline_config_is_bounded_exclusive_and_serve_only() {
+    fn inline_config_is_bounded_and_exclusive() {
         let directory = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("milk-carton-inline-config-test-{}", Uuid::now_v7()));
@@ -5152,29 +4686,21 @@ mod cli_tests {
                 .to_string()
                 .contains("is required")
         );
-        assert!(
-            load_selected_config(
-                None,
-                Some(config_bytes),
-                Some(&Command::Tick { once: true })
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("only accepted by serve")
-        );
-        assert!(
-            load_selected_config(
-                None,
-                Some(config_bytes),
-                Some(&Command::MaterializeStudentJob {
-                    student_job_id: "a".repeat(64),
-                    stage_dir: PathBuf::from("/tmp/stage"),
-                })
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("only accepted by serve")
-        );
+        load_selected_config(
+            None,
+            Some(config_bytes),
+            Some(&Command::Tick { once: true }),
+        )
+        .unwrap();
+        load_selected_config(
+            None,
+            Some(config_bytes),
+            Some(&Command::MaterializeStudentJob {
+                student_job_id: "a".repeat(64),
+                stage_dir: PathBuf::from("/tmp/stage"),
+            }),
+        )
+        .unwrap();
         assert!(
             load_selected_config(
                 None,

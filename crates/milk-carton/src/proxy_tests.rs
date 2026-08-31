@@ -327,30 +327,8 @@ fn student_runtime_images_are_immutable_and_branch_matches_route_authority() {
         signing_public_key_hex: "5".repeat(64),
         signing_key_id: "route-test".into(),
         allow_private_candidate_http: false,
-        authorized_provider_terms_sha256: Some("6".repeat(64)),
-        authorized_student_branch_runtime_image_reference: Some(format!(
-            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
-            "7".repeat(64)
-        )),
-        authorized_admission_program_sha256: Some("8".repeat(64)),
-        winner_authorization_not_after: Some("2099-01-01T00:00:00Z".parse().unwrap()),
-        winner_max_wall_seconds: Some(crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS),
-        winner_max_cost_microusd: Some(crate::route::MAX_WINNER_DEPLOYMENT_COST_MICROUSD),
         candidate_max_in_flight: 1,
     });
-    assert!(validate_teacher_config(&routed).is_err());
-    routed
-        .route
-        .as_mut()
-        .unwrap()
-        .authorized_student_branch_runtime_image_reference = Some(
-        routed
-            .teacher
-            .as_ref()
-            .unwrap()
-            .student_branch_runtime_image_reference
-            .clone(),
-    );
     validate_teacher_config(&routed).unwrap();
 }
 

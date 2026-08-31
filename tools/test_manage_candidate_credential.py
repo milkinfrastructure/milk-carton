@@ -24,16 +24,11 @@ ADMIN_KEY = "milk_admin_" + "A" * 48
 CANDIDATE_KEY = "bt_candidate_test_secret_123456789"
 CANDIDATE_SHA = hashlib.sha256(CANDIDATE_KEY.encode()).hexdigest()
 CLOUDFLARE_TOKEN = "D" * 40
-ZERO_SHA256 = "0" * 64
 ROUTE_SCOPE_PREFIX = "milk/v1/scopes/10000000-0000-0000-0000-000000000001"
 
 
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-
-
-def gateway(value):
-    return (json.dumps(value, separators=(",", ":")) + "\n").encode()
 
 
 def candidate_frame(candidate=CANDIDATE_KEY, digest=None):
@@ -67,38 +62,17 @@ def verify_request(frame=None):
     })
 
 
-def route_receipt(revision, basis_points, previous_revision=None):
-    return {
-        "schema_version": "milk.route-publication-receipt.v2",
-        "route_revision": revision,
-        "student_job_id": "1" * 64,
-        "student_result_sha256": "5" * 64,
-        "model_manifest_sha256": "6" * 64,
-        "dev_receipt_sha256": "7" * 64,
-        "previous_route_revision": previous_revision,
-        "candidate_basis_points": basis_points,
-        "manifest_object_key": "routes/manifest.json",
-        "signature_object_key": "routes/signature.json",
-        "live_pointer_object_key": "routes/current.json",
-        "state": "published",
-    }
-
-
 def operator_route_receipt(
     revision,
     basis_points,
     proposal_sha256,
-    candidate_sha256,
     previous_revision=None,
 ):
-    candidate = basis_points != 0
     return {
-        "schema_version": "milk.route-publication-receipt.v2",
+        "schema_version": "milk.route-publication-receipt.v3",
         "route_revision": revision,
-        "student_job_id": candidate_sha256 if candidate else ZERO_SHA256,
-        "student_result_sha256": proposal_sha256,
-        "model_manifest_sha256": "6" * 64 if candidate else ZERO_SHA256,
-        "dev_receipt_sha256": ZERO_SHA256,
+        "proposal_sha256": proposal_sha256,
+        "candidate_api_key_sha256": CANDIDATE_SHA,
         "previous_route_revision": previous_revision,
         "candidate_basis_points": basis_points,
         "manifest_object_key": f"{ROUTE_SCOPE_PREFIX}/routes/versions/{revision}.json",
@@ -112,14 +86,12 @@ def operator_route_receipt(
 
 def operator_route_remove_request(installed_ack):
     proposal_sha256 = "5" * 64
-    candidate_sha256 = "1" * 64
     canary_revision = "8" * 64
     zero_revision = "9" * 64
     return {
         "candidate_key_sha256": installed_ack["candidate_key_sha256"],
-        "candidate_sha256": candidate_sha256,
         "canary_route_receipt": operator_route_receipt(
-            canary_revision, 100, proposal_sha256, candidate_sha256
+            canary_revision, 100, proposal_sha256
         ),
         "gateway_release_id": installed_ack["gateway_release_id"],
         "gateway_release_sha256": installed_ack["gateway_release_sha256"],
@@ -137,54 +109,9 @@ def operator_route_remove_request(installed_ack):
             zero_revision,
             0,
             proposal_sha256,
-            candidate_sha256,
             canary_revision,
         ),
     }
-
-
-def remove_request(installed_ack, trigger=None):
-    trigger = trigger or {
-        "kind": "service_expired",
-        "service_not_after": "2026-08-27T20:00:00Z",
-    }
-    authorization = {
-        "schema_version": "milk.provider-teardown-authorization.v1",
-        "scope": {
-            "tenant_id": "10000000-0000-0000-0000-000000000001",
-            "project_id": "20000000-0000-0000-0000-000000000002",
-            "environment_id": "30000000-0000-0000-0000-000000000003",
-            "workload_id": "40000000-0000-0000-0000-000000000004",
-            "eval_id": "e" * 64,
-        },
-        "student_job_id": "1" * 64,
-        "claim_sha256": "2" * 64,
-        "winner_result_object_key": "control/winner-result.json",
-        "winner_result_sha256": "3" * 64,
-        "provider_acceptance_sha256": "4" * 64,
-        "run_id": installed_ack["run_id"],
-        "selected_provider": "baseten",
-        "execution_id": "execution-1",
-        "trigger": trigger,
-        "authorized_at": "2026-08-27T20:00:00Z",
-    }
-    return canonical({
-        "candidate_key_sha256": installed_ack["candidate_key_sha256"],
-        "gateway_cleanup_authorization": authorization,
-        "gateway_cleanup_authorization_sha256": hashlib.sha256(gateway(authorization)).hexdigest(),
-        "gateway_release_id": installed_ack["gateway_release_id"],
-        "gateway_release_sha256": installed_ack["gateway_release_sha256"],
-        "key_name": installed_ack["key_name"],
-        "key_prefix": installed_ack["key_prefix"],
-        "model_id": installed_ack["model_id"],
-        "payload_bytes": installed_ack["payload_bytes"],
-        "payload_sha256": installed_ack["payload_sha256"],
-        "provider": installed_ack["provider"],
-        "run_id": installed_ack["run_id"],
-        "schema_version": "milk.baseten-candidate-key-remove.v1",
-        "team_name": installed_ack["team_name"],
-        "trigger": trigger,
-    })
 
 
 FAKE_COMMAND = r'''#!/usr/bin/env python3
@@ -474,7 +401,9 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.assertEqual(verified["state"], "installed")
         self.assertEqual(verified["gateway_release_id"], INSTALLED_WORKER)
 
-        code, removed_raw, stdout, stderr = fixture.transact(remove_request(verified))
+        code, removed_raw, stdout, stderr = fixture.transact(
+            canonical(operator_route_remove_request(verified))
+        )
         self.assertEqual((code, stdout, stderr), (0, b"", b""))
         removed = json.loads(removed_raw)
         self.assertEqual(removed["state"], "absent")
@@ -503,7 +432,7 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.assertEqual(stderr, b"candidate credential operation failed\n")
         self.assertFalse(wrong.state["candidate_installed"])
 
-    def test_baseten_remove_survives_restart_and_rejects_forged_release(self):
+    def test_operator_remove_survives_restart_and_rejects_forged_release(self):
         stale = Fixture()
         self.addCleanup(stale.close)
         code, installed_raw, _stdout, _stderr = stale.transact(candidate_frame())
@@ -511,7 +440,7 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         code, _verified_raw, _stdout, _stderr = stale.transact(verify_request())
         self.assertEqual(code, 0)
         code, response, stdout, stderr = stale.transact(
-            remove_request(json.loads(installed_raw))
+            canonical(operator_route_remove_request(json.loads(installed_raw)))
         )
         self.assertEqual((code, stdout, stderr), (0, b"", b""))
         self.assertEqual(json.loads(response)["state"], "absent")
@@ -522,7 +451,7 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.addCleanup(forged.close)
         code, installed_raw, _stdout, _stderr = forged.transact(candidate_frame())
         self.assertEqual(code, 0)
-        request = json.loads(remove_request(json.loads(installed_raw)))
+        request = operator_route_remove_request(json.loads(installed_raw))
         request["gateway_release_sha256"] = "f" * 64
         code, response, stdout, stderr = forged.transact(canonical(request))
         self.assertEqual((code, response, stdout), (1, b"", b""))
@@ -530,12 +459,12 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.assertTrue(forged.state["candidate_installed"])
         self.assertEqual(forged.state["container_last_change"], 1100)
 
-    def test_baseten_remove_is_replay_safe_after_secret_delete_failure(self):
+    def test_operator_remove_is_replay_safe_after_secret_delete_failure(self):
         fixture = Fixture("delete_fail_once")
         self.addCleanup(fixture.close)
         code, installed_raw, _stdout, _stderr = fixture.transact(candidate_frame())
         self.assertEqual(code, 0)
-        request = remove_request(json.loads(installed_raw))
+        request = canonical(operator_route_remove_request(json.loads(installed_raw)))
 
         code, response, stdout, stderr = fixture.transact(request)
         self.assertEqual((code, response, stdout), (1, b"", b""))
@@ -547,41 +476,6 @@ class CandidateCredentialHelperTests(unittest.TestCase):
         self.assertEqual((code, stdout, stderr), (0, b"", b""))
         self.assertEqual(json.loads(removed_raw)["state"], "absent")
         self.assertFalse(fixture.state["candidate_installed"])
-
-    def test_route_zero_removal_requires_the_exact_one_percent_canary(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        code, installed_raw, _stdout, _stderr = fixture.transact(candidate_frame())
-        self.assertEqual(code, 0)
-        installed = json.loads(installed_raw)
-        canary_revision = "8" * 64
-        zero_revision = "9" * 64
-        trigger = {
-            "kind": "route_zero",
-            "retirement_object_key": "routes/retirement.json",
-            "retirement_sha256": "a" * 64,
-            "zero_route_revision": zero_revision,
-            "canary_route_receipt": route_receipt(canary_revision, 100),
-            "zero_route_receipt": route_receipt(zero_revision, 0, canary_revision),
-        }
-        code, removed_raw, stdout, stderr = fixture.transact(
-            remove_request(installed, trigger)
-        )
-        self.assertEqual((code, stdout, stderr), (0, b"", b""))
-        self.assertEqual(json.loads(removed_raw)["state"], "absent")
-
-        trigger["canary_route_receipt"]["candidate_basis_points"] = 500
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        code, installed_raw, _stdout, _stderr = fixture.transact(candidate_frame())
-        self.assertEqual(code, 0)
-        code, response, stdout, stderr = fixture.transact(
-            remove_request(json.loads(installed_raw), trigger)
-        )
-        self.assertEqual(code, 1)
-        self.assertEqual((response, stdout), (b"", b""))
-        self.assertEqual(stderr, b"candidate credential operation failed\n")
-        self.assertTrue(fixture.state["candidate_installed"])
 
     def test_operator_route_zero_removes_the_exact_installed_release(self):
         fixture = Fixture()
@@ -606,13 +500,20 @@ class CandidateCredentialHelperTests(unittest.TestCase):
                 "candidate_basis_points", 1
             ),
             lambda request: request["zero_route_receipt"].__setitem__(
-                "student_result_sha256", "e" * 64
+                "proposal_sha256", "e" * 64
             ),
             lambda request: request["canary_route_receipt"].__setitem__(
-                "student_job_id", "e" * 64
+                "schema_version", "milk.route-publication-receipt.v2"
+            ),
+            lambda request: request["canary_route_receipt"].__setitem__(
+                "candidate_api_key_sha256", "e" * 64
             ),
             lambda request: request["zero_route_receipt"].__setitem__(
-                "student_job_id", request["candidate_sha256"]
+                "manifest_object_key",
+                request["zero_route_receipt"]["manifest_object_key"].replace(
+                    "10000000-0000-0000-0000-000000000001",
+                    "20000000-0000-0000-0000-000000000002",
+                ),
             ),
         )
         for mutate in mutations:

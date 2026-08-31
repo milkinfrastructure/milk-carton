@@ -10,21 +10,16 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use uuid::Uuid;
 
-pub(crate) const ROUTE_SCHEMA_VERSION: &str = "milk.route.v4";
 pub(crate) const OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v3";
-const LEGACY_OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION: &str = "milk.unsigned-route-proposal.v2";
 pub(crate) const OPERATOR_ROUTE_SCHEMA_VERSION: &str = "milk.route.v1";
-pub(crate) const WINNER_ADMISSION_SCHEMA_VERSION: &str = "milk.winner-admission-receipt.v2";
 const ROUTE_LIVE_SCHEMA_VERSION: &str = "milk.route-live.v1";
 const BASELINE_ROUTE_REVISION: &str = "openai-baseline-v1";
 pub(crate) const MAX_ROUTE_MANIFEST_BYTES: usize = 8 * 1_024;
-pub(crate) const MAX_WINNER_ADMISSION_BYTES: usize = 8 * 1_024;
 pub(crate) const ED25519_SIGNATURE_BYTES: usize = 64;
 pub(crate) const MAX_ROUTE_LIVE_BYTES: usize = 1_024;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_KEY_ID_BYTES: usize = 128;
-const MAX_PROVIDER_BYTES: usize = 64;
 const MAX_EXECUTION_ID_BYTES: usize = 256;
 const MAX_IMAGE_REFERENCE_BYTES: usize = 2_048;
 const MAX_CAPABILITIES: usize = 8;
@@ -32,14 +27,8 @@ pub(crate) const CANDIDATE_CONTEXT_WINDOW_TOKENS: u32 = 4_096;
 pub(crate) const CANDIDATE_MAX_INPUT_UTF8_BYTES: usize = 2_048;
 pub(crate) const CANDIDATE_MAX_INPUT_MESSAGES: usize = 16;
 pub(crate) const CANDIDATE_MAX_INPUT_REQUEST_BYTES: usize = 16_384;
-pub(crate) const WINNER_CANARY_BASIS_POINTS: u16 = 100;
-pub(crate) const WINNER_CANARY_VALID_FOR_SECONDS: u32 = 15 * 60;
-pub(crate) const WINNER_ZERO_VALID_FOR_SECONDS: u32 = 60;
-pub(crate) const WINNER_ROUTE_RUNWAY_SECONDS: u32 =
-    WINNER_CANARY_VALID_FOR_SECONDS + WINNER_ZERO_VALID_FOR_SECONDS;
-pub(crate) const MAX_WINNER_DEPLOYMENT_WALL_SECONDS: u64 = 24 * 60 * 60;
-pub(crate) const MAX_WINNER_DEPLOYMENT_COST_MICROUSD: u64 = 1_000_000_000;
-pub(crate) const WINNER_PROVIDER: &str = "baseten";
+const OPERATOR_CANDIDATE_VALID_FOR_SECONDS: u32 = 15 * 60;
+const OPERATOR_ZERO_VALID_FOR_SECONDS: u32 = 60;
 const TEMPLATE_TOKENS_PER_MESSAGE: usize = 64;
 const OUTPUT_AND_FIXED_RESERVE_TOKENS: usize = 1_024;
 const _: () = assert!(
@@ -51,9 +40,7 @@ const _: () = assert!(
 const MAX_ROUTE_VALIDITY_HOURS: i64 = 24;
 const MAX_PUBLICATION_START_DELAY_MINUTES: i64 = 5;
 const MAX_HARNESS_CANDIDATE_BASIS_POINTS: u16 = 1_000;
-const MAX_HARNESS_SPEND_MICROUSD: u64 = 25_000_000;
 const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v4";
-const LEGACY_HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v2";
 const HARNESS_TAXONOMY_VERSION: &str = "milk.semantic-taxonomy.v1";
 
 #[derive(Clone, Debug, Deserialize)]
@@ -62,39 +49,14 @@ pub(crate) struct RouteStartupConfig {
     pub(crate) signing_public_key_hex: String,
     pub(crate) signing_key_id: String,
     pub(crate) allow_private_candidate_http: bool,
-    pub(crate) authorized_provider_terms_sha256: Option<String>,
-    pub(crate) authorized_student_branch_runtime_image_reference: Option<String>,
-    pub(crate) authorized_admission_program_sha256: Option<String>,
-    pub(crate) winner_authorization_not_after: Option<DateTime<Utc>>,
-    pub(crate) winner_max_wall_seconds: Option<u64>,
-    pub(crate) winner_max_cost_microusd: Option<u64>,
     pub(crate) candidate_max_in_flight: usize,
 }
 
 impl RouteStartupConfig {
-    pub(crate) fn validate(&self, gateway_max_in_flight: usize) -> Result<()> {
-        self.winner_deployment_authority()?.validate()?;
-        self.validate_common(gateway_max_in_flight)
-    }
-
     pub(crate) fn validate_common(&self, gateway_max_in_flight: usize) -> Result<()> {
         decode_lowercase_hex_32(&self.signing_public_key_hex, "route signing public key")?;
         if self.signing_key_id.is_empty() || self.signing_key_id.len() > MAX_KEY_ID_BYTES {
             bail!("route signing key ID is invalid");
-        }
-        let winner_fields = [
-            self.authorized_provider_terms_sha256.is_some(),
-            self.authorized_student_branch_runtime_image_reference
-                .is_some(),
-            self.authorized_admission_program_sha256.is_some(),
-            self.winner_authorization_not_after.is_some(),
-            self.winner_max_wall_seconds.is_some(),
-            self.winner_max_cost_microusd.is_some(),
-        ];
-        if winner_fields.iter().any(|configured| *configured)
-            && !winner_fields.iter().all(|configured| *configured)
-        {
-            bail!("legacy winner route authorization must be complete or omitted");
         }
         if gateway_max_in_flight < 2
             || self.candidate_max_in_flight == 0
@@ -103,125 +65,6 @@ impl RouteStartupConfig {
             bail!("candidate_max_in_flight must reserve at least one baseline request slot");
         }
         Ok(())
-    }
-
-    pub(crate) fn winner_deployment_authority(&self) -> Result<WinnerDeploymentAuthority> {
-        let authority = WinnerDeploymentAuthority {
-            schema_version: "milk.winner-deployment-authority.v3".to_owned(),
-            provider_policy: WinnerProviderPolicy {
-                only: WINNER_PROVIDER.to_owned(),
-            },
-            provider_terms_sha256: self
-                .authorized_provider_terms_sha256
-                .clone()
-                .context("legacy winner route authorization is not configured")?,
-            student_branch_runtime_image_reference: self
-                .authorized_student_branch_runtime_image_reference
-                .clone()
-                .context("legacy winner route authorization is not configured")?,
-            admission_program_sha256: self
-                .authorized_admission_program_sha256
-                .clone()
-                .context("legacy winner route authorization is not configured")?,
-            authorization_not_after: self
-                .winner_authorization_not_after
-                .context("legacy winner route authorization is not configured")?,
-            max_wall_seconds: self
-                .winner_max_wall_seconds
-                .context("legacy winner route authorization is not configured")?,
-            max_cost_microusd: self
-                .winner_max_cost_microusd
-                .context("legacy winner route authorization is not configured")?,
-            allow_private_candidate_http: self.allow_private_candidate_http,
-            signing_public_key_hex: self.signing_public_key_hex.clone(),
-            signing_key_id: self.signing_key_id.clone(),
-            candidate_max_in_flight: self.candidate_max_in_flight,
-            canary_candidate_basis_points: WINNER_CANARY_BASIS_POINTS,
-            canary_valid_for_seconds: WINNER_CANARY_VALID_FOR_SECONDS,
-            max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
-            max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
-            max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
-            route_schema_version: ROUTE_SCHEMA_VERSION.to_owned(),
-            winner_admission_schema_version: WINNER_ADMISSION_SCHEMA_VERSION.to_owned(),
-        };
-        authority.validate()?;
-        Ok(authority)
-    }
-
-    pub(crate) fn has_winner_deployment_authority(&self) -> bool {
-        self.authorized_provider_terms_sha256.is_some()
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WinnerDeploymentAuthority {
-    pub(crate) schema_version: String,
-    pub(crate) provider_policy: WinnerProviderPolicy,
-    pub(crate) provider_terms_sha256: String,
-    pub(crate) student_branch_runtime_image_reference: String,
-    pub(crate) admission_program_sha256: String,
-    pub(crate) authorization_not_after: DateTime<Utc>,
-    pub(crate) max_wall_seconds: u64,
-    pub(crate) max_cost_microusd: u64,
-    pub(crate) allow_private_candidate_http: bool,
-    pub(crate) signing_public_key_hex: String,
-    pub(crate) signing_key_id: String,
-    pub(crate) candidate_max_in_flight: usize,
-    pub(crate) canary_candidate_basis_points: u16,
-    pub(crate) canary_valid_for_seconds: u32,
-    pub(crate) max_input_utf8_bytes: usize,
-    pub(crate) max_input_messages: usize,
-    pub(crate) max_input_request_bytes: usize,
-    pub(crate) route_schema_version: String,
-    pub(crate) winner_admission_schema_version: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WinnerProviderPolicy {
-    pub(crate) only: String,
-}
-
-impl WinnerDeploymentAuthority {
-    pub(crate) fn validate(&self) -> Result<()> {
-        decode_lowercase_hex_32(&self.signing_public_key_hex, "route signing public key")?;
-        decode_lowercase_hex_32(
-            &self.provider_terms_sha256,
-            "authorized provider terms SHA-256",
-        )?;
-        validate_runtime_image_reference(&self.student_branch_runtime_image_reference)?;
-        decode_lowercase_hex_32(
-            &self.admission_program_sha256,
-            "authorized admission program SHA-256",
-        )?;
-        if self.schema_version != "milk.winner-deployment-authority.v3"
-            || self.provider_policy.only != WINNER_PROVIDER
-            || self.authorization_not_after.nanosecond() != 0
-            || !(60..=MAX_WINNER_DEPLOYMENT_WALL_SECONDS).contains(&self.max_wall_seconds)
-            || !(1..=MAX_WINNER_DEPLOYMENT_COST_MICROUSD).contains(&self.max_cost_microusd)
-            || self.signing_key_id.is_empty()
-            || self.signing_key_id.len() > MAX_KEY_ID_BYTES
-            || self.candidate_max_in_flight == 0
-            || self.canary_candidate_basis_points != WINNER_CANARY_BASIS_POINTS
-            || self.canary_valid_for_seconds != WINNER_CANARY_VALID_FOR_SECONDS
-            || self.max_input_utf8_bytes != CANDIDATE_MAX_INPUT_UTF8_BYTES
-            || self.max_input_messages != CANDIDATE_MAX_INPUT_MESSAGES
-            || self.max_input_request_bytes != CANDIDATE_MAX_INPUT_REQUEST_BYTES
-            || self.route_schema_version != ROUTE_SCHEMA_VERSION
-            || self.winner_admission_schema_version != WINNER_ADMISSION_SCHEMA_VERSION
-        {
-            bail!("winner deployment authority is invalid");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn provider_binding_sha256(&self) -> Result<[u8; 32]> {
-        self.validate()?;
-        let mut digest = Sha256::new();
-        digest.update(b"milk.winner-provider-binding.v1\0");
-        digest.update(serde_json::to_vec(self)?);
-        Ok(digest.finalize().into())
     }
 }
 
@@ -306,180 +149,6 @@ enum RouteCapability {
     Responses,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WinnerVariant {
-    Bf16,
-    DynamicFp8,
-    StaticFp8,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WinnerAdmissionReceipt {
-    pub(crate) schema_version: String,
-    pub(crate) provider: String,
-    pub(crate) student_job_id: String,
-    pub(crate) student_variant: WinnerVariant,
-    pub(crate) model_manifest_sha256: String,
-    pub(crate) model_alias: String,
-    pub(crate) model_alias_sha256: String,
-    pub(crate) candidate_api_key_sha256: String,
-    pub(crate) student_branch_runtime_image_reference: String,
-    pub(crate) admission_program_sha256: String,
-    pub(crate) execution_id: String,
-    pub(crate) execution_name: String,
-    pub(crate) api_base_url: String,
-    pub(crate) models_response_sha256: String,
-    pub(crate) chat_request_sha256: String,
-    pub(crate) chat_response_sha256: String,
-    pub(crate) launch_started_at: DateTime<Utc>,
-    pub(crate) ready_at: DateTime<Utc>,
-    pub(crate) admitted_at: DateTime<Utc>,
-    pub(crate) service_not_after: DateTime<Utc>,
-}
-
-impl WinnerAdmissionReceipt {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > MAX_WINNER_ADMISSION_BYTES {
-            bail!("winner admission exceeds {MAX_WINNER_ADMISSION_BYTES} bytes");
-        }
-        let body = bytes
-            .strip_suffix(b"\n")
-            .context("winner admission must be canonical compact JSON plus one LF")?;
-        let receipt: Self =
-            serde_json::from_slice(body).context("winner admission is not strict typed JSON")?;
-        if serde_json::to_vec(&receipt)? != body {
-            bail!("winner admission must be canonical compact JSON plus one LF");
-        }
-        Ok(receipt)
-    }
-
-    pub(crate) fn to_canonical_json_line(&self) -> Result<Vec<u8>> {
-        let mut bytes = serde_json::to_vec(self)?;
-        bytes.push(b'\n');
-        if bytes.len() > MAX_WINNER_ADMISSION_BYTES {
-            bail!("winner admission exceeds {MAX_WINNER_ADMISSION_BYTES} bytes");
-        }
-        Ok(bytes)
-    }
-
-    pub(crate) fn validate_for_authority(
-        &self,
-        authority: &WinnerDeploymentAuthority,
-    ) -> Result<Url> {
-        authority.validate()?;
-        if self.schema_version != WINNER_ADMISSION_SCHEMA_VERSION {
-            bail!("winner admission receipt has an unsupported schema version");
-        }
-        if !valid_provider(&self.provider) || self.provider != authority.provider_policy.only {
-            bail!("winner admission provider is not authorized");
-        }
-        if !valid_model_alias(&self.model_alias) {
-            bail!("winner admission model alias is invalid");
-        }
-        for (value, name) in [
-            (&self.student_job_id, "winner admission student job ID"),
-            (
-                &self.model_manifest_sha256,
-                "winner admission model manifest SHA-256",
-            ),
-            (
-                &self.model_alias_sha256,
-                "winner admission model alias SHA-256",
-            ),
-            (
-                &self.candidate_api_key_sha256,
-                "winner admission candidate API key SHA-256",
-            ),
-            (
-                &self.admission_program_sha256,
-                "winner admission program SHA-256",
-            ),
-            (
-                &self.models_response_sha256,
-                "winner admission models response SHA-256",
-            ),
-            (
-                &self.chat_request_sha256,
-                "winner admission chat request SHA-256",
-            ),
-            (
-                &self.chat_response_sha256,
-                "winner admission chat response SHA-256",
-            ),
-        ] {
-            decode_lowercase_hex_32(value, name)?;
-        }
-        let model_alias_sha256: [u8; 32] = Sha256::digest(self.model_alias.as_bytes()).into();
-        if self.model_alias_sha256 != hex_digest(&model_alias_sha256) {
-            bail!("winner admission model alias digest differs");
-        }
-        validate_runtime_image_reference(&self.student_branch_runtime_image_reference)?;
-        if self.student_branch_runtime_image_reference
-            != authority.student_branch_runtime_image_reference
-        {
-            bail!("winner admission runtime image is not authorized");
-        }
-        if self.admission_program_sha256 != authority.admission_program_sha256 {
-            bail!("winner admission program is not authorized");
-        }
-        if !valid_bounded_ascii(&self.execution_id, MAX_EXECUTION_ID_BYTES)
-            || !valid_bounded_ascii(&self.execution_name, MAX_EXECUTION_ID_BYTES)
-        {
-            bail!("winner admission execution identity is invalid");
-        }
-        let maximum_interval = TimeDelta::seconds(
-            i64::try_from(authority.max_wall_seconds)
-                .context("winner deployment wall authority is out of range")?,
-        );
-        if self.launch_started_at > self.ready_at
-            || self.ready_at > self.admitted_at
-            || self.admitted_at >= self.service_not_after
-            || self.service_not_after > authority.authorization_not_after
-            || self.admitted_at - self.launch_started_at > maximum_interval
-            || self.service_not_after - self.admitted_at
-                < TimeDelta::seconds(i64::from(WINNER_ROUTE_RUNWAY_SECONDS))
-        {
-            bail!("winner admission service interval is invalid");
-        }
-        validate_candidate_api_base_url(&self.api_base_url, authority.allow_private_candidate_http)
-    }
-
-    pub(crate) fn deployment_sha256(&self) -> Result<[u8; 32]> {
-        let mut deployment = Sha256::new();
-        deployment.update(b"milk.student-deployment.v2\0");
-        deployment.update(serde_json::to_vec(self)?);
-        Ok(deployment.finalize().into())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RouteManifest {
-    schema_version: String,
-    scope: RouteScope,
-    cohort_sha256: String,
-    student_job_id: String,
-    student_result_sha256: String,
-    model_manifest_sha256: String,
-    dev_receipt_sha256: String,
-    winner_admission: WinnerAdmissionReceipt,
-    winner_provider_binding_sha256: String,
-    provider_terms_sha256: String,
-    candidate_basis_points: u16,
-    previous_route_revision: Option<String>,
-    route_secret_sha256: String,
-    supported_capabilities: Vec<RouteCapability>,
-    reasoning_effort: Option<CandidateReasoningEffort>,
-    max_input_utf8_bytes: usize,
-    max_input_messages: usize,
-    max_input_request_bytes: usize,
-    not_before: DateTime<Utc>,
-    not_after: DateTime<Utc>,
-    signing_key_id: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorRouteCandidate {
@@ -512,10 +181,6 @@ pub(crate) struct HarnessTeacherBinding {
     pub(crate) timeout_seconds: u64,
     pub(crate) max_input_tokens: u64,
     pub(crate) max_output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) input_rate_microusd_per_million: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) output_rate_microusd_per_million: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -523,10 +188,6 @@ pub(crate) struct HarnessTeacherBinding {
 pub(crate) struct HarnessScoreTargetBinding {
     pub(crate) api_url: String,
     pub(crate) model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) input_rate_microusd_per_million: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) output_rate_microusd_per_million: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -546,20 +207,9 @@ pub(crate) struct HarnessCandidateScoreBinding {
     pub(crate) minimum_reference_pass_delta_basis_points: i16,
     pub(crate) maximum_candidate_error_basis_points: u16,
     pub(crate) maximum_candidate_p95_latency_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) minimum_fallback_reference_pass_basis_points: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) maximum_fallback_error_basis_points: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) maximum_fallback_p95_latency_ms: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct HarnessBudgetBinding {
-    pub(crate) starting_spend_microusd: u64,
-    pub(crate) stop_new_spend_microusd: u64,
-    pub(crate) absolute_spend_microusd: u64,
+    pub(crate) minimum_fallback_reference_pass_basis_points: u16,
+    pub(crate) maximum_fallback_error_basis_points: u16,
+    pub(crate) maximum_fallback_p95_latency_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -596,13 +246,9 @@ pub(crate) struct OperatorRouteProvenance {
     pub(crate) prompt_sha256s: HarnessPromptDigests,
     pub(crate) teacher: HarnessTeacherBinding,
     pub(crate) candidate_score: HarnessCandidateScoreBinding,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) budget: Option<HarnessBudgetBinding>,
     pub(crate) job_ids: HarnessJobIds,
     pub(crate) teacher_result_sha256s: HarnessTeacherResultDigests,
     pub(crate) provider_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) accounted_cost_microusd: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -626,20 +272,13 @@ pub(crate) struct OperatorRouteProposal {
     pub(crate) provenance: OperatorRouteProvenance,
 }
 
-impl OperatorRouteProposal {
-    pub(crate) fn uses_budget_free_contract(&self) -> bool {
-        self.schema_version == OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorRouteManifest {
     schema_version: String,
     scope: RouteScope,
     proposal_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    profile: Option<HarnessProfile>,
+    profile: HarnessProfile,
     candidate: Option<OperatorRouteCandidate>,
     candidate_basis_points: u16,
     previous_route_revision: Option<String>,
@@ -671,23 +310,6 @@ struct RuntimeRouteManifest {
     not_after: DateTime<Utc>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoutePublicationSource {
-    StudentWinner,
-    OperatorProposal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VerifiedRouteWinner {
-    pub(crate) student_job_id: [u8; 32],
-    pub(crate) student_result_sha256: [u8; 32],
-    pub(crate) model_manifest_sha256: [u8; 32],
-    pub(crate) dev_receipt_sha256: [u8; 32],
-    pub(crate) cohort_sha256: [u8; 32],
-    pub(crate) student_variant: WinnerVariant,
-    pub(crate) student_branch_runtime_image_reference: String,
-}
-
 struct ParsedRouteManifest {
     manifest: RuntimeRouteManifest,
     endpoint: Option<Url>,
@@ -699,28 +321,13 @@ struct ParsedRouteManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RoutePublication {
-    pub(crate) source: RoutePublicationSource,
     pub(crate) has_candidate: bool,
     pub(crate) revision: [u8; 32],
     pub(crate) cohort_sha256: [u8; 32],
-    pub(crate) student_job_id: [u8; 32],
-    pub(crate) student_result_sha256: [u8; 32],
-    pub(crate) model_manifest_sha256: [u8; 32],
-    pub(crate) dev_receipt_sha256: [u8; 32],
-    pub(crate) deployment_sha256: [u8; 32],
-    pub(crate) winner_provider_binding_sha256: [u8; 32],
-    pub(crate) student_variant: WinnerVariant,
-    pub(crate) student_branch_runtime_image_reference: String,
-    pub(crate) provider_terms_sha256: [u8; 32],
-    pub(crate) candidate_api_base_url: String,
-    pub(crate) logical_model_alias: String,
+    pub(crate) proposal_sha256: [u8; 32],
+    pub(crate) candidate_api_key_sha256: Option<[u8; 32]>,
     pub(crate) candidate_basis_points: u16,
-    pub(crate) reasoning_effort: Option<CandidateReasoningEffort>,
     pub(crate) previous_route_revision: Option<[u8; 32]>,
-    pub(crate) route_secret_sha256: [u8; 32],
-    pub(crate) max_input_utf8_bytes: usize,
-    pub(crate) max_input_messages: usize,
-    pub(crate) max_input_request_bytes: usize,
     pub(crate) not_after: DateTime<Utc>,
 }
 
@@ -772,22 +379,6 @@ impl RoutePublication {
             publication,
             ..
         } = parse_manifest(config, expected_scope, manifest_bytes)?;
-        if now.is_some()
-            && matches!(publication.source, RoutePublicationSource::StudentWinner)
-            && publication.candidate_basis_points > 0
-        {
-            bail!("legacy student winner candidate routes are read-only");
-        }
-        if now.is_some()
-            && publication.is_operator_proposal()
-            && publication.candidate_basis_points > 0
-        {
-            let operator: OperatorRouteManifest = serde_json::from_slice(manifest_bytes)
-                .context("operator route manifest is not strict typed JSON")?;
-            if operator.profile != Some(HarnessProfile::Production) {
-                bail!("legacy or non-production operator candidate routes are read-only");
-            }
-        }
         if let Some(now) = now
             && (manifest.not_after <= now
                 || manifest.not_after > now + chrono::TimeDelta::hours(MAX_ROUTE_VALIDITY_HOURS)
@@ -805,79 +396,9 @@ impl RoutePublication {
         hex_digest(&self.revision)
     }
 
-    pub(crate) const fn is_operator_proposal(&self) -> bool {
-        matches!(self.source, RoutePublicationSource::OperatorProposal)
+    pub(crate) const fn operator_proposal_sha256(&self) -> [u8; 32] {
+        self.proposal_sha256
     }
-
-    pub(crate) fn operator_proposal_sha256(&self) -> Option<[u8; 32]> {
-        self.is_operator_proposal()
-            .then_some(self.student_result_sha256)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_route_manifest(
-    config: &RouteStartupConfig,
-    scope: &RouteScope,
-    winner: &VerifiedRouteWinner,
-    winner_admission_bytes: &[u8],
-    route_secret_hex: &str,
-    candidate_basis_points: u16,
-    reasoning_effort: Option<CandidateReasoningEffort>,
-    previous: Option<&RoutePublication>,
-    now: DateTime<Utc>,
-    valid_for_seconds: u32,
-) -> Result<(Vec<u8>, RoutePublication)> {
-    if !(60..=u32::try_from(MAX_ROUTE_VALIDITY_HOURS * 60 * 60)?).contains(&valid_for_seconds) {
-        bail!("route validity must be in 60..=86400 seconds");
-    }
-    let winner_admission = WinnerAdmissionReceipt::parse(winner_admission_bytes)?;
-    if winner_admission.student_job_id != hex_digest(&winner.student_job_id)
-        || winner_admission.model_manifest_sha256 != hex_digest(&winner.model_manifest_sha256)
-        || winner_admission.student_variant != winner.student_variant
-        || winner_admission.student_branch_runtime_image_reference
-            != winner.student_branch_runtime_image_reference
-    {
-        bail!("winner admission differs from the verified stored winner");
-    }
-    let route_secret = decode_lowercase_hex_32(route_secret_hex, "route secret")?;
-    let route_secret_sha256: [u8; 32] = Sha256::digest(route_secret).into();
-    let not_before = now
-        .with_nanosecond(0)
-        .context("route preparation time is outside the supported range")?
-        .max(winner_admission.admitted_at);
-    let not_after = not_before
-        .checked_add_signed(TimeDelta::seconds(i64::from(valid_for_seconds)))
-        .context("route validity overflow")?;
-    if not_after > winner_admission.service_not_after {
-        bail!("requested route validity exceeds the admitted winner service interval");
-    }
-    let winner_authority = config.winner_deployment_authority()?;
-    let manifest = serde_json::to_vec(&RouteManifest {
-        schema_version: ROUTE_SCHEMA_VERSION.to_owned(),
-        scope: scope.clone(),
-        cohort_sha256: hex_digest(&winner.cohort_sha256),
-        student_job_id: hex_digest(&winner.student_job_id),
-        student_result_sha256: hex_digest(&winner.student_result_sha256),
-        model_manifest_sha256: hex_digest(&winner.model_manifest_sha256),
-        dev_receipt_sha256: hex_digest(&winner.dev_receipt_sha256),
-        winner_admission,
-        winner_provider_binding_sha256: hex_digest(&winner_authority.provider_binding_sha256()?),
-        provider_terms_sha256: winner_authority.provider_terms_sha256,
-        candidate_basis_points,
-        previous_route_revision: previous.map(RoutePublication::revision_hex),
-        route_secret_sha256: hex_digest(&route_secret_sha256),
-        supported_capabilities: vec![RouteCapability::Stream],
-        reasoning_effort,
-        max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
-        max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
-        max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
-        not_before,
-        not_after,
-        signing_key_id: config.signing_key_id.clone(),
-    })?;
-    let publication = RoutePublication::parse_for_publication(config, scope, &manifest, None, now)?;
-    Ok((manifest, publication))
 }
 
 pub(crate) fn prepare_operator_route_manifest(
@@ -932,17 +453,13 @@ fn prepare_operator_route_manifest_inner(
     zero: bool,
 ) -> Result<(Vec<u8>, RoutePublication)> {
     let proposal = parse_operator_route_proposal(config, scope, proposal_bytes)?;
-    if !zero && !proposal.uses_budget_free_contract() {
-        bail!("legacy operator proposals are read-only except for zero-route rollback");
-    }
     let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
     if zero {
         let previous = previous.context("operator zero route requires a live predecessor")?;
         if proposal.candidate_basis_points == 0
-            || !previous.is_operator_proposal()
             || !previous.has_candidate
             || previous.candidate_basis_points == 0
-            || previous.student_result_sha256 != proposal_sha256
+            || previous.proposal_sha256 != proposal_sha256
         {
             bail!("operator zero route requires the live candidate route for this exact proposal");
         }
@@ -984,9 +501,9 @@ fn prepare_operator_route_manifest_inner(
         None
     };
     let valid_for_seconds = if candidate.is_some() {
-        WINNER_CANARY_VALID_FOR_SECONDS
+        OPERATOR_CANDIDATE_VALID_FOR_SECONDS
     } else {
-        WINNER_ZERO_VALID_FOR_SECONDS
+        OPERATOR_ZERO_VALID_FOR_SECONDS
     };
     let not_before = now
         .with_nanosecond(0)
@@ -998,7 +515,7 @@ fn prepare_operator_route_manifest_inner(
         schema_version: OPERATOR_ROUTE_SCHEMA_VERSION.to_owned(),
         scope: scope.clone(),
         proposal_sha256: hex_digest(&proposal_sha256),
-        profile: Some(proposal.profile),
+        profile: proposal.profile,
         candidate,
         candidate_basis_points,
         previous_route_revision: previous.map(RoutePublication::revision_hex),
@@ -1026,13 +543,9 @@ pub(crate) fn parse_operator_route_proposal(
     if canonical_proposal != proposal_bytes {
         bail!("route proposal must be canonical key-sorted compact JSON plus one LF");
     }
-    if !matches!(
-        proposal.schema_version.as_str(),
-        OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION | LEGACY_OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION
-    ) {
+    if proposal.schema_version != OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION {
         bail!("route proposal has an unsupported schema version");
     }
-    let budget_free = proposal.uses_budget_free_contract();
     if proposal.scope_id != scope.scope_id {
         bail!("route proposal scope does not match startup configuration");
     }
@@ -1087,18 +600,13 @@ pub(crate) fn parse_operator_route_proposal(
     ] {
         decode_lowercase_hex_32(value, description)?;
     }
-    if budget_free && proposal.profile != HarnessProfile::Production {
-        bail!("budget-free candidate proposals require production-qualified evidence");
+    if proposal.profile != HarnessProfile::Production {
+        bail!("candidate proposals require production-qualified evidence");
     }
     if !valid_harness_identifier(&proposal.series_id)
         || !valid_harness_identifier(&proposal.candidate_id)
         || !valid_model_alias(&proposal.model)
-        || proposal.code_version
-            != if budget_free {
-                HARNESS_CODE_VERSION
-            } else {
-                LEGACY_HARNESS_CODE_VERSION
-            }
+        || proposal.code_version != HARNESS_CODE_VERSION
         || proposal.provenance.taxonomy_version != HARNESS_TAXONOMY_VERSION
         || proposal.provenance.harness_revision.len() != 40
         || !proposal
@@ -1108,78 +616,6 @@ pub(crate) fn parse_operator_route_proposal(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         bail!("route proposal harness identity is invalid");
-    }
-    let monetary_fields = [
-        proposal.provenance.teacher.input_rate_microusd_per_million,
-        proposal.provenance.teacher.output_rate_microusd_per_million,
-        proposal
-            .provenance
-            .candidate_score
-            .incumbent
-            .input_rate_microusd_per_million,
-        proposal
-            .provenance
-            .candidate_score
-            .incumbent
-            .output_rate_microusd_per_million,
-        proposal
-            .provenance
-            .candidate_score
-            .candidate
-            .input_rate_microusd_per_million,
-        proposal
-            .provenance
-            .candidate_score
-            .candidate
-            .output_rate_microusd_per_million,
-    ];
-    let fallback_fields = [
-        proposal
-            .provenance
-            .candidate_score
-            .minimum_fallback_reference_pass_basis_points
-            .map(u64::from),
-        proposal
-            .provenance
-            .candidate_score
-            .maximum_fallback_error_basis_points
-            .map(u64::from),
-        proposal
-            .provenance
-            .candidate_score
-            .maximum_fallback_p95_latency_ms,
-    ];
-    if budget_free {
-        if monetary_fields.iter().any(Option::is_some)
-            || proposal.provenance.budget.is_some()
-            || proposal.provenance.accounted_cost_microusd.is_some()
-            || fallback_fields.iter().any(Option::is_none)
-        {
-            bail!(
-                "budget-free route proposal contains legacy monetary fields or lacks fallback bounds"
-            );
-        }
-    } else {
-        let budget = proposal
-            .provenance
-            .budget
-            .context("legacy route proposal budget is missing")?;
-        let accounted_cost_microusd = proposal
-            .provenance
-            .accounted_cost_microusd
-            .context("legacy route proposal accounted cost is missing")?;
-        if monetary_fields.iter().any(Option::is_none)
-            || fallback_fields.iter().any(Option::is_some)
-            || budget.starting_spend_microusd > budget.stop_new_spend_microusd
-            || budget.stop_new_spend_microusd > budget.absolute_spend_microusd
-            || budget.absolute_spend_microusd > MAX_HARNESS_SPEND_MICROUSD
-            || accounted_cost_microusd
-                > budget
-                    .absolute_spend_microusd
-                    .saturating_sub(budget.starting_spend_microusd)
-        {
-            bail!("legacy route proposal budget is invalid");
-        }
     }
     validate_candidate_api_base_url(&proposal.api_base_url, config.allow_private_candidate_http)?;
     Ok(proposal)
@@ -1198,11 +634,8 @@ pub(crate) fn verify_operator_manifest_proposal_binding(
         bail!("route manifest is not canonical JSON");
     }
     validate_operator_manifest(config, scope, &manifest)?;
-    if manifest.profile != Some(proposal.profile) {
+    if manifest.profile != proposal.profile {
         bail!("signed route profile differs from its stored proposal");
-    }
-    if manifest.candidate.is_some() && !proposal.uses_budget_free_contract() {
-        bail!("legacy operator proposals cannot activate a new candidate route");
     }
     let proposal_sha256: [u8; 32] = Sha256::digest(proposal_bytes).into();
     if manifest.proposal_sha256 != hex_digest(&proposal_sha256) {
@@ -1221,7 +654,7 @@ pub(crate) fn verify_operator_manifest_proposal_binding(
         {
             bail!("signed candidate route differs from its stored proposal");
         }
-        WINNER_CANARY_VALID_FOR_SECONDS
+        OPERATOR_CANDIDATE_VALID_FOR_SECONDS
     } else {
         if proposal.candidate_basis_points == 0
             || manifest.candidate_basis_points != 0
@@ -1229,7 +662,7 @@ pub(crate) fn verify_operator_manifest_proposal_binding(
         {
             bail!("signed zero route differs from its candidate proposal lineage");
         }
-        WINNER_ZERO_VALID_FOR_SECONDS
+        OPERATOR_ZERO_VALID_FOR_SECONDS
     };
     if manifest.not_before.nanosecond() != 0
         || manifest.not_after.nanosecond() != 0
@@ -1237,182 +670,6 @@ pub(crate) fn verify_operator_manifest_proposal_binding(
             != TimeDelta::seconds(i64::from(expected_validity))
     {
         bail!("signed operator route validity differs from the bounded prepared route");
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub(crate) enum WinnerRoutePhase {
-    Canary,
-    Zero,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WinnerRouteAdvanceAction {
-    Prepare,
-    Observe,
-    Done,
-}
-
-#[derive(Debug)]
-pub(crate) struct WinnerRouteAdvance {
-    pub(crate) action: WinnerRouteAdvanceAction,
-    pub(crate) manifest: Option<Vec<u8>>,
-    pub(crate) publication: RoutePublication,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn advance_winner_route(
-    config: &RouteStartupConfig,
-    scope: &RouteScope,
-    winner: &VerifiedRouteWinner,
-    winner_admission_bytes: &[u8],
-    route_secret_hex: &str,
-    phase: WinnerRoutePhase,
-    live: Option<&RoutePublication>,
-    live_previous: Option<&RoutePublication>,
-    now: DateTime<Utc>,
-) -> Result<WinnerRouteAdvance> {
-    let Some(live) = live else {
-        if live_previous.is_some() {
-            bail!("live route predecessor exists without a live route");
-        }
-        if phase == WinnerRoutePhase::Zero {
-            bail!("zero route requires an exact live canary");
-        }
-        let (manifest, publication) = prepare_route_manifest(
-            config,
-            scope,
-            winner,
-            winner_admission_bytes,
-            route_secret_hex,
-            WINNER_CANARY_BASIS_POINTS,
-            None,
-            None,
-            now,
-            WINNER_CANARY_VALID_FOR_SECONDS,
-        )?;
-        return Ok(WinnerRouteAdvance {
-            action: WinnerRouteAdvanceAction::Prepare,
-            manifest: Some(manifest),
-            publication,
-        });
-    };
-
-    if live.student_job_id != winner.student_job_id {
-        bail!("live route belongs to a different student job");
-    }
-
-    match live.candidate_basis_points {
-        WINNER_CANARY_BASIS_POINTS => {
-            if live_previous.is_some() {
-                bail!("live canary unexpectedly has a predecessor");
-            }
-            require_exact_winner_route(
-                config,
-                scope,
-                winner,
-                winner_admission_bytes,
-                route_secret_hex,
-                live,
-                None,
-                WINNER_CANARY_BASIS_POINTS,
-                WINNER_CANARY_VALID_FOR_SECONDS,
-            )?;
-            if phase == WinnerRoutePhase::Canary {
-                return Ok(WinnerRouteAdvance {
-                    action: WinnerRouteAdvanceAction::Observe,
-                    manifest: None,
-                    publication: live.clone(),
-                });
-            }
-            let (manifest, publication) = prepare_route_manifest(
-                config,
-                scope,
-                winner,
-                winner_admission_bytes,
-                route_secret_hex,
-                0,
-                None,
-                Some(live),
-                now,
-                WINNER_ZERO_VALID_FOR_SECONDS,
-            )?;
-            Ok(WinnerRouteAdvance {
-                action: WinnerRouteAdvanceAction::Prepare,
-                manifest: Some(manifest),
-                publication,
-            })
-        }
-        0 => {
-            let previous = live_previous.context("live zero route is missing its canary")?;
-            if previous.student_job_id != winner.student_job_id {
-                bail!("live route predecessor belongs to a different student job");
-            }
-            require_exact_winner_route(
-                config,
-                scope,
-                winner,
-                winner_admission_bytes,
-                route_secret_hex,
-                previous,
-                None,
-                WINNER_CANARY_BASIS_POINTS,
-                WINNER_CANARY_VALID_FOR_SECONDS,
-            )?;
-            require_exact_winner_route(
-                config,
-                scope,
-                winner,
-                winner_admission_bytes,
-                route_secret_hex,
-                live,
-                Some(previous),
-                0,
-                WINNER_ZERO_VALID_FOR_SECONDS,
-            )?;
-            Ok(WinnerRouteAdvance {
-                action: WinnerRouteAdvanceAction::Done,
-                manifest: None,
-                publication: live.clone(),
-            })
-        }
-        _ => bail!("live route is not the exact winner canary or zero route"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn require_exact_winner_route(
-    config: &RouteStartupConfig,
-    scope: &RouteScope,
-    winner: &VerifiedRouteWinner,
-    winner_admission_bytes: &[u8],
-    route_secret_hex: &str,
-    actual: &RoutePublication,
-    previous: Option<&RoutePublication>,
-    candidate_basis_points: u16,
-    valid_for_seconds: u32,
-) -> Result<()> {
-    let prepared_at = actual
-        .not_after
-        .checked_sub_signed(TimeDelta::seconds(i64::from(valid_for_seconds)))
-        .context("live route validity start is outside the supported range")?;
-    let (_, expected) = prepare_route_manifest(
-        config,
-        scope,
-        winner,
-        winner_admission_bytes,
-        route_secret_hex,
-        candidate_basis_points,
-        None,
-        previous,
-        prepared_at,
-        valid_for_seconds,
-    )?;
-    if actual != &expected {
-        bail!("live route is not the exact winner canary or zero route");
     }
     Ok(())
 }
@@ -1595,13 +852,9 @@ impl RoutePolicy {
             cohort_sha256,
             deployment_sha256,
             revision,
-            publication,
+            publication: _,
         } = parse_manifest(config, expected_scope, manifest_bytes)?;
-        if publication.is_operator_proposal() {
-            config.validate_common(gateway_max_in_flight)?;
-        } else {
-            config.validate(gateway_max_in_flight)?;
-        }
+        config.validate_common(gateway_max_in_flight)?;
 
         let route_secret = route_secret_hex
             .map(|value| decode_lowercase_hex_32(value, "route secret"))
@@ -1645,7 +898,7 @@ impl RoutePolicy {
             .context("active route is missing its candidate")?;
         let expected_candidate_api_key_sha256 = decode_lowercase_hex_32(
             &candidate.candidate_api_key_sha256,
-            "winner admission candidate API key SHA-256",
+            "candidate API key SHA-256",
         )?;
         let observed_candidate_api_key_sha256: [u8; 32] =
             Sha256::digest(candidate_api_key.as_bytes()).into();
@@ -1916,109 +1169,7 @@ fn parse_manifest(
     if manifest_bytes.len() > MAX_ROUTE_MANIFEST_BYTES {
         bail!("route manifest exceeds {MAX_ROUTE_MANIFEST_BYTES} bytes");
     }
-    #[derive(Deserialize)]
-    struct ManifestSchema<'a> {
-        schema_version: &'a str,
-    }
-    let schema: ManifestSchema<'_> = serde_json::from_slice(manifest_bytes)
-        .context("route manifest is not strict typed JSON")?;
-    match schema.schema_version {
-        ROUTE_SCHEMA_VERSION => parse_student_manifest(config, expected_scope, manifest_bytes),
-        OPERATOR_ROUTE_SCHEMA_VERSION => {
-            parse_operator_manifest(config, expected_scope, manifest_bytes)
-        }
-        _ => bail!("route manifest has an unsupported schema version"),
-    }
-}
-
-fn parse_student_manifest(
-    config: &RouteStartupConfig,
-    expected_scope: &RouteScope,
-    manifest_bytes: &[u8],
-) -> Result<ParsedRouteManifest> {
-    let manifest: RouteManifest = serde_json::from_slice(manifest_bytes)
-        .context("student route manifest is not strict typed JSON")?;
-    if serde_json::to_vec(&manifest)? != manifest_bytes {
-        bail!("route manifest is not canonical JSON");
-    }
-    let (endpoint, cohort_sha256, deployment_sha256) =
-        validate_manifest(config, expected_scope, &manifest)?;
-    let revision = Sha256::digest(manifest_bytes).into();
-    let candidate_sha256 = decode_lowercase_hex_32(&manifest.student_job_id, "student job ID")?;
-    let artifact_sha256 =
-        decode_lowercase_hex_32(&manifest.model_manifest_sha256, "model manifest SHA-256")?;
-    let publication = RoutePublication {
-        source: RoutePublicationSource::StudentWinner,
-        has_candidate: true,
-        revision,
-        cohort_sha256,
-        student_job_id: candidate_sha256,
-        student_result_sha256: decode_lowercase_hex_32(
-            &manifest.student_result_sha256,
-            "student result SHA-256",
-        )?,
-        model_manifest_sha256: artifact_sha256,
-        dev_receipt_sha256: decode_lowercase_hex_32(
-            &manifest.dev_receipt_sha256,
-            "DEV receipt SHA-256",
-        )?,
-        deployment_sha256,
-        winner_provider_binding_sha256: decode_lowercase_hex_32(
-            &manifest.winner_provider_binding_sha256,
-            "winner provider binding SHA-256",
-        )?,
-        student_variant: manifest.winner_admission.student_variant,
-        student_branch_runtime_image_reference: manifest
-            .winner_admission
-            .student_branch_runtime_image_reference
-            .clone(),
-        provider_terms_sha256: decode_lowercase_hex_32(
-            &manifest.provider_terms_sha256,
-            "provider terms SHA-256",
-        )?,
-        candidate_api_base_url: manifest.winner_admission.api_base_url.clone(),
-        logical_model_alias: manifest.winner_admission.model_alias.clone(),
-        candidate_basis_points: manifest.candidate_basis_points,
-        reasoning_effort: manifest.reasoning_effort,
-        previous_route_revision: manifest
-            .previous_route_revision
-            .as_deref()
-            .map(|value| decode_lowercase_hex_32(value, "previous route revision"))
-            .transpose()?,
-        route_secret_sha256: decode_lowercase_hex_32(
-            &manifest.route_secret_sha256,
-            "route secret SHA-256",
-        )?,
-        max_input_utf8_bytes: manifest.max_input_utf8_bytes,
-        max_input_messages: manifest.max_input_messages,
-        max_input_request_bytes: manifest.max_input_request_bytes,
-        not_after: manifest.not_after,
-    };
-    let runtime = RuntimeRouteManifest {
-        candidate: Some(RuntimeRouteCandidate {
-            model: manifest.winner_admission.model_alias.clone(),
-            candidate_api_key_sha256: manifest.winner_admission.candidate_api_key_sha256.clone(),
-            supported_capabilities: manifest.supported_capabilities.clone(),
-            reasoning_effort: manifest.reasoning_effort,
-            max_input_utf8_bytes: manifest.max_input_utf8_bytes,
-            max_input_messages: manifest.max_input_messages,
-            max_input_request_bytes: manifest.max_input_request_bytes,
-            candidate_sha256: hex_digest(&candidate_sha256),
-            artifact_sha256: hex_digest(&artifact_sha256),
-        }),
-        candidate_basis_points: manifest.candidate_basis_points,
-        route_secret_sha256: Some(manifest.route_secret_sha256),
-        not_before: manifest.not_before,
-        not_after: manifest.not_after,
-    };
-    Ok(ParsedRouteManifest {
-        manifest: runtime,
-        endpoint: Some(endpoint),
-        cohort_sha256,
-        deployment_sha256,
-        revision,
-        publication,
-    })
+    parse_operator_manifest(config, expected_scope, manifest_bytes)
 }
 
 fn parse_operator_manifest(
@@ -2040,12 +1191,10 @@ fn parse_operator_manifest(
         .as_deref()
         .map(|value| decode_lowercase_hex_32(value, "previous route revision"))
         .transpose()?;
-    let route_secret_sha256 = manifest
-        .route_secret_sha256
-        .as_deref()
-        .map(|value| decode_lowercase_hex_32(value, "route secret SHA-256"))
-        .transpose()?;
-    let (candidate, candidate_sha256, artifact_sha256, deployment_sha256) =
+    if let Some(value) = manifest.route_secret_sha256.as_deref() {
+        decode_lowercase_hex_32(value, "route secret SHA-256")?;
+    }
+    let (candidate, candidate_sha256, deployment_sha256, candidate_api_key_sha256) =
         if let Some(candidate) = &manifest.candidate {
             let candidate_bytes = serde_json::to_vec(candidate)?;
             let candidate_sha256: [u8; 32] = Sha256::digest(&candidate_bytes).into();
@@ -2078,11 +1227,14 @@ fn parse_operator_manifest(
                     artifact_sha256: hex_digest(&artifact_sha256),
                 }),
                 candidate_sha256,
-                artifact_sha256,
                 deployment_sha256,
+                Some(decode_lowercase_hex_32(
+                    &candidate.candidate_api_key_sha256,
+                    "candidate API key SHA-256",
+                )?),
             )
         } else {
-            (None, [0; 32], [0; 32], [0; 32])
+            (None, [0; 32], [0; 32], None)
         };
     let cohort_sha256 = if candidate.is_some() {
         candidate_sha256
@@ -2090,48 +1242,13 @@ fn parse_operator_manifest(
         proposal_sha256
     };
     let publication = RoutePublication {
-        source: RoutePublicationSource::OperatorProposal,
         has_candidate: candidate.is_some(),
         revision,
         cohort_sha256,
-        student_job_id: candidate_sha256,
-        student_result_sha256: proposal_sha256,
-        model_manifest_sha256: artifact_sha256,
-        dev_receipt_sha256: [0; 32],
-        deployment_sha256,
-        winner_provider_binding_sha256: [0; 32],
-        student_variant: WinnerVariant::Bf16,
-        student_branch_runtime_image_reference: String::new(),
-        provider_terms_sha256: [0; 32],
-        candidate_api_base_url: manifest
-            .candidate
-            .as_ref()
-            .map(|value| value.api_base_url.clone())
-            .unwrap_or_default(),
-        logical_model_alias: manifest
-            .candidate
-            .as_ref()
-            .map(|value| value.model.clone())
-            .unwrap_or_default(),
+        proposal_sha256,
+        candidate_api_key_sha256,
         candidate_basis_points: manifest.candidate_basis_points,
-        reasoning_effort: manifest
-            .candidate
-            .as_ref()
-            .and_then(|value| value.reasoning_effort),
         previous_route_revision,
-        route_secret_sha256: route_secret_sha256.unwrap_or([0; 32]),
-        max_input_utf8_bytes: manifest
-            .candidate
-            .as_ref()
-            .map_or(0, |value| value.max_input_utf8_bytes),
-        max_input_messages: manifest
-            .candidate
-            .as_ref()
-            .map_or(0, |value| value.max_input_messages),
-        max_input_request_bytes: manifest
-            .candidate
-            .as_ref()
-            .map_or(0, |value| value.max_input_request_bytes),
         not_after: manifest.not_after,
     };
     Ok(ParsedRouteManifest {
@@ -2184,6 +1301,9 @@ fn validate_operator_manifest(
             Ok(None)
         }
         (Some(candidate), 1..=10_000) => {
+            if manifest.profile != HarnessProfile::Production {
+                bail!("candidate routes require production-qualified evidence");
+            }
             let route_secret = manifest
                 .route_secret_sha256
                 .as_deref()
@@ -2229,105 +1349,6 @@ fn validate_operator_candidate(
     validate_candidate_api_base_url(&candidate.api_base_url, config.allow_private_candidate_http)
 }
 
-fn validate_manifest(
-    config: &RouteStartupConfig,
-    expected_scope: &RouteScope,
-    manifest: &RouteManifest,
-) -> Result<(Url, [u8; 32], [u8; 32])> {
-    if manifest.schema_version != ROUTE_SCHEMA_VERSION {
-        bail!("route manifest has an unsupported schema version");
-    }
-    if &manifest.scope != expected_scope {
-        bail!("route manifest scope does not match startup configuration");
-    }
-    if config.signing_key_id.is_empty()
-        || config.signing_key_id.len() > MAX_KEY_ID_BYTES
-        || manifest.signing_key_id != config.signing_key_id
-    {
-        bail!("route manifest signing key ID does not match startup configuration");
-    }
-    if manifest.not_before >= manifest.not_after
-        || manifest.not_after - manifest.not_before
-            > chrono::TimeDelta::hours(MAX_ROUTE_VALIDITY_HOURS)
-    {
-        bail!("route manifest validity interval must be positive and no longer than 24 hours");
-    }
-    if manifest.candidate_basis_points > 10_000 {
-        bail!("candidate_basis_points cannot exceed 10000");
-    }
-    if manifest.candidate_basis_points == 0 && manifest.previous_route_revision.is_none() {
-        bail!("zero-basis-point route requires a previous route revision");
-    }
-    if manifest.supported_capabilities.len() > MAX_CAPABILITIES {
-        bail!("route manifest has too many supported capabilities");
-    }
-    if manifest.max_input_utf8_bytes != CANDIDATE_MAX_INPUT_UTF8_BYTES
-        || manifest.max_input_messages != CANDIDATE_MAX_INPUT_MESSAGES
-        || manifest.max_input_request_bytes != CANDIDATE_MAX_INPUT_REQUEST_BYTES
-    {
-        bail!("route manifest candidate input bounds are unsupported");
-    }
-    for (index, capability) in manifest.supported_capabilities.iter().enumerate() {
-        if manifest.supported_capabilities[..index].contains(capability) {
-            bail!("route manifest contains a duplicate capability");
-        }
-    }
-
-    let cohort_sha256 = decode_lowercase_hex_32(&manifest.cohort_sha256, "cohort SHA-256")?;
-    for (value, name) in [
-        (&manifest.student_job_id, "student job ID"),
-        (&manifest.student_result_sha256, "student result SHA-256"),
-        (&manifest.model_manifest_sha256, "model manifest SHA-256"),
-        (&manifest.dev_receipt_sha256, "DEV receipt SHA-256"),
-        (&manifest.provider_terms_sha256, "provider terms SHA-256"),
-        (
-            &manifest.winner_provider_binding_sha256,
-            "winner provider binding SHA-256",
-        ),
-        (&manifest.route_secret_sha256, "route secret SHA-256"),
-    ] {
-        decode_lowercase_hex_32(value, name)?;
-    }
-    if let Some(revision) = &manifest.previous_route_revision {
-        decode_lowercase_hex_32(revision, "previous route revision")?;
-    }
-    let winner_authority = config.winner_deployment_authority()?;
-    let authorized_terms = decode_lowercase_hex_32(
-        &winner_authority.provider_terms_sha256,
-        "authorized provider terms SHA-256",
-    )?;
-    let manifest_terms =
-        decode_lowercase_hex_32(&manifest.provider_terms_sha256, "provider terms SHA-256")?;
-    if authorized_terms != manifest_terms {
-        bail!("route manifest provider terms do not match startup authorization");
-    }
-    let authorized_winner_binding = winner_authority.provider_binding_sha256()?;
-    if manifest.winner_provider_binding_sha256 != hex_digest(&authorized_winner_binding) {
-        bail!("route manifest winner provider binding does not match startup authorization");
-    }
-
-    let (endpoint, deployment_sha256) = validate_winner_admission(config, manifest)?;
-    Ok((endpoint, cohort_sha256, deployment_sha256))
-}
-
-fn validate_winner_admission(
-    config: &RouteStartupConfig,
-    manifest: &RouteManifest,
-) -> Result<(Url, [u8; 32])> {
-    let receipt = &manifest.winner_admission;
-    let authority = config.winner_deployment_authority()?;
-    let endpoint = receipt.validate_for_authority(&authority)?;
-    if receipt.student_job_id != manifest.student_job_id
-        || receipt.model_manifest_sha256 != manifest.model_manifest_sha256
-    {
-        bail!("winner admission receipt differs from the routed student winner");
-    }
-    if manifest.not_before < receipt.admitted_at || manifest.not_after > receipt.service_not_after {
-        bail!("route validity exceeds the admitted winner service interval");
-    }
-    Ok((endpoint, receipt.deployment_sha256()?))
-}
-
 pub(crate) fn validate_runtime_image_reference(value: &str) -> Result<()> {
     runtime_image_digest(value)?;
     Ok(())
@@ -2355,17 +1376,6 @@ fn runtime_image_digest(value: &str) -> Result<&str> {
     }
     decode_lowercase_hex_32(digest, "runtime image digest")?;
     Ok(digest)
-}
-
-fn valid_provider(value: &str) -> bool {
-    (1..=MAX_PROVIDER_BYTES).contains(&value.len())
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_')
-        })
 }
 
 fn valid_model_alias(value: &str) -> bool {
@@ -2474,1669 +1484,4 @@ fn hex_digest(digest: &[u8; 32]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
-}
-
-#[cfg(test)]
-mod tests {
-    use ring::signature::{Ed25519KeyPair, KeyPair};
-
-    use super::*;
-
-    const SIGNING_SEED: [u8; 32] = [7; 32];
-    const ROUTE_SECRET: [u8; 32] = [9; 32];
-    const CANDIDATE_API_KEY: &str = "candidate-test-secret";
-    const ACTIVE_NOW: &str = "2026-08-25T12:00:00Z";
-    const ACTIVE_NOT_BEFORE: &str = "2026-08-25T00:00:00Z";
-    const ACTIVE_NOT_AFTER: &str = "2026-08-26T00:00:00Z";
-
-    struct Fixture {
-        config: RouteStartupConfig,
-        scope: RouteScope,
-        secret_hex: String,
-        manifest: Vec<u8>,
-        signature: Vec<u8>,
-    }
-
-    impl Fixture {
-        fn active(basis_points: u16, capabilities: &str) -> Self {
-            Self::new(
-                basis_points,
-                capabilities,
-                ACTIVE_NOT_BEFORE,
-                ACTIVE_NOT_AFTER,
-            )
-        }
-
-        fn new(basis_points: u16, capabilities: &str, not_before: &str, not_after: &str) -> Self {
-            let previous = repeated_digest(0x88);
-            Self::new_with_previous(
-                basis_points,
-                capabilities,
-                not_before,
-                not_after,
-                (basis_points == 0).then_some(previous.as_str()),
-            )
-        }
-
-        fn new_with_previous(
-            basis_points: u16,
-            capabilities: &str,
-            not_before: &str,
-            not_after: &str,
-            previous_revision: Option<&str>,
-        ) -> Self {
-            let scope = RouteScope {
-                scope_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
-            };
-            let secret_hex = hex_bytes(&ROUTE_SECRET);
-            let route_secret_sha256: [u8; 32] = Sha256::digest(ROUTE_SECRET).into();
-            let student_branch_runtime_image_reference = format!(
-                "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
-                repeated_digest(0x91)
-            );
-            let admission_program_sha256 = repeated_digest(0x92);
-            let not_before: DateTime<Utc> = not_before.parse().unwrap();
-            let not_after: DateTime<Utc> = not_after.parse().unwrap();
-            let key_pair = signing_key();
-            let config = RouteStartupConfig {
-                signing_public_key_hex: hex_bytes(key_pair.public_key().as_ref()),
-                signing_key_id: "route-key-v1".to_owned(),
-                allow_private_candidate_http: false,
-                authorized_provider_terms_sha256: Some(repeated_digest(0x66)),
-                authorized_student_branch_runtime_image_reference: Some(
-                    student_branch_runtime_image_reference.clone(),
-                ),
-                authorized_admission_program_sha256: Some(admission_program_sha256.clone()),
-                winner_authorization_not_after: Some(not_after),
-                winner_max_wall_seconds: Some(MAX_WINNER_DEPLOYMENT_WALL_SECONDS),
-                winner_max_cost_microusd: Some(MAX_WINNER_DEPLOYMENT_COST_MICROUSD),
-                candidate_max_in_flight: 2,
-            };
-            let manifest = serde_json::to_vec(&RouteManifest {
-                schema_version: ROUTE_SCHEMA_VERSION.to_owned(),
-                scope: scope.clone(),
-                cohort_sha256: repeated_digest(0x22),
-                student_job_id: repeated_digest(0x33),
-                student_result_sha256: repeated_digest(0x88),
-                model_manifest_sha256: repeated_digest(0x44),
-                dev_receipt_sha256: repeated_digest(0x77),
-                winner_admission: WinnerAdmissionReceipt {
-                    schema_version: WINNER_ADMISSION_SCHEMA_VERSION.to_owned(),
-                    provider: WINNER_PROVIDER.to_owned(),
-                    student_job_id: repeated_digest(0x33),
-                    student_variant: WinnerVariant::StaticFp8,
-                    model_manifest_sha256: repeated_digest(0x44),
-                    model_alias: "customer-model".to_owned(),
-                    model_alias_sha256: hex_digest(&Sha256::digest(b"customer-model").into()),
-                    candidate_api_key_sha256: hex_digest(
-                        &Sha256::digest(b"candidate-test-secret").into(),
-                    ),
-                    student_branch_runtime_image_reference: student_branch_runtime_image_reference
-                        .clone(),
-                    admission_program_sha256: admission_program_sha256.clone(),
-                    execution_id: "sb-0123456789".to_owned(),
-                    execution_name: "winner-test".to_owned(),
-                    api_base_url: "https://candidate.example/v1/".to_owned(),
-                    models_response_sha256: repeated_digest(0x93),
-                    chat_request_sha256: repeated_digest(0x94),
-                    chat_response_sha256: repeated_digest(0x95),
-                    launch_started_at: not_before,
-                    ready_at: not_before,
-                    admitted_at: not_before,
-                    service_not_after: not_after,
-                },
-                winner_provider_binding_sha256: hex_digest(
-                    &config
-                        .winner_deployment_authority()
-                        .unwrap()
-                        .provider_binding_sha256()
-                        .unwrap(),
-                ),
-                provider_terms_sha256: repeated_digest(0x66),
-                candidate_basis_points: basis_points,
-                previous_route_revision: previous_revision.map(str::to_owned),
-                route_secret_sha256: hex_digest(&route_secret_sha256),
-                supported_capabilities: serde_json::from_str(capabilities).unwrap(),
-                reasoning_effort: None,
-                max_input_utf8_bytes: CANDIDATE_MAX_INPUT_UTF8_BYTES,
-                max_input_messages: CANDIDATE_MAX_INPUT_MESSAGES,
-                max_input_request_bytes: CANDIDATE_MAX_INPUT_REQUEST_BYTES,
-                not_before,
-                not_after,
-                signing_key_id: "route-key-v1".to_owned(),
-            })
-            .unwrap();
-            let signature = key_pair.sign(&manifest).as_ref().to_vec();
-            Self {
-                config,
-                scope,
-                secret_hex,
-                manifest,
-                signature,
-            }
-        }
-
-        fn policy(&self) -> RoutePolicy {
-            self.policy_with(Some(&self.secret_hex), Some(CANDIDATE_API_KEY))
-        }
-
-        fn policy_with(
-            &self,
-            secret: Option<&str>,
-            candidate_api_key: Option<&str>,
-        ) -> RoutePolicy {
-            RoutePolicy::from_signed_bytes(
-                &self.config,
-                &self.scope,
-                secret,
-                candidate_api_key,
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &self.manifest,
-                &self.signature,
-            )
-            .unwrap()
-        }
-    }
-
-    fn verified_winner(fixture: &Fixture) -> (VerifiedRouteWinner, Vec<u8>) {
-        let source: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-        let admission = source.winner_admission.to_canonical_json_line().unwrap();
-        let winner = VerifiedRouteWinner {
-            student_job_id: decode_lowercase_hex_32(&source.student_job_id, "student").unwrap(),
-            student_result_sha256: decode_lowercase_hex_32(&source.student_result_sha256, "result")
-                .unwrap(),
-            model_manifest_sha256: decode_lowercase_hex_32(&source.model_manifest_sha256, "model")
-                .unwrap(),
-            dev_receipt_sha256: decode_lowercase_hex_32(&source.dev_receipt_sha256, "DEV").unwrap(),
-            cohort_sha256: decode_lowercase_hex_32(&source.cohort_sha256, "cohort").unwrap(),
-            student_variant: source.winner_admission.student_variant,
-            student_branch_runtime_image_reference: source
-                .winner_admission
-                .student_branch_runtime_image_reference,
-        };
-        (winner, admission)
-    }
-
-    fn operator_proposal(scope: &RouteScope, eval_sha256: &str, basis_points: u16) -> Vec<u8> {
-        let proposal = OperatorRouteProposal {
-            schema_version: OPERATOR_ROUTE_PROPOSAL_SCHEMA_VERSION.to_owned(),
-            scope_id: scope.scope_id,
-            profile: HarnessProfile::Mechanics,
-            series_id: "mechanics-v1".to_owned(),
-            code_version: HARNESS_CODE_VERSION.to_owned(),
-            source_manifest_sha256: repeated_digest(0xb1),
-            summary_sha256: repeated_digest(0xb2),
-            readiness_sha256: repeated_digest(0xb3),
-            eval_sha256: eval_sha256.to_owned(),
-            eval_validation_sha256: repeated_digest(0xb4),
-            candidate_score_sha256: repeated_digest(0xb5),
-            candidate_id: "candidate-2026-08-29".to_owned(),
-            api_base_url: "https://candidate.example/v1/".to_owned(),
-            model: "customer-model".to_owned(),
-            candidate_basis_points: basis_points,
-            provenance: OperatorRouteProvenance {
-                harness_revision: "1".repeat(40),
-                config_sha256: repeated_digest(0xc1),
-                taxonomy_version: HARNESS_TAXONOMY_VERSION.to_owned(),
-                prompt_sha256s: HarnessPromptDigests {
-                    classifier: repeated_digest(0xc2),
-                    eval_generation: repeated_digest(0xc3),
-                    eval_validation: repeated_digest(0xc4),
-                },
-                teacher: HarnessTeacherBinding {
-                    api_url: "https://teacher.example/v1/responses".to_owned(),
-                    model: "teacher-model".to_owned(),
-                    reasoning_effort: "high".to_owned(),
-                    timeout_seconds: 60,
-                    max_input_tokens: 128,
-                    max_output_tokens: 64,
-                    input_rate_microusd_per_million: 1,
-                    output_rate_microusd_per_million: 1,
-                },
-                candidate_score: HarnessCandidateScoreBinding {
-                    incumbent: HarnessScoreTargetBinding {
-                        api_url: "https://incumbent.example/v1/chat/completions".to_owned(),
-                        model: "incumbent-model".to_owned(),
-                        input_rate_microusd_per_million: 1,
-                        output_rate_microusd_per_million: 1,
-                    },
-                    candidate: HarnessScoreTargetBinding {
-                        api_url: "https://candidate.example/v1/chat/completions".to_owned(),
-                        model: "customer-model".to_owned(),
-                        input_rate_microusd_per_million: 1,
-                        output_rate_microusd_per_million: 1,
-                    },
-                    held_out_cases: 1,
-                    timeout_seconds: 60,
-                    minimum_request_interval_ms: 1_000,
-                    max_calls_per_run: 2,
-                    max_input_tokens_per_call: 128,
-                    max_output_tokens_per_call: 16,
-                    max_total_tokens_per_run: 288,
-                    case_reference_similarity_basis_points: 9_000,
-                    minimum_candidate_reference_pass_basis_points: 9_000,
-                    minimum_reference_pass_delta_basis_points: 0,
-                    maximum_candidate_error_basis_points: 0,
-                    maximum_candidate_p95_latency_ms: 30_000,
-                },
-                budget: HarnessBudgetBinding {
-                    starting_spend_microusd: 0,
-                    stop_new_spend_microusd: MAX_HARNESS_SPEND_MICROUSD,
-                    absolute_spend_microusd: MAX_HARNESS_SPEND_MICROUSD,
-                },
-                job_ids: HarnessJobIds {
-                    classifier: repeated_digest(0xd1),
-                    eval_generation: repeated_digest(0xd2),
-                    eval_validation: repeated_digest(0xd3),
-                    candidate_score: repeated_digest(0xd4),
-                },
-                teacher_result_sha256s: HarnessTeacherResultDigests {
-                    classifier: repeated_digest(0xe1),
-                    eval_generation: repeated_digest(0xe2),
-                    eval_validation: repeated_digest(0xe3),
-                },
-                provider_tokens: 1,
-                accounted_cost_microusd: 1,
-            },
-        };
-        let mut bytes = serde_json::to_vec(&serde_json::to_value(proposal).unwrap()).unwrap();
-        bytes.push(b'\n');
-        bytes
-    }
-
-    #[test]
-    fn prepare_route_builds_verified_canary_and_exact_rollback() {
-        let fixture = Fixture::active(100, r#"["stream"]"#);
-        let (winner, admission) = verified_winner(&fixture);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let (canary_bytes, canary) = prepare_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            100,
-            None,
-            None,
-            now,
-            900,
-        )
-        .unwrap();
-        let canary_wire: RouteManifest = serde_json::from_slice(&canary_bytes).unwrap();
-        assert_eq!(serde_json::to_vec(&canary_wire).unwrap(), canary_bytes);
-        assert_eq!(canary.candidate_basis_points, 100);
-        assert_eq!(canary.previous_route_revision, None);
-        assert_eq!(canary.student_job_id, winner.student_job_id);
-        assert_eq!(canary.student_result_sha256, winner.student_result_sha256);
-        assert_eq!(canary.model_manifest_sha256, winner.model_manifest_sha256);
-        assert_eq!(canary.dev_receipt_sha256, winner.dev_receipt_sha256);
-        assert_eq!(canary.cohort_sha256, winner.cohort_sha256);
-        assert_eq!(canary.student_variant, winner.student_variant);
-        assert_eq!(
-            canary_wire.supported_capabilities,
-            [RouteCapability::Stream]
-        );
-        assert_eq!(
-            canary_wire.max_input_utf8_bytes,
-            CANDIDATE_MAX_INPUT_UTF8_BYTES
-        );
-        assert_eq!(canary_wire.max_input_messages, CANDIDATE_MAX_INPUT_MESSAGES);
-        assert_eq!(
-            canary_wire.max_input_request_bytes,
-            CANDIDATE_MAX_INPUT_REQUEST_BYTES
-        );
-        assert_eq!(canary_wire.not_before, now);
-        assert_eq!(canary_wire.not_after, now + TimeDelta::seconds(900));
-
-        let rollback_now = now + TimeDelta::seconds(60);
-        let (rollback_bytes, rollback) = prepare_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            0,
-            None,
-            Some(&canary),
-            rollback_now,
-            300,
-        )
-        .unwrap();
-        let rollback_wire: RouteManifest = serde_json::from_slice(&rollback_bytes).unwrap();
-        assert_eq!(rollback.candidate_basis_points, 0);
-        assert_eq!(rollback.previous_route_revision, Some(canary.revision));
-        assert_eq!(
-            rollback_wire.previous_route_revision,
-            Some(canary.revision_hex())
-        );
-        assert_eq!(rollback.deployment_sha256, canary.deployment_sha256);
-        assert_eq!(rollback.student_job_id, canary.student_job_id);
-        assert_eq!(rollback.student_result_sha256, canary.student_result_sha256);
-        assert_eq!(rollback.model_manifest_sha256, canary.model_manifest_sha256);
-        assert_eq!(rollback.dev_receipt_sha256, canary.dev_receipt_sha256);
-        assert_eq!(rollback.cohort_sha256, canary.cohort_sha256);
-        assert_eq!(rollback.route_secret_sha256, canary.route_secret_sha256);
-
-        assert!(
-            prepare_route_manifest(
-                &fixture.config,
-                &fixture.scope,
-                &winner,
-                admission.strip_suffix(b"\n").unwrap(),
-                &fixture.secret_hex,
-                100,
-                None,
-                None,
-                now,
-                900,
-            )
-            .is_err()
-        );
-        assert!(
-            prepare_route_manifest(
-                &fixture.config,
-                &fixture.scope,
-                &winner,
-                &admission,
-                &fixture.secret_hex,
-                0,
-                None,
-                None,
-                now,
-                900,
-            )
-            .is_err()
-        );
-        let mut wrong_runtime_winner = winner.clone();
-        wrong_runtime_winner.student_branch_runtime_image_reference = format!(
-            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
-            "a".repeat(64)
-        );
-        assert!(
-            prepare_route_manifest(
-                &fixture.config,
-                &fixture.scope,
-                &wrong_runtime_winner,
-                &admission,
-                &fixture.secret_hex,
-                100,
-                None,
-                None,
-                now,
-                900,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn unsigned_harness_proposal_routes_chat_and_keeps_responses_on_baseline() {
-        let fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let generic_config: RouteStartupConfig = serde_json::from_value(serde_json::json!({
-            "allow_private_candidate_http": fixture.config.allow_private_candidate_http,
-            "candidate_max_in_flight": fixture.config.candidate_max_in_flight,
-            "signing_key_id": fixture.config.signing_key_id.clone(),
-            "signing_public_key_hex": fixture.config.signing_public_key_hex.clone(),
-        }))
-        .unwrap();
-        generic_config.validate_common(8).unwrap();
-        assert!(generic_config.winner_deployment_authority().is_err());
-        let proposal = operator_proposal(&fixture.scope, &repeated_digest(0xa1), 1_000);
-        let (manifest_bytes, publication) = prepare_operator_route_manifest(
-            &generic_config,
-            &fixture.scope,
-            &proposal,
-            Some(&fixture.secret_hex),
-            Some(CANDIDATE_API_KEY),
-            None,
-            now,
-        )
-        .unwrap();
-        assert!(publication.is_operator_proposal());
-        assert!(publication.has_candidate);
-
-        let mut missing_lf = proposal.clone();
-        assert_eq!(missing_lf.pop(), Some(b'\n'));
-        assert!(
-            prepare_operator_route_manifest(
-                &generic_config,
-                &fixture.scope,
-                &missing_lf,
-                Some(&fixture.secret_hex),
-                Some(CANDIDATE_API_KEY),
-                None,
-                now,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("canonical key-sorted compact JSON plus one LF")
-        );
-        let unknown_field = String::from_utf8(proposal.clone())
-            .unwrap()
-            .replace("}\n", ",\"signature\":null}\n")
-            .into_bytes();
-        assert!(
-            prepare_operator_route_manifest(
-                &generic_config,
-                &fixture.scope,
-                &unknown_field,
-                Some(&fixture.secret_hex),
-                Some(CANDIDATE_API_KEY),
-                None,
-                now,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("strict typed JSON")
-        );
-        let manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert_eq!(manifest.schema_version, OPERATOR_ROUTE_SCHEMA_VERSION);
-        assert_eq!(manifest.previous_route_revision, None);
-        assert_eq!(
-            manifest.candidate.as_ref().unwrap().supported_capabilities,
-            [RouteCapability::Stream]
-        );
-        verify_operator_manifest_proposal_binding(
-            &generic_config,
-            &fixture.scope,
-            &manifest_bytes,
-            &proposal,
-        )
-        .unwrap();
-
-        let mut mismatched = manifest.clone();
-        mismatched.candidate.as_mut().unwrap().model = "other-model".to_owned();
-        assert!(
-            verify_operator_manifest_proposal_binding(
-                &generic_config,
-                &fixture.scope,
-                &serde_json::to_vec(&mismatched).unwrap(),
-                &proposal,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("differs from its stored proposal")
-        );
-
-        let mut extended = manifest.clone();
-        extended.candidate.as_mut().unwrap().supported_capabilities =
-            vec![RouteCapability::Stream, RouteCapability::Responses];
-        assert!(
-            verify_operator_manifest_proposal_binding(
-                &generic_config,
-                &fixture.scope,
-                &serde_json::to_vec(&extended).unwrap(),
-                &proposal,
-            )
-            .is_err()
-        );
-
-        let mut long_lived = manifest.clone();
-        long_lived.not_after += TimeDelta::seconds(1);
-        assert!(
-            verify_operator_manifest_proposal_binding(
-                &generic_config,
-                &fixture.scope,
-                &serde_json::to_vec(&long_lived).unwrap(),
-                &proposal,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("validity differs")
-        );
-
-        let signature = signing_key().sign(&manifest_bytes);
-        let policy = RoutePolicy::from_signed_bytes(
-            &generic_config,
-            &fixture.scope,
-            Some(&fixture.secret_hex),
-            Some(CANDIDATE_API_KEY),
-            8,
-            now,
-            Instant::now(),
-            &manifest_bytes,
-            signature.as_ref(),
-        )
-        .unwrap();
-        let chat = br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}]}"#;
-        assert!((0_u64..100).any(|cohort| {
-            policy
-                .decide(&request(chat, &cohort.to_be_bytes()), Instant::now())
-                .target
-                == RouteTarget::Candidate
-        }));
-        let responses = br#"{"model":"customer-model","input":"hi"}"#;
-        assert_eq!(
-            policy
-                .decide(&responses_request(responses, b"session"), Instant::now())
-                .target,
-            RouteTarget::Baseline
-        );
-    }
-
-    #[test]
-    fn unsigned_harness_zero_proposal_emits_signed_baseline_without_candidate() {
-        let fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let proposal = operator_proposal(&fixture.scope, &repeated_digest(0xa2), 0);
-        let (manifest_bytes, publication) = prepare_operator_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &proposal,
-            None,
-            None,
-            None,
-            now,
-        )
-        .unwrap();
-        assert!(publication.is_operator_proposal());
-        assert!(!publication.has_candidate);
-        assert_eq!(publication.candidate_basis_points, 0);
-        let manifest: OperatorRouteManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(manifest.candidate.is_none());
-        assert!(manifest.route_secret_sha256.is_none());
-        assert!(manifest.previous_route_revision.is_none());
-
-        let signature = signing_key().sign(&manifest_bytes);
-        let policy = RoutePolicy::from_signed_bytes(
-            &fixture.config,
-            &fixture.scope,
-            None,
-            None,
-            8,
-            now,
-            Instant::now(),
-            &manifest_bytes,
-            signature.as_ref(),
-        )
-        .unwrap();
-        assert_baseline(
-            policy.decide(
-                &request(br#"{"model":"customer-model","messages":[]}"#, b"session"),
-                Instant::now(),
-            ),
-            BaselineReason::PolicyZero,
-        );
-    }
-
-    #[test]
-    fn operator_zero_route_requires_the_live_candidate_for_the_exact_proposal() {
-        let fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let proposal = operator_proposal(
-            &fixture.scope,
-            &repeated_digest(0xa5),
-            WINNER_CANARY_BASIS_POINTS,
-        );
-        let (_, canary) = prepare_operator_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &proposal,
-            Some(&fixture.secret_hex),
-            Some(CANDIDATE_API_KEY),
-            None,
-            now,
-        )
-        .unwrap();
-        let (zero_bytes, zero) = prepare_operator_zero_route_manifest(
-            &fixture.config,
-            &fixture.scope,
-            &proposal,
-            &canary,
-            now + TimeDelta::seconds(60),
-        )
-        .unwrap();
-        let zero_manifest: OperatorRouteManifest = serde_json::from_slice(&zero_bytes).unwrap();
-        assert!(!zero.has_candidate);
-        assert_eq!(zero.candidate_basis_points, 0);
-        assert_eq!(zero.previous_route_revision, Some(canary.revision));
-        assert_eq!(zero.student_result_sha256, canary.student_result_sha256);
-        assert!(zero_manifest.candidate.is_none());
-        assert!(zero_manifest.route_secret_sha256.is_none());
-        assert_eq!(
-            zero_manifest.previous_route_revision,
-            Some(canary.revision_hex())
-        );
-        verify_operator_manifest_proposal_binding(
-            &fixture.config,
-            &fixture.scope,
-            &zero_bytes,
-            &proposal,
-        )
-        .unwrap();
-
-        let other = operator_proposal(
-            &fixture.scope,
-            &repeated_digest(0xa6),
-            WINNER_CANARY_BASIS_POINTS,
-        );
-        assert!(
-            prepare_operator_zero_route_manifest(
-                &fixture.config,
-                &fixture.scope,
-                &other,
-                &canary,
-                now + TimeDelta::seconds(60),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("exact proposal")
-        );
-        let student = RoutePublication::parse_for_publication(
-            &fixture.config,
-            &fixture.scope,
-            &fixture.manifest,
-            Some(&fixture.signature),
-            now,
-        )
-        .unwrap();
-        assert!(
-            prepare_operator_zero_route_manifest(
-                &fixture.config,
-                &fixture.scope,
-                &proposal,
-                &student,
-                now + TimeDelta::seconds(60),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn advance_route_adopts_canary_without_extending_after_lost_response() {
-        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
-        let (winner, admission) = verified_winner(&fixture);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let prepared = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Canary,
-            None,
-            None,
-            now,
-        )
-        .unwrap();
-        assert_eq!(prepared.action, WinnerRouteAdvanceAction::Prepare);
-        assert!(prepared.manifest.is_some());
-        let canary = prepared.publication;
-
-        let adopted = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Canary,
-            Some(&canary),
-            None,
-            now + TimeDelta::seconds(30),
-        )
-        .unwrap();
-        assert_eq!(adopted.action, WinnerRouteAdvanceAction::Observe);
-        assert!(adopted.manifest.is_none());
-        assert_eq!(adopted.publication, canary);
-        assert_eq!(
-            adopted.publication.not_after,
-            now + TimeDelta::seconds(i64::from(WINNER_CANARY_VALID_FOR_SECONDS))
-        );
-    }
-
-    #[test]
-    fn advance_route_prepares_sixty_second_zero_from_expired_canary() {
-        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
-        let (winner, admission) = verified_winner(&fixture);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let canary = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Canary,
-            None,
-            None,
-            now,
-        )
-        .unwrap()
-        .publication;
-
-        let zero = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Zero,
-            Some(&canary),
-            None,
-            canary.not_after,
-        )
-        .unwrap();
-        assert_eq!(zero.action, WinnerRouteAdvanceAction::Prepare);
-        assert!(zero.manifest.is_some());
-        assert_eq!(zero.publication.candidate_basis_points, 0);
-        assert_eq!(
-            zero.publication.previous_route_revision,
-            Some(canary.revision)
-        );
-        assert_eq!(
-            zero.publication.not_after,
-            canary.not_after + TimeDelta::seconds(i64::from(WINNER_ZERO_VALID_FOR_SECONDS))
-        );
-    }
-
-    #[test]
-    fn advance_route_adopts_zero_after_lost_response() {
-        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
-        let (winner, admission) = verified_winner(&fixture);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        let canary = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Canary,
-            None,
-            None,
-            now,
-        )
-        .unwrap()
-        .publication;
-        let zero = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Zero,
-            Some(&canary),
-            None,
-            canary.not_after,
-        )
-        .unwrap()
-        .publication;
-
-        for phase in [WinnerRoutePhase::Zero, WinnerRoutePhase::Canary] {
-            let adopted = advance_winner_route(
-                &fixture.config,
-                &fixture.scope,
-                &winner,
-                &admission,
-                &fixture.secret_hex,
-                phase,
-                Some(&zero),
-                Some(&canary),
-                zero.not_after,
-            )
-            .unwrap();
-            assert_eq!(adopted.action, WinnerRouteAdvanceAction::Done);
-            assert!(adopted.manifest.is_none());
-            assert_eq!(adopted.publication, zero);
-        }
-    }
-
-    #[test]
-    fn advance_route_rejects_missing_canary_other_student_and_other_state() {
-        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
-        let (winner, admission) = verified_winner(&fixture);
-        let now: DateTime<Utc> = ACTIVE_NOW.parse().unwrap();
-        assert!(
-            advance_winner_route(
-                &fixture.config,
-                &fixture.scope,
-                &winner,
-                &admission,
-                &fixture.secret_hex,
-                WinnerRoutePhase::Zero,
-                None,
-                None,
-                now,
-            )
-            .is_err()
-        );
-        let canary = advance_winner_route(
-            &fixture.config,
-            &fixture.scope,
-            &winner,
-            &admission,
-            &fixture.secret_hex,
-            WinnerRoutePhase::Canary,
-            None,
-            None,
-            now,
-        )
-        .unwrap()
-        .publication;
-        let mut other_student = canary.clone();
-        other_student.student_job_id = [0xaa; 32];
-        assert!(
-            advance_winner_route(
-                &fixture.config,
-                &fixture.scope,
-                &winner,
-                &admission,
-                &fixture.secret_hex,
-                WinnerRoutePhase::Canary,
-                Some(&other_student),
-                None,
-                now,
-            )
-            .is_err()
-        );
-        let mut other_state = canary;
-        other_state.candidate_basis_points = 200;
-        assert!(
-            advance_winner_route(
-                &fixture.config,
-                &fixture.scope,
-                &winner,
-                &admission,
-                &fixture.secret_hex,
-                WinnerRoutePhase::Canary,
-                Some(&other_state),
-                None,
-                now,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn winner_admission_requires_canary_and_zero_runway() {
-        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
-        let source: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-        let authority = fixture.config.winner_deployment_authority().unwrap();
-        let mut admission = source.winner_admission;
-        admission.service_not_after =
-            admission.admitted_at + TimeDelta::seconds(i64::from(WINNER_ROUTE_RUNWAY_SECONDS - 1));
-        assert!(admission.validate_for_authority(&authority).is_err());
-        admission.service_not_after =
-            admission.admitted_at + TimeDelta::seconds(i64::from(WINNER_ROUTE_RUNWAY_SECONDS));
-        assert!(admission.validate_for_authority(&authority).is_ok());
-    }
-
-    #[test]
-    fn winner_authority_is_exactly_baseten_only_v3() {
-        let fixture = Fixture::active(WINNER_CANARY_BASIS_POINTS, r#"["stream"]"#);
-        let authority = fixture.config.winner_deployment_authority().unwrap();
-        let encoded = serde_json::to_string(&authority).unwrap();
-        assert!(encoded.starts_with(
-            r#"{"schema_version":"milk.winner-deployment-authority.v3","provider_policy":{"only":"baseten"},"provider_terms_sha256":"#
-        ));
-        assert!(!encoded.contains("primary"));
-        assert!(!encoded.contains("fallback"));
-
-        let mut obsolete = authority;
-        obsolete.schema_version = "milk.winner-deployment-authority.v2".to_owned();
-        assert!(obsolete.validate().is_err());
-    }
-
-    #[test]
-    fn live_pointer_is_typed_canonical_and_scope_bound() {
-        let fixture = Fixture::active(10_000, "[]");
-        let pointer =
-            RouteLivePointer::new(fixture.scope.clone(), [0xaa; 32], Some([0xbb; 32])).unwrap();
-        let bytes = pointer.to_bytes().unwrap();
-        assert!(bytes.len() <= MAX_ROUTE_LIVE_BYTES);
-        assert_eq!(
-            RouteLivePointer::parse(&fixture.scope, &bytes).unwrap(),
-            pointer
-        );
-
-        let mut noncanonical = bytes.clone();
-        noncanonical.push(b'\n');
-        assert!(RouteLivePointer::parse(&fixture.scope, &noncanonical).is_err());
-
-        let mut wrong_scope = fixture.scope.clone();
-        wrong_scope.scope_id = Uuid::new_v4();
-        assert!(RouteLivePointer::parse(&wrong_scope, &bytes).is_err());
-        assert!(RouteLivePointer::new(fixture.scope, [0xaa; 32], Some([0xaa; 32])).is_err());
-    }
-
-    #[test]
-    fn signed_policy_routes_known_endpoints_without_rejecting_optional_fields() {
-        let fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let policy = fixture.policy();
-        let monotonic_now = Instant::now();
-        let valid_body = br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
-        let valid = request(valid_body, b"tenant-42");
-        let decision = policy.decide(&valid, monotonic_now);
-        assert_eq!(decision.target, RouteTarget::Candidate);
-        assert_eq!(decision.route_revision, policy.revision());
-        assert_eq!(decision.baseline_reason, None);
-        let candidate = decision.candidate.unwrap();
-        assert_eq!(candidate.endpoint.as_str(), "https://candidate.example/v1/");
-        assert_eq!(candidate.candidate_sha256, repeated_digest(0x33));
-        assert_eq!(candidate.artifact_sha256, repeated_digest(0x44));
-        let manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-        assert_eq!(
-            candidate.deployment_sha256,
-            hex_digest(&manifest.winner_admission.deployment_sha256().unwrap())
-        );
-        assert_eq!(candidate.max_in_flight, 2);
-        assert_eq!(policy.candidate().unwrap().max_in_flight, 2);
-
-        let with_tools = request(
-            br#"{"model":"customer-model","messages":[],"tools":[]}"#,
-            b"tenant-42",
-        );
-        assert_eq!(
-            policy.decide(&with_tools, monotonic_now).target,
-            RouteTarget::Candidate
-        );
-        for supported_body in [
-            br#"{"model":"customer-model","messages":[],"response_format":{"type":"json_object"}}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[],"modalities":["text"]}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[],"tool_choice":"none"}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[],"unknown_extension":true}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-1"}}]}]}"#.as_slice(),
-        ] {
-            assert_eq!(
-                policy
-                    .decide(&request(supported_body, b"tenant-42"), monotonic_now)
-                    .target,
-                RouteTarget::Candidate
-            );
-        }
-        let text_parts = request(
-            br#"{"model":"customer-model","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
-            b"tenant-42",
-        );
-        assert_eq!(
-            policy.decide(&text_parts, monotonic_now).target,
-            RouteTarget::Candidate
-        );
-        let wrong_model = request(br#"{"model":"another-model","messages":[]}"#, b"tenant-42");
-        assert_baseline(
-            policy.decide(&wrong_model, monotonic_now),
-            BaselineReason::ModelMismatch,
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_routes_only_when_it_matches_signed_policy() {
-        let policy = RoutePolicy::active_with_reasoning_for_test(
-            Url::parse("https://candidate.example/v1/").unwrap(),
-            2,
-            CANDIDATE_API_KEY,
-            Some(CandidateReasoningEffort::High),
-        );
-        let matching = request(
-            br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#,
-            b"tenant-42",
-        );
-        assert_eq!(
-            policy.decide(&matching, Instant::now()).target,
-            RouteTarget::Candidate
-        );
-        for body in [
-            br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
-            br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}"#.as_slice(),
-        ] {
-            assert_baseline(
-                policy.decide(&request(body, b"tenant-42"), Instant::now()),
-                BaselineReason::ReasoningEffortMismatch,
-            );
-        }
-        assert_baseline(
-            policy.decide(
-                &request(
-                    br#"{"model":"customer-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"extreme"}"#,
-                    b"tenant-42",
-                ),
-                Instant::now(),
-            ),
-            BaselineReason::UnsupportedRequest,
-        );
-    }
-
-    #[test]
-    fn responses_routing_is_endpoint_aware_and_preserves_optional_fields() {
-        let policy = RoutePolicy::active_for_test(
-            Url::parse("https://candidate.example/v1/").unwrap(),
-            2,
-            CANDIDATE_API_KEY,
-        );
-        let body = br#"{"model":"customer-model","input":[{"role":"user","content":"hi"}],"conversation":"conv_123","stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"unknown_extension":{"enabled":true}}"#;
-        let request = responses_request(body, b"session-hmac");
-        assert_eq!(
-            policy.decide(&request, Instant::now()).target,
-            RouteTarget::Candidate
-        );
-
-        let mut fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let mut manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-        manifest
-            .supported_capabilities
-            .retain(|capability| *capability != RouteCapability::Responses);
-        fixture.manifest = serde_json::to_vec(&manifest).unwrap();
-        fixture.signature = signing_key().sign(&fixture.manifest).as_ref().to_vec();
-        assert_baseline(
-            fixture.policy().decide(&request, Instant::now()),
-            BaselineReason::UnsupportedCapability,
-        );
-    }
-
-    #[test]
-    fn candidate_input_bounds_count_items_and_raw_bytes() {
-        let fixture = Fixture::active(10_000, "[]");
-        let policy = fixture.policy();
-        let monotonic_now = Instant::now();
-        let body = |contents: Vec<String>| {
-            let messages = contents
-                .into_iter()
-                .map(|content| serde_json::json!({"role": "user", "content": content}))
-                .collect::<Vec<_>>();
-            serde_json::to_vec(
-                &serde_json::json!({"model": "customer-model", "messages": messages}),
-            )
-            .unwrap()
-        };
-
-        let sixteen_messages = body(vec!["x".to_owned(); CANDIDATE_MAX_INPUT_MESSAGES]);
-        assert_eq!(
-            policy
-                .decide(&request(&sixteen_messages, b"tenant-42"), monotonic_now)
-                .target,
-            RouteTarget::Candidate
-        );
-        let seventeen_messages = body(vec!["x".to_owned(); CANDIDATE_MAX_INPUT_MESSAGES + 1]);
-        assert_baseline(
-            policy.decide(&request(&seventeen_messages, b"tenant-42"), monotonic_now),
-            BaselineReason::UnsupportedCapability,
-        );
-
-        let mut exact_request_bytes = body(vec!["x".to_owned()]);
-        exact_request_bytes.resize(CANDIDATE_MAX_INPUT_REQUEST_BYTES, b' ');
-        assert_eq!(
-            policy
-                .decide(&request(&exact_request_bytes, b"tenant-42"), monotonic_now,)
-                .target,
-            RouteTarget::Candidate
-        );
-        exact_request_bytes.push(b' ');
-        assert_baseline(
-            policy.decide(&request(&exact_request_bytes, b"tenant-42"), monotonic_now),
-            BaselineReason::UnsupportedCapability,
-        );
-
-        let oversized_input = body(vec!["x".repeat(CANDIDATE_MAX_INPUT_UTF8_BYTES + 1)]);
-        assert_baseline(
-            policy.decide(&request(&oversized_input, b"tenant-42"), monotonic_now),
-            BaselineReason::UnsupportedCapability,
-        );
-    }
-
-    #[test]
-    fn signature_scope_origin_terms_and_secret_are_bound() {
-        let fixture = Fixture::active(10_000, "[]");
-        let mut tampered = fixture.manifest.clone();
-        let last = tampered.len() - 2;
-        tampered[last] ^= 1;
-        assert!(
-            RoutePolicy::from_signed_bytes(
-                &fixture.config,
-                &fixture.scope,
-                Some(&fixture.secret_hex),
-                Some(CANDIDATE_API_KEY),
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &tampered,
-                &fixture.signature,
-            )
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("signature verification")
-        );
-
-        let mut unknown = String::from_utf8(fixture.manifest.clone()).unwrap();
-        unknown.insert_str(1, r#""unknown":true,"#);
-        let unknown = unknown.into_bytes();
-        let unknown_signature = signing_key().sign(&unknown);
-        assert!(
-            RoutePolicy::from_signed_bytes(
-                &fixture.config,
-                &fixture.scope,
-                Some(&fixture.secret_hex),
-                Some(CANDIDATE_API_KEY),
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &unknown,
-                unknown_signature.as_ref(),
-            )
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("strict typed JSON")
-        );
-
-        let mut wrong_scope = fixture.scope.clone();
-        wrong_scope.scope_id = Uuid::new_v4();
-        assert!(load_bytes(&fixture, &fixture.config, &wrong_scope, &fixture.secret_hex).is_err());
-        let mut wrong_eval = fixture.scope.clone();
-        wrong_eval.scope_id = Uuid::new_v4();
-        assert!(load_bytes(&fixture, &fixture.config, &wrong_eval, &fixture.secret_hex).is_err());
-
-        let mut wrong_terms = fixture.config.clone();
-        wrong_terms.authorized_provider_terms_sha256 = Some(repeated_digest(0xaa));
-        assert!(load_bytes(&fixture, &wrong_terms, &fixture.scope, &fixture.secret_hex).is_err());
-
-        let wrong_secret = hex_bytes(&[1; 32]);
-        assert!(load_bytes(&fixture, &fixture.config, &fixture.scope, &wrong_secret).is_err());
-        for (expected, unsupported) in [
-            (
-                "\"max_input_utf8_bytes\":2048",
-                "\"max_input_utf8_bytes\":2049",
-            ),
-            ("\"max_input_messages\":16", "\"max_input_messages\":17"),
-            (
-                "\"max_input_request_bytes\":16384",
-                "\"max_input_request_bytes\":16385",
-            ),
-        ] {
-            let manifest = String::from_utf8(fixture.manifest.clone())
-                .unwrap()
-                .replacen(expected, unsupported, 1)
-                .into_bytes();
-            let signature = signing_key().sign(&manifest);
-            assert!(
-                RoutePolicy::from_signed_bytes(
-                    &fixture.config,
-                    &fixture.scope,
-                    Some(&fixture.secret_hex),
-                    Some(CANDIDATE_API_KEY),
-                    8,
-                    ACTIVE_NOW.parse().unwrap(),
-                    Instant::now(),
-                    &manifest,
-                    signature.as_ref(),
-                )
-                .is_err()
-            );
-        }
-        let mut no_baseline_capacity = fixture.config.clone();
-        no_baseline_capacity.candidate_max_in_flight = 8;
-        assert!(
-            load_bytes(
-                &fixture,
-                &no_baseline_capacity,
-                &fixture.scope,
-                &fixture.secret_hex,
-            )
-            .is_err()
-        );
-        assert!(
-            RoutePolicy::from_signed_bytes(
-                &fixture.config,
-                &fixture.scope,
-                Some(&fixture.secret_hex),
-                Some(CANDIDATE_API_KEY),
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &fixture.manifest,
-                &fixture.signature[..63],
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn signed_route_binds_the_exact_authorized_winner_admission() {
-        let fixture = Fixture::active(100, r#"["stream"]"#);
-        let publication = RoutePublication::parse_for_publication(
-            &fixture.config,
-            &fixture.scope,
-            &fixture.manifest,
-            Some(&fixture.signature),
-            ACTIVE_NOW.parse().unwrap(),
-        )
-        .unwrap();
-        let manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-        assert_eq!(publication.student_variant, WinnerVariant::StaticFp8);
-        assert_eq!(
-            publication.candidate_api_base_url,
-            manifest.winner_admission.api_base_url
-        );
-        assert_eq!(
-            publication.logical_model_alias,
-            manifest.winner_admission.model_alias
-        );
-        assert_eq!(
-            publication.deployment_sha256,
-            manifest.winner_admission.deployment_sha256().unwrap()
-        );
-        assert!(!String::from_utf8_lossy(&fixture.manifest).contains("\"deployment_sha256\""));
-
-        let mut unsupported_manifest: RouteManifest =
-            serde_json::from_slice(&fixture.manifest).unwrap();
-        unsupported_manifest.winner_admission.provider = "runpod".to_owned();
-        let unsupported_manifest = serde_json::to_vec(&unsupported_manifest).unwrap();
-        let unsupported_signature = signing_key().sign(&unsupported_manifest);
-        assert!(
-            RoutePublication::parse_for_publication(
-                &fixture.config,
-                &fixture.scope,
-                &unsupported_manifest,
-                Some(unsupported_signature.as_ref()),
-                ACTIVE_NOW.parse().unwrap(),
-            )
-            .is_err()
-        );
-
-        let mut wrong_authority = fixture.config.clone();
-        *wrong_authority.winner_max_cost_microusd.as_mut().unwrap() -= 1;
-        assert!(
-            RoutePublication::parse_for_publication(
-                &wrong_authority,
-                &fixture.scope,
-                &fixture.manifest,
-                Some(&fixture.signature),
-                ACTIVE_NOW.parse().unwrap(),
-            )
-            .is_err()
-        );
-
-        let mut wrong_image = fixture.config.clone();
-        wrong_image.authorized_student_branch_runtime_image_reference = Some(format!(
-            "ghcr.io/milkinfrastructure/milk-student-branch@sha256:{}",
-            repeated_digest(0xaa)
-        ));
-        assert!(
-            RoutePublication::parse_for_publication(
-                &wrong_image,
-                &fixture.scope,
-                &fixture.manifest,
-                Some(&fixture.signature),
-                ACTIVE_NOW.parse().unwrap(),
-            )
-            .is_err()
-        );
-
-        let mut wrong_program = fixture.config.clone();
-        wrong_program.authorized_admission_program_sha256 = Some(repeated_digest(0xaa));
-        assert!(
-            RoutePublication::parse_for_publication(
-                &wrong_program,
-                &fixture.scope,
-                &fixture.manifest,
-                Some(&fixture.signature),
-                ACTIVE_NOW.parse().unwrap(),
-            )
-            .is_err()
-        );
-
-        for mutation in ["student", "alias", "interval"] {
-            let mut manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-            match mutation {
-                "student" => manifest.winner_admission.student_job_id = repeated_digest(0xaa),
-                "alias" => manifest.winner_admission.model_alias_sha256 = repeated_digest(0xaa),
-                "interval" => {
-                    manifest.winner_admission.admitted_at =
-                        manifest.not_before + chrono::TimeDelta::seconds(1);
-                }
-                _ => unreachable!(),
-            }
-            let manifest = serde_json::to_vec(&manifest).unwrap();
-            let signature = signing_key().sign(&manifest);
-            assert!(
-                RoutePublication::parse_for_publication(
-                    &fixture.config,
-                    &fixture.scope,
-                    &manifest,
-                    Some(signature.as_ref()),
-                    ACTIVE_NOW.parse().unwrap(),
-                )
-                .is_err(),
-                "{mutation}"
-            );
-        }
-    }
-
-    #[test]
-    fn inactive_policies_are_permanently_dormant_for_the_process() {
-        let invalid = request(b"not-json", b"tenant-42");
-        let baseline = RoutePolicy::baseline();
-        assert_eq!(baseline.revision(), BASELINE_ROUTE_REVISION);
-        assert_baseline(
-            baseline.decide(&invalid, Instant::now()),
-            BaselineReason::PolicyAbsent,
-        );
-
-        let zero_fixture = Fixture::active(0, "[]");
-        let zero = zero_fixture.policy_with(None, None);
-        assert!(zero.candidate().is_none());
-        assert_baseline(
-            zero.decide(&invalid, Instant::now()),
-            BaselineReason::PolicyZero,
-        );
-        assert!(
-            load_bytes(
-                &zero_fixture,
-                &zero_fixture.config,
-                &zero_fixture.scope,
-                &hex_bytes(&[1; 32]),
-            )
-            .is_err()
-        );
-        let mut rollback_config = zero_fixture.config.clone();
-        rollback_config.candidate_max_in_flight = 8;
-        assert!(
-            RoutePolicy::from_signed_bytes(
-                &rollback_config,
-                &zero_fixture.scope,
-                None,
-                None,
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &zero_fixture.manifest,
-                &zero_fixture.signature,
-            )
-            .is_err()
-        );
-
-        let expired = Fixture::new(10_000, "[]", "2026-08-23T00:00:00Z", "2026-08-24T00:00:00Z")
-            .policy_with(None, None);
-        assert_baseline(
-            expired.decide(&invalid, Instant::now()),
-            BaselineReason::PolicyExpired,
-        );
-
-        let future = Fixture::new(10_000, "[]", "2026-08-27T00:00:00Z", "2026-08-28T00:00:00Z")
-            .policy_with(None, None);
-        assert_baseline(
-            future.decide(&invalid, Instant::now()),
-            BaselineReason::PolicyNotYetValid,
-        );
-
-        let missing_secret =
-            Fixture::active(10_000, "[]").policy_with(None, Some(CANDIDATE_API_KEY));
-        assert_baseline(
-            missing_secret.decide(&invalid, Instant::now()),
-            BaselineReason::RouteSecretMissing,
-        );
-        let fixture = Fixture::active(10_000, "[]");
-        let missing_credential = fixture.policy_with(Some(&fixture.secret_hex), None);
-        assert_baseline(
-            missing_credential.decide(&invalid, Instant::now()),
-            BaselineReason::CandidateCredentialMissing,
-        );
-        assert!(
-            RoutePolicy::from_signed_bytes(
-                &fixture.config,
-                &fixture.scope,
-                Some(&fixture.secret_hex),
-                Some("wrong-candidate-key"),
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &fixture.manifest,
-                &fixture.signature,
-            )
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("admitted credential")
-        );
-    }
-
-    #[test]
-    fn publication_and_startup_enforce_the_24_hour_validity_ceiling() {
-        let rollback_revision = repeated_digest(0x88);
-        let zero = Fixture::new_with_previous(
-            0,
-            "[]",
-            ACTIVE_NOT_BEFORE,
-            ACTIVE_NOT_AFTER,
-            Some(&rollback_revision),
-        );
-        let publication = RoutePublication::parse_for_publication(
-            &zero.config,
-            &zero.scope,
-            &zero.manifest,
-            Some(&zero.signature),
-            ACTIVE_NOW.parse().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(publication.candidate_basis_points, 0);
-        assert_eq!(publication.cohort_sha256, [0x22; 32]);
-        assert_eq!(publication.previous_route_revision, Some([0x88; 32]));
-        let route_secret_sha256: [u8; 32] = Sha256::digest(ROUTE_SECRET).into();
-        assert_eq!(publication.route_secret_sha256, route_secret_sha256);
-        assert!(
-            RoutePublication::parse_archived(
-                &zero.config,
-                &zero.scope,
-                &zero.manifest,
-                &zero.signature,
-            )
-            .is_ok()
-        );
-        let mut bad_signature = zero.signature.clone();
-        bad_signature[0] ^= 1;
-        assert!(
-            RoutePublication::parse_archived(
-                &zero.config,
-                &zero.scope,
-                &zero.manifest,
-                &bad_signature,
-            )
-            .is_err()
-        );
-
-        let nonzero_previous = Fixture::new_with_previous(
-            100,
-            "[]",
-            ACTIVE_NOT_BEFORE,
-            ACTIVE_NOT_AFTER,
-            Some(&rollback_revision),
-        );
-        assert!(
-            RoutePublication::parse_for_publication(
-                &nonzero_previous.config,
-                &nonzero_previous.scope,
-                &nonzero_previous.manifest,
-                Some(&nonzero_previous.signature),
-                ACTIVE_NOW.parse().unwrap(),
-            )
-            .is_ok()
-        );
-
-        let too_long = Fixture::new(0, "[]", "2026-08-25T00:00:00Z", "2026-08-26T00:00:01Z");
-        assert!(
-            RoutePolicy::from_signed_bytes(
-                &too_long.config,
-                &too_long.scope,
-                None,
-                None,
-                8,
-                ACTIVE_NOW.parse().unwrap(),
-                Instant::now(),
-                &too_long.manifest,
-                &too_long.signature,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn sticky_hash_math_is_exact() {
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &ROUTE_SECRET);
-        let experiment = [0x22; 32];
-        let sample = sticky_sample(&key, &experiment, b"tenant-42");
-        assert_eq!(sample, 1_037_516_788_915_898_171);
-        assert!(!selected(sample, 562));
-        assert!(selected(sample, 563));
-        let one_basis_point = ((1_u128 << u64::BITS) / 10_000) as u64;
-        assert!(selected(one_basis_point - 1, 1));
-        assert!(!selected(one_basis_point, 1));
-        assert!(!selected(u64::MAX, 0));
-        assert!(selected(u64::MAX, 10_000));
-    }
-
-    #[test]
-    fn candidate_api_base_requires_explicit_private_http_authorization() {
-        assert!(validate_candidate_api_base_url("https://candidate.example/v1/", false).is_ok());
-        assert!(validate_candidate_api_base_url("http://127.0.0.1:8081/v1/", false).is_ok());
-        assert!(validate_candidate_api_base_url("http://[::1]:8081/v1/", false).is_ok());
-        assert!(
-            validate_candidate_api_base_url(
-                "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/",
-                false,
-            )
-            .is_ok()
-        );
-        for private in [
-            "http://10.0.0.1:8080/v1/",
-            "http://10.255.255.254:8080/v1/",
-            "http://172.16.0.1:8080/v1/",
-            "http://172.31.255.254:8080/v1/",
-            "http://192.168.0.1:8080/v1/",
-            "http://192.168.255.254:8080/v1/",
-        ] {
-            assert!(
-                validate_candidate_api_base_url(private, false).is_err(),
-                "{private}"
-            );
-            assert!(
-                validate_candidate_api_base_url(private, true).is_ok(),
-                "{private}"
-            );
-        }
-        for invalid in [
-            "http://candidate.example/v1/",
-            "http://localhost:8081/v1/",
-            "http://172.15.255.255:8080/v1/",
-            "http://172.32.0.1:8080/v1/",
-            "http://192.167.255.255:8080/v1/",
-            "http://192.169.0.1:8080/v1/",
-            "http://169.254.169.254/v1/",
-            "http://100.64.0.1/v1/",
-            "http://8.8.8.8/v1/",
-            "http://[fd00::1]/v1/",
-            "http://0x0a000001/v1/",
-            "http://user:pass@10.0.0.1/v1/",
-            "http://127.0.0.1:8081/v1/models",
-            "http://127.0.0.1:8081/v1/?debug=1",
-            "http://10.0.0.1/v1/#fragment",
-            "https://candidate.example/v1-extra/",
-        ] {
-            assert!(
-                validate_candidate_api_base_url(invalid, true).is_err(),
-                "{invalid}"
-            );
-        }
-    }
-
-    #[test]
-    fn signed_route_requires_startup_opt_in_for_private_http() {
-        let mut fixture = Fixture::active(10_000, r#"["stream"]"#);
-        let private = "http://10.0.0.8:8080/v1/";
-        fixture.manifest = String::from_utf8(fixture.manifest)
-            .unwrap()
-            .replace("https://candidate.example/v1/", private)
-            .into_bytes();
-        fixture.signature = signing_key().sign(&fixture.manifest).as_ref().to_vec();
-        assert!(
-            load_bytes(
-                &fixture,
-                &fixture.config,
-                &fixture.scope,
-                &fixture.secret_hex,
-            )
-            .is_err()
-        );
-        fixture.config.allow_private_candidate_http = true;
-        let mut manifest: RouteManifest = serde_json::from_slice(&fixture.manifest).unwrap();
-        manifest.winner_provider_binding_sha256 = hex_digest(
-            &fixture
-                .config
-                .winner_deployment_authority()
-                .unwrap()
-                .provider_binding_sha256()
-                .unwrap(),
-        );
-        fixture.manifest = serde_json::to_vec(&manifest).unwrap();
-        fixture.signature = signing_key().sign(&fixture.manifest).as_ref().to_vec();
-        assert_eq!(
-            fixture.policy().candidate().unwrap().endpoint.as_str(),
-            private
-        );
-    }
-
-    fn request<'a>(body: &'a [u8], routing_cohort: &'a [u8]) -> RouteRequest<'a> {
-        RouteRequest {
-            endpoint: RouteEndpoint::ChatCompletions,
-            body,
-            content_type: Some(b"Application/JSON; charset=utf-8"),
-            has_multiple_content_types: false,
-            has_content_encoding: false,
-            has_openai_beta: false,
-            query: "",
-            routing_cohort,
-        }
-    }
-
-    fn responses_request<'a>(body: &'a [u8], routing_cohort: &'a [u8]) -> RouteRequest<'a> {
-        RouteRequest {
-            endpoint: RouteEndpoint::Responses,
-            ..request(body, routing_cohort)
-        }
-    }
-
-    fn assert_baseline(decision: RouteDecision<'_>, reason: BaselineReason) {
-        assert_eq!(decision.target, RouteTarget::Baseline);
-        assert_eq!(decision.baseline_reason, Some(reason));
-        assert!(decision.candidate.is_none());
-    }
-
-    fn load_bytes(
-        fixture: &Fixture,
-        config: &RouteStartupConfig,
-        scope: &RouteScope,
-        secret: &str,
-    ) -> Result<RoutePolicy> {
-        RoutePolicy::from_signed_bytes(
-            config,
-            scope,
-            Some(secret),
-            Some(CANDIDATE_API_KEY),
-            8,
-            ACTIVE_NOW.parse().unwrap(),
-            Instant::now(),
-            &fixture.manifest,
-            &fixture.signature,
-        )
-    }
-
-    fn signing_key() -> Ed25519KeyPair {
-        Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap()
-    }
-
-    fn repeated_digest(byte: u8) -> String {
-        format!("{byte:02x}").repeat(32)
-    }
-
-    fn hex_bytes(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut encoded = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            encoded.push(HEX[(byte >> 4) as usize] as char);
-            encoded.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        encoded
-    }
 }

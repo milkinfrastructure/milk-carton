@@ -38,9 +38,7 @@ use crate::route::{
     BaselineReason, ED25519_SIGNATURE_BYTES, HarnessCandidateScoreBinding, HarnessProfile,
     HarnessScoreTargetBinding, HarnessTeacherBinding, MAX_ROUTE_LIVE_BYTES,
     MAX_ROUTE_MANIFEST_BYTES, OperatorRouteProposal, RouteLivePointer, RoutePublication,
-    RouteScope, VerifiedRouteWinner, WinnerAdmissionReceipt, WinnerDeploymentAuthority,
-    WinnerProviderPolicy, WinnerVariant, validate_distinct_runtime_image_references,
-    validate_runtime_image_reference,
+    RouteScope, validate_distinct_runtime_image_references, validate_runtime_image_reference,
 };
 
 const TRACE_QUEUE_RECORDS: usize = 1_024;
@@ -76,10 +74,6 @@ const MAX_STUDENT_INDEX_BYTES: usize = MAX_STUDENT_CLAIM_BYTES + METADATA_RECORD
 const MAX_GPU_LAUNCH_OUTBOX_BYTES: usize = 16 * 1_024;
 const MAX_GPU_LAUNCH_FRONTIER_BYTES: usize = 4 * 1_024;
 const MAX_GPU_DISPATCH_NOT_STARTED_BYTES: usize = 2 * 1_024;
-const MAX_WINNER_DEPLOYMENT_CLAIM_BYTES: usize = 32 * 1_024;
-pub(crate) const MAX_WINNER_DEPLOYMENT_RESULT_BYTES: usize = 32 * 1_024;
-const MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES: usize = 8 * 1_024;
-pub(crate) const MAX_PROVIDER_TEARDOWN_RESULT_BYTES: usize = 16 * 1_024;
 const MAX_GPU_LAUNCH_INTENT_BYTES: usize =
     MAX_STUDENT_CLAIM_BYTES + MAX_STUDENT_RESULT_BYTES + MAX_GPU_LAUNCH_OUTBOX_BYTES + 64 * 1_024;
 const MAX_TICK_LEASE_BYTES: usize = 2 * 1_024;
@@ -114,8 +108,6 @@ const TEACHER_PARTITION_DOMAIN: &[u8] = b"milk.teacher-partition.v1\0";
 const STUDENT_DEV_SET_DOMAIN: &[u8] = b"milk.student-dev-set.v1\0";
 const MAX_ANALYZER_TOKEN_COUNT: u64 = 1_000_000_000;
 const MAX_ROUTE_COMMIT_BYTES: usize = 8 * 1_024;
-const MAX_ROUTE_COHORT_BINDING_BYTES: usize = 1_024;
-const MAX_ROUTE_RETIREMENT_BYTES: usize = 1_024;
 const MAX_EDIT_DISTANCE_CELLS: usize = 16 * 1_024 * 1_024;
 const MAX_STUDENT_DEV_BUNDLE_BYTES: usize =
     MAX_ANALYZER_REQUEST_BYTES + MAX_ANALYZER_RESPONSE_BYTES + 64 * 1_024;
@@ -223,6 +215,7 @@ struct HarnessReadinessChecks {
     represented_classes_meet_minimum: bool,
     representative_eval_capacity: bool,
     production_text_reference_capacity: bool,
+    eval_source_plan_feasible: bool,
     closed_watermark_without_capture_gap: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     eval_generation_budget_available: Option<bool>,
@@ -257,6 +250,7 @@ struct HarnessReadiness {
     class_failures: Vec<String>,
     eval_eligible_cases: u64,
     unsupported_eval_categories: BTreeMap<String, u64>,
+    eval_plan_failure: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -291,8 +285,6 @@ struct HarnessEvalRevision {
     generation_job_id: String,
     provider_request_id: String,
     token_usage: HarnessTokenUsage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cost_microusd: Option<u64>,
     cases: Vec<HarnessEvalCase>,
     code_version: String,
     parent_version_sha256: Option<String>,
@@ -341,8 +333,6 @@ struct HarnessEvalValidationRevision {
     prompt_sha256: String,
     teacher: HarnessTeacherBinding,
     token_usage: HarnessTokenUsage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cost_microusd: Option<u64>,
     code_version: String,
     parent_version_sha256: Option<String>,
 }
@@ -371,8 +361,6 @@ struct HarnessScoreTargetResult {
     p95_latency_ms: Option<u64>,
     input_tokens: u64,
     output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    calculated_cost_microusd: Option<u64>,
     cases: Vec<HarnessScoreCase>,
 }
 
@@ -383,12 +371,9 @@ struct HarnessScoreChecks {
     reference_pass_delta: bool,
     candidate_errors: bool,
     candidate_p95_latency: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    incumbent_reference_pass_rate: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    incumbent_errors: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    incumbent_p95_latency: Option<bool>,
+    incumbent_reference_pass_rate: bool,
+    incumbent_errors: bool,
+    incumbent_p95_latency: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -403,10 +388,6 @@ struct HarnessCandidateScoreResult {
     candidate: HarnessScoreTargetResult,
     provider_calls: u64,
     provider_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    calculated_cost_microusd: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    accounted_cost_microusd: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2574,235 +2555,6 @@ struct StudentFanoutClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StudentWinnerDeploymentClaim {
-    schema_version: String,
-    scope: Scope,
-    student_job_id: String,
-    student_claim_sha256: String,
-    student_result_sha256: String,
-    winner: StudentVariant,
-    model_manifest: StudentArtifactRef,
-    dev_receipt: StudentArtifactRef,
-    student_branch_runtime_image_reference: String,
-    provider_binding_sha256: String,
-    authority: WinnerDeploymentAuthority,
-    claimed_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WinnerProvider {
-    Baseten,
-}
-
-impl WinnerProvider {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Baseten => crate::route::WINNER_PROVIDER,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BasetenProviderIdentity {
-    provider: WinnerProvider,
-    team_name: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ReadyProviderPreflight {
-    provider: WinnerProvider,
-    outcome: String,
-    evidence_sha256: String,
-    observed_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(
-    tag = "selected_provider",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-enum WinnerProviderSelection {
-    Baseten {
-        provider_identity: BasetenProviderIdentity,
-        primary_preflight: ReadyProviderPreflight,
-    },
-}
-
-impl WinnerProviderSelection {
-    fn selected_provider(&self) -> WinnerProvider {
-        match self {
-            Self::Baseten { .. } => WinnerProvider::Baseten,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WinnerProviderAcceptance {
-    schema_version: String,
-    campaign_id: String,
-    run_id: String,
-    claim_sha256: String,
-    outbox_sha256: String,
-    provider_binding_sha256: String,
-    selection: WinnerProviderSelection,
-    image_release_sha256: String,
-    image_admission_sha256: String,
-    provider_pass_claim_sha256: String,
-    create_authorization_sha256: String,
-    budget_reservation_sha256: String,
-    reserved_microusd: u64,
-    reserved_at: String,
-    accepted_at: String,
-    create_not_after: String,
-    provider_not_after: String,
-    max_wall_seconds: u64,
-    max_cost_microusd: u64,
-    state: String,
-}
-
-struct VerifiedWinnerProviderAcceptance {
-    selected_provider: WinnerProvider,
-    first_preflight_at: DateTime<Utc>,
-    last_preflight_at: DateTime<Utc>,
-    reserved_at: DateTime<Utc>,
-    accepted_at: DateTime<Utc>,
-    create_not_after: DateTime<Utc>,
-    provider_not_after: DateTime<Utc>,
-}
-
-#[derive(Serialize)]
-struct ProviderNeutralWinnerRunIdentity<'a> {
-    schema_version: &'static str,
-    campaign_id: &'a str,
-    claim_sha256: &'a str,
-    outbox_sha256: &'a str,
-    operation: ProviderNeutralWinnerOperation<'a>,
-    image_release_sha256: &'a str,
-    image_admission_sha256: &'a str,
-}
-
-#[derive(Serialize)]
-struct ProviderNeutralWinnerOperation<'a> {
-    kind: &'static str,
-    student_job_id: &'a str,
-    student_result_sha256: &'a str,
-    winner: StudentVariant,
-    max_wall_seconds: u64,
-    max_cost_microusd: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StudentWinnerDeploymentResult {
-    schema_version: String,
-    scope: Scope,
-    student_job_id: String,
-    claim_sha256: String,
-    provider_binding_sha256: String,
-    provider_acceptance: WinnerProviderAcceptance,
-    observed_cost_microusd: u64,
-    admission: WinnerAdmissionReceipt,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ProviderTeardownTrigger {
-    RouteZero {
-        retirement_object_key: String,
-        retirement_sha256: String,
-        zero_route_revision: String,
-        canary_route_receipt: Box<RoutePublicationWrite>,
-        zero_route_receipt: Box<RoutePublicationWrite>,
-    },
-    ServiceExpired {
-        service_not_after: DateTime<Utc>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderTeardownAuthorization {
-    schema_version: String,
-    scope: Scope,
-    student_job_id: String,
-    claim_sha256: String,
-    winner_result_object_key: String,
-    winner_result_sha256: String,
-    provider_acceptance_sha256: String,
-    run_id: String,
-    selected_provider: WinnerProvider,
-    execution_id: String,
-    trigger: ProviderTeardownTrigger,
-    authorized_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderTeardownFrontier {
-    schema_version: String,
-    scope: Scope,
-    student_job_id: String,
-    authorization_object_key: String,
-    authorization_sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderEvidenceReference {
-    store_identity_sha256: String,
-    object_key: String,
-    sha256: String,
-    bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ProviderTeardownResult {
-    schema_version: String,
-    scope: Scope,
-    student_job_id: String,
-    claim_sha256: String,
-    run_id: String,
-    selected_provider: WinnerProvider,
-    execution_id: String,
-    teardown_authorization_sha256: String,
-    accounted_microusd: u64,
-    provider_zero_evidence: ProviderEvidenceReference,
-    private_log_artifact: ProviderEvidenceReference,
-    budget_settlement: ProviderEvidenceReference,
-    terminated_at: DateTime<Utc>,
-    verified_zero_at: DateTime<Utc>,
-    state: String,
-}
-
-impl ProviderTeardownResult {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        parse_canonical_json_line(
-            bytes,
-            MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
-            "provider teardown result",
-        )
-    }
-}
-
-impl StudentWinnerDeploymentResult {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        parse_canonical_json_line(
-            bytes,
-            MAX_WINNER_DEPLOYMENT_RESULT_BYTES,
-            "student winner deployment result",
-        )
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum GpuLaunchOperation {
     TeacherRun {
@@ -2829,15 +2581,6 @@ enum GpuLaunchOperation {
         student_job_id: String,
         max_total_gpu_seconds: u64,
         branches: Vec<StudentBranchClaim>,
-    },
-    StudentWinnerDeployment {
-        student_job_id: String,
-        student_result_sha256: String,
-        winner: StudentVariant,
-        provider_binding_sha256: String,
-        provider_policy: WinnerProviderPolicy,
-        max_wall_seconds: u64,
-        max_cost_microusd: u64,
     },
 }
 
@@ -2890,9 +2633,6 @@ enum GpuLaunchIntentClaim {
         parent: Box<StudentJobClaim>,
         train: StudentTrainResult,
         claim: StudentFanoutClaim,
-    },
-    StudentWinnerDeployment {
-        claim: StudentWinnerDeploymentClaim,
     },
 }
 
@@ -3217,41 +2957,6 @@ pub(crate) struct StudentFanoutLaunchWrite {
     pub(crate) fanout_claim_sha256: String,
     pub(crate) student_branch_runtime_image_reference: String,
     branches: Vec<StudentBranchClaim>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StudentWinnerDeploymentLaunchWrite {
-    pub(crate) schema_version: &'static str,
-    pub(crate) student_job_id: String,
-    pub(crate) student_result_sha256: String,
-    pub(crate) winner: StudentVariant,
-    pub(crate) deployment_claim_object_key: String,
-    pub(crate) deployment_claim_sha256: String,
-    pub(crate) provider_binding_sha256: String,
-    pub(crate) provider_policy: WinnerProviderPolicy,
-    pub(crate) student_branch_runtime_image_reference: String,
-    pub(crate) max_wall_seconds: u64,
-    pub(crate) max_cost_microusd: u64,
-    pub(crate) expires_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StudentWinnerDeploymentResultWrite {
-    pub(crate) schema_version: &'static str,
-    pub(crate) student_job_id: String,
-    pub(crate) result_object_key: String,
-    pub(crate) state: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ProviderTeardownResultWrite {
-    pub(crate) schema_version: &'static str,
-    pub(crate) student_job_id: String,
-    pub(crate) result_object_key: String,
-    pub(crate) state: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -3739,34 +3444,6 @@ struct RoutePublicationCommit {
     signature_bytes: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RouteCohortBinding {
-    schema_version: String,
-    scope: Scope,
-    cohort_sha256: String,
-    route_secret_sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RouteStudentRetirement {
-    schema_version: String,
-    scope: Scope,
-    student_job_id: String,
-    zero_route_revision: String,
-}
-
-struct VerifiedStudentWinner {
-    claim: StudentJobClaim,
-    result: StoredStudentResult,
-    candidate: StudentCandidateResult,
-    model_manifest_sha256: [u8; 32],
-    model_manifest_bytes: Bytes,
-    model_manifest: StudentModelManifest,
-    dev_receipt_sha256: [u8; 32],
-}
-
 struct StudentWinnerMaterializationOutput {
     stage_path: PathBuf,
     model_path: PathBuf,
@@ -3813,10 +3490,8 @@ impl From<&fs::Metadata> for StudentWinnerFileMetadata {
 pub(crate) struct RoutePublicationWrite {
     pub(crate) schema_version: String,
     pub(crate) route_revision: String,
-    pub(crate) student_job_id: String,
-    pub(crate) student_result_sha256: String,
-    pub(crate) model_manifest_sha256: String,
-    pub(crate) dev_receipt_sha256: String,
+    pub(crate) proposal_sha256: String,
+    pub(crate) candidate_api_key_sha256: String,
     pub(crate) previous_route_revision: Option<String>,
     pub(crate) candidate_basis_points: u16,
     pub(crate) manifest_object_key: String,
@@ -4576,18 +4251,6 @@ impl Records {
             .await
     }
 
-    pub(crate) async fn claim_student_winner_deployment(
-        &self,
-        scope: &Scope,
-        teacher_provider_binding_sha256: &[u8; 32],
-        authority: WinnerDeploymentAuthority,
-        now: DateTime<Utc>,
-    ) -> Result<Option<StudentWinnerDeploymentLaunchWrite>> {
-        self.store
-            .claim_student_winner_deployment(scope, teacher_provider_binding_sha256, authority, now)
-            .await
-    }
-
     pub(crate) async fn export_student_branch(
         &self,
         scope: &Scope,
@@ -4635,60 +4298,6 @@ impl Records {
             .await
     }
 
-    pub(crate) async fn ingest_student_winner_deployment_result(
-        &self,
-        scope: &Scope,
-        result: StudentWinnerDeploymentResult,
-    ) -> Result<StudentWinnerDeploymentResultWrite> {
-        self.store
-            .ingest_student_winner_deployment_result(scope, result)
-            .await
-    }
-
-    pub(crate) async fn ingest_provider_teardown_result(
-        &self,
-        scope: &Scope,
-        result: ProviderTeardownResult,
-        observed_at: DateTime<Utc>,
-    ) -> Result<ProviderTeardownResultWrite> {
-        self.store
-            .ingest_provider_teardown_result(scope, result, observed_at)
-            .await
-    }
-
-    pub(crate) async fn materialize_student_winner(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        stage_dir: &Path,
-    ) -> Result<StudentWinnerMaterializationReceipt> {
-        self.store
-            .materialize_student_winner(scope, student_job_id, stage_dir)
-            .await
-    }
-
-    pub(crate) async fn verified_route_winner(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<VerifiedRouteWinner> {
-        self.store
-            .load_verified_student_route(scope, student_job_id)
-            .await
-    }
-
-    pub(crate) async fn verified_winner_admission(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<Vec<u8>> {
-        self.store
-            .load_verified_student_winner_deployment_result(scope, student_job_id)
-            .await?
-            .admission
-            .to_canonical_json_line()
-    }
-
     pub(crate) async fn verify_route_publication(
         &self,
         scope: &Scope,
@@ -4697,16 +4306,6 @@ impl Records {
     ) -> Result<()> {
         self.store
             .verify_route_publication_lineage(scope, publication, previous)
-            .await
-    }
-
-    pub(crate) async fn verify_zero_route_retirement(
-        &self,
-        scope: &Scope,
-        publication: &RoutePublication,
-    ) -> Result<()> {
-        self.store
-            .verify_zero_route_retirement(scope, publication)
             .await
     }
 
@@ -5788,31 +5387,6 @@ impl RecordStore {
                     bail!("GPU fanout intent differs from its durable parent or train result");
                 }
             }
-            GpuLaunchIntentClaim::StudentWinnerDeployment { claim } => {
-                let student_job_id = decode_hex_digest(&claim.student_job_id)?;
-                let winner = self
-                    .load_verified_student_winner(scope, &student_job_id)
-                    .await?;
-                let payload = serde_json::to_vec(claim)?;
-                validate_student_winner_deployment_claim(
-                    scope,
-                    &student_job_id,
-                    &winner,
-                    claim,
-                    &payload,
-                )?;
-                if self
-                    .exists(&student_winner_deployment_claim_key(scope, &student_job_id))
-                    .await?
-                {
-                    let (stored, stored_payload) = self
-                        .load_verified_student_winner_deployment_claim(scope, &student_job_id)
-                        .await?;
-                    if stored != *claim || stored_payload != payload {
-                        bail!("GPU winner intent differs from its durable claim");
-                    }
-                }
-            }
             GpuLaunchIntentClaim::TeacherRun { claim } => {
                 self.verify_teacher_gpu_run_admission(scope, claim, false)
                     .await?;
@@ -5992,13 +5566,6 @@ impl RecordStore {
                     &fanout_payload,
                 )?
             }
-            GpuLaunchOperation::StudentWinnerDeployment { student_job_id, .. } => {
-                let student_job_id = decode_hex_digest(student_job_id)?;
-                let (claim, claim_payload) = self
-                    .load_verified_student_winner_deployment_claim(scope, &student_job_id)
-                    .await?;
-                student_winner_deployment_gpu_launch_outbox(scope, &claim, &claim_payload)?
-            }
         };
         if expected_key != frontier.outbox_object_key || expected != outbox {
             bail!("GPU launch outbox differs from its canonical claim");
@@ -6043,48 +5610,7 @@ impl RecordStore {
                     .await?;
                 Ok(true)
             }
-            GpuLaunchOperation::StudentWinnerDeployment { student_job_id, .. } => {
-                let student_job_id = decode_hex_digest(student_job_id)?;
-                if self
-                    .exists(&student_winner_deployment_result_key(
-                        scope,
-                        &student_job_id,
-                    ))
-                    .await?
-                {
-                    self.load_verified_student_winner_deployment_result(scope, &student_job_id)
-                        .await?;
-                }
-                if !self
-                    .exists(&provider_teardown_result_key(scope, &student_job_id))
-                    .await?
-                {
-                    return Ok(false);
-                }
-                self.load_verified_provider_teardown_result_control(scope, &student_job_id)
-                    .await?;
-                Ok(true)
-            }
         }
-    }
-
-    async fn delete_winner_gpu_launch_frontier(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<()> {
-        let (claim, claim_payload) = self
-            .load_verified_student_winner_deployment_claim(scope, student_job_id)
-            .await?;
-        let (_, outbox) =
-            student_winner_deployment_gpu_launch_outbox(scope, &claim, &claim_payload)?;
-        let dispatch_id = decode_hex_digest(&outbox.dispatch_id)?;
-        self.delete(&gpu_launch_frontier_key(
-            scope,
-            outbox.expires_at,
-            &dispatch_id,
-        ))
-        .await
     }
 
     async fn enforce_gpu_launch_frontier_bound(
@@ -6096,7 +5622,6 @@ impl RecordStore {
         let prefix_string = gpu_launch_frontier_prefix(scope);
         let prefix = ObjectPath::parse(&prefix_string)?;
         let mut active_dispatches = HashSet::new();
-        let mut active_winner_dispatches = HashSet::new();
         let expected_dispatch = dispatch_id.map(hex_digest);
         let mut listed = self.objects.list(Some(&prefix));
         let mut scanned = 0_usize;
@@ -6108,49 +5633,10 @@ impl RecordStore {
             let key = meta?.location.to_string();
             let verified = self.load_verified_gpu_launch_frontier(scope, &key).await?;
             if self.gpu_launch_is_terminal(scope, &verified.outbox).await? {
-                if let GpuLaunchOperation::StudentWinnerDeployment { student_job_id, .. } =
-                    &verified.outbox.operation
-                {
-                    self.delete(&provider_teardown_frontier_key(
-                        scope,
-                        &decode_hex_digest(student_job_id)?,
-                    ))
-                    .await?;
-                }
                 self.delete(&key).await?;
                 continue;
             }
-            if let GpuLaunchOperation::StudentWinnerDeployment { student_job_id, .. } =
-                &verified.outbox.operation
-            {
-                active_winner_dispatches.insert(verified.frontier.dispatch_id.clone());
-                if active_winner_dispatches.len() > 1 {
-                    bail!("multiple active winner deployments already exist");
-                }
-                let student_job_id = decode_hex_digest(student_job_id)?;
-                if self
-                    .exists(&student_winner_deployment_result_key(
-                        scope,
-                        &student_job_id,
-                    ))
-                    .await?
-                {
-                    let result = self
-                        .load_verified_student_winner_deployment_result(scope, &student_job_id)
-                        .await?;
-                    if result.admission.service_not_after <= now {
-                        self.ensure_provider_teardown_authorization(
-                            scope,
-                            &student_job_id,
-                            ProviderTeardownTrigger::ServiceExpired {
-                                service_not_after: result.admission.service_not_after,
-                            },
-                            now,
-                        )
-                        .await?;
-                    }
-                }
-            } else if verified.frontier.expires_at <= now {
+            if verified.frontier.expires_at <= now {
                 self.delete(&key).await?;
                 continue;
             }
@@ -6176,15 +5662,6 @@ impl RecordStore {
             };
             if !terminal {
                 active_dispatches.insert(intent.record.dispatch_id.clone());
-                if matches!(
-                    intent.record.outbox.operation,
-                    GpuLaunchOperation::StudentWinnerDeployment { .. }
-                ) {
-                    active_winner_dispatches.insert(intent.record.dispatch_id);
-                    if active_winner_dispatches.len() > 1 {
-                        bail!("multiple active winner deployments already exist");
-                    }
-                }
             }
             if active_dispatches.len() > MAX_ACTIVE_GPU_LAUNCHES {
                 bail!("GPU launch intent and frontier union exceeds its hard active bound");
@@ -6197,64 +5674,6 @@ impl RecordStore {
             bail!("GPU launch frontier has no capacity for another active claim");
         }
         Ok(intent_count)
-    }
-
-    async fn other_active_winner_exists(
-        &self,
-        scope: &Scope,
-        candidate_dispatch_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<bool> {
-        if !valid_lowercase_sha256(candidate_dispatch_id) {
-            bail!("winner dispatch ID is invalid");
-        }
-        let mut active = HashSet::new();
-        let prefix = ObjectPath::parse(gpu_launch_frontier_prefix(scope))?;
-        let mut listed = self.objects.list(Some(&prefix));
-        let mut scanned = 0_usize;
-        while let Some(meta) = listed.next().await {
-            scanned = scanned.saturating_add(1);
-            if scanned > MAX_ACTIVE_GPU_LAUNCHES {
-                bail!("GPU launch frontier exceeds its hard object bound");
-            }
-            let meta = meta?;
-            let verified = self
-                .load_verified_gpu_launch_frontier(scope, meta.location.as_ref())
-                .await?;
-            if matches!(
-                verified.outbox.operation,
-                GpuLaunchOperation::StudentWinnerDeployment { .. }
-            ) && !self.gpu_launch_is_terminal(scope, &verified.outbox).await?
-                && verified.frontier.dispatch_id != candidate_dispatch_id
-            {
-                active.insert(verified.frontier.dispatch_id);
-            }
-        }
-        for intent in self.load_verified_gpu_launch_intents(scope).await? {
-            if intent.record.state != GpuLaunchIntentState::Pending
-                || intent.record.expires_at <= now
-                || intent.record.dispatch_id == candidate_dispatch_id
-                || !matches!(
-                    intent.record.outbox.operation,
-                    GpuLaunchOperation::StudentWinnerDeployment { .. }
-                )
-            {
-                continue;
-            }
-            let terminal = if self.exists(&intent.claim_object.key).await? {
-                self.gpu_launch_is_terminal(scope, &intent.record.outbox)
-                    .await?
-            } else {
-                false
-            };
-            if !terminal {
-                active.insert(intent.record.dispatch_id);
-            }
-        }
-        if active.len() > 1 {
-            bail!("multiple active winner deployments already exist");
-        }
-        Ok(!active.is_empty())
     }
 
     async fn ensure_gpu_launch_outbox(
@@ -10604,99 +10023,6 @@ impl RecordStore {
             .await
     }
 
-    async fn claim_student_winner_deployment(
-        &self,
-        scope: &Scope,
-        teacher_provider_binding_sha256: &[u8; 32],
-        authority: WinnerDeploymentAuthority,
-        now: DateTime<Utc>,
-    ) -> Result<Option<StudentWinnerDeploymentLaunchWrite>> {
-        authority.validate()?;
-        let Some(student) = self
-            .load_student_reservation(scope, teacher_provider_binding_sha256)
-            .await?
-            .and_then(|frontier| frontier.canonical)
-        else {
-            return Ok(None);
-        };
-        let Some(result) = student.result else {
-            return Ok(None);
-        };
-        if !matches!(result.outcome, StudentJobOutcome::Succeeded { .. }) {
-            return Ok(None);
-        }
-        let student_job_id = decode_hex_digest(&student.claim.student_job_id)?;
-        let claim_key = student_winner_deployment_claim_key(scope, &student_job_id);
-        if self.exists(&claim_key).await? {
-            let (claim, claim_payload) = self
-                .load_verified_student_winner_deployment_claim(scope, &student_job_id)
-                .await?;
-            let (outbox_key, outbox) =
-                student_winner_deployment_gpu_launch_outbox(scope, &claim, &claim_payload)?;
-            let terminal = self
-                .exists(&student_winner_deployment_result_key(
-                    scope,
-                    &student_job_id,
-                ))
-                .await?;
-            if terminal {
-                self.load_verified_student_winner_deployment_result(scope, &student_job_id)
-                    .await?;
-            }
-            self.ensure_gpu_launch_outbox(
-                scope,
-                outbox_key,
-                outbox,
-                !terminal && now < claim.expires_at,
-                now,
-            )
-            .await?;
-            return Ok(None);
-        }
-        if !LEGACY_PROVIDER_CLAIM_CREATION_ENABLED {
-            return Ok(None);
-        }
-        let winner = self
-            .load_verified_student_winner(scope, &student_job_id)
-            .await?;
-        let claim = prepare_student_winner_deployment_claim(scope, &winner, authority, now)?;
-        let encoded = encode_json(claim_key.clone(), &claim)?;
-        if encoded.payload.len() > MAX_WINNER_DEPLOYMENT_CLAIM_BYTES {
-            bail!("student winner deployment claim exceeds its hard byte limit");
-        }
-        let (outbox_key, outbox) =
-            student_winner_deployment_gpu_launch_outbox(scope, &claim, &encoded.payload)?;
-        if self
-            .other_active_winner_exists(scope, &outbox.dispatch_id, now)
-            .await?
-        {
-            return Ok(None);
-        }
-        let intent = self
-            .begin_gpu_launch_intent(
-                scope,
-                GpuLaunchIntentClaim::StudentWinnerDeployment {
-                    claim: claim.clone(),
-                },
-                now,
-            )
-            .await?;
-        let disposition = self.put_create_same(&encoded).await?;
-        self.ensure_gpu_launch_outbox(scope, outbox_key, outbox, true, now)
-            .await?;
-        self.terminalize_gpu_launch_intent(scope, intent, true, now)
-            .await?;
-        if disposition == PutDisposition::Created {
-            Ok(Some(student_winner_deployment_launch_write(
-                &claim,
-                &encoded.payload,
-                claim_key,
-            )))
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn create_student_fanout_claim(
         &self,
         scope: &Scope,
@@ -10855,108 +10181,6 @@ impl RecordStore {
         self.put_create_same(&object).await?;
         self.join_student_stages(scope, &student_job_id).await?;
         Ok(student_stage_result_write(result.student_job_id, key))
-    }
-
-    async fn ingest_student_winner_deployment_result(
-        &self,
-        scope: &Scope,
-        result: StudentWinnerDeploymentResult,
-    ) -> Result<StudentWinnerDeploymentResultWrite> {
-        let student_job_id = decode_hex_digest(&result.student_job_id)?;
-        let key = student_winner_deployment_result_key(scope, &student_job_id);
-        if self.exists(&key).await? {
-            let stored = self
-                .load_verified_student_winner_deployment_result(scope, &student_job_id)
-                .await?;
-            if stored != result {
-                bail!("stored winner deployment result differs from the exact retry");
-            }
-            return Ok(student_winner_deployment_result_write(
-                result.student_job_id,
-                key,
-            ));
-        }
-        let (claim, claim_payload) = self
-            .load_verified_student_winner_deployment_claim(scope, &student_job_id)
-            .await?;
-        validate_student_winner_deployment_result(
-            scope,
-            &student_job_id,
-            &claim,
-            &claim_payload,
-            &result,
-        )?;
-        let object = encode_json(key.clone(), &result)?;
-        if object.payload.len() > MAX_WINNER_DEPLOYMENT_RESULT_BYTES {
-            bail!("student winner deployment result exceeds its hard byte limit");
-        }
-        self.put_create_same(&object).await?;
-        let stored = self
-            .load_verified_student_winner_deployment_result(scope, &student_job_id)
-            .await?;
-        if stored != result {
-            bail!("stored winner deployment result changed after creation");
-        }
-        Ok(student_winner_deployment_result_write(
-            result.student_job_id,
-            key,
-        ))
-    }
-
-    async fn ingest_provider_teardown_result(
-        &self,
-        scope: &Scope,
-        result: ProviderTeardownResult,
-        observed_at: DateTime<Utc>,
-    ) -> Result<ProviderTeardownResultWrite> {
-        let student_job_id = decode_hex_digest(&result.student_job_id)?;
-        let key = provider_teardown_result_key(scope, &student_job_id);
-        if self.exists(&key).await? {
-            let stored = self
-                .load_verified_provider_teardown_result(scope, &student_job_id)
-                .await?;
-            if stored != result {
-                bail!("stored provider teardown result differs from the exact retry");
-            }
-            self.delete(&provider_teardown_frontier_key(scope, &student_job_id))
-                .await?;
-            self.delete_winner_gpu_launch_frontier(scope, &student_job_id)
-                .await?;
-            return Ok(provider_teardown_result_write(result.student_job_id, key));
-        }
-        self.load_verified_provider_teardown_frontier(scope, &student_job_id)
-            .await?;
-        let (authorization, authorization_payload) = self
-            .load_verified_provider_teardown_authorization(scope, &student_job_id)
-            .await?;
-        let winner = self
-            .load_verified_student_winner_deployment_result(scope, &student_job_id)
-            .await?;
-        validate_provider_teardown_result(
-            scope,
-            &student_job_id,
-            &authorization_payload,
-            &authorization,
-            &winner,
-            &result,
-            observed_at,
-        )?;
-        let object = encode_json(key.clone(), &result)?;
-        if object.payload.len() > MAX_PROVIDER_TEARDOWN_RESULT_BYTES {
-            bail!("provider teardown result exceeds its hard byte limit");
-        }
-        self.put_create_same(&object).await?;
-        let stored = self
-            .load_verified_provider_teardown_result(scope, &student_job_id)
-            .await?;
-        if stored != result {
-            bail!("stored provider teardown result changed after creation");
-        }
-        self.delete(&provider_teardown_frontier_key(scope, &student_job_id))
-            .await?;
-        self.delete_winner_gpu_launch_frontier(scope, &student_job_id)
-            .await?;
-        Ok(provider_teardown_result_write(result.student_job_id, key))
     }
 
     async fn store_student_upload(
@@ -11313,677 +10537,23 @@ impl RecordStore {
             self.load_verified_route_commit(scope, &previous.revision)
                 .await?;
         }
-        if publication.is_operator_proposal() {
-            if publication.has_candidate != (publication.candidate_basis_points > 0) {
-                bail!("operator route candidate differs from its basis points");
-            }
-            if !publication.has_candidate {
-                let previous = previous
-                    .context("operator zero route requires its prior committed candidate route")?;
-                if !previous.is_operator_proposal()
-                    || !previous.has_candidate
-                    || previous.candidate_basis_points == 0
-                    || publication.student_result_sha256 != previous.student_result_sha256
-                {
-                    bail!("operator zero route differs from its exact proposal predecessor");
-                }
-            }
-            return if publication.has_candidate {
-                self.verify_route_cohort_binding(scope, publication).await
-            } else {
-                Ok(())
-            };
+        if publication.has_candidate != (publication.candidate_basis_points > 0) {
+            bail!("operator route candidate differs from its basis points");
         }
-        if publication.candidate_basis_points == 0 {
+        if publication.has_candidate != publication.candidate_api_key_sha256.is_some() {
+            bail!("operator route candidate differs from its credential digest");
+        }
+        if !publication.has_candidate {
             let previous = previous
-                .context("zero-basis-point rollback requires a prior committed route revision")?;
-            if previous.candidate_basis_points == 0
-                || publication.cohort_sha256 != previous.cohort_sha256
-                || publication.student_job_id != previous.student_job_id
-                || publication.student_result_sha256 != previous.student_result_sha256
-                || publication.model_manifest_sha256 != previous.model_manifest_sha256
-                || publication.dev_receipt_sha256 != previous.dev_receipt_sha256
-                || publication.deployment_sha256 != previous.deployment_sha256
-                || publication.winner_provider_binding_sha256
-                    != previous.winner_provider_binding_sha256
-                || publication.student_variant != previous.student_variant
-                || publication.student_branch_runtime_image_reference
-                    != previous.student_branch_runtime_image_reference
-                || publication.provider_terms_sha256 != previous.provider_terms_sha256
-                || publication.candidate_api_base_url != previous.candidate_api_base_url
-                || publication.logical_model_alias != previous.logical_model_alias
-                || publication.reasoning_effort != previous.reasoning_effort
-                || publication.route_secret_sha256 != previous.route_secret_sha256
-                || publication.max_input_utf8_bytes != previous.max_input_utf8_bytes
-                || publication.max_input_messages != previous.max_input_messages
-                || publication.max_input_request_bytes != previous.max_input_request_bytes
+                .context("operator zero route requires its prior committed candidate route")?;
+            if !previous.has_candidate
+                || previous.candidate_basis_points == 0
+                || publication.proposal_sha256 != previous.proposal_sha256
             {
-                bail!("zero-basis-point rollback differs from its prior committed route");
-            }
-            return self.verify_route_cohort_binding(scope, publication).await;
-        }
-        self.verify_student_route_is_live(scope, &publication.student_job_id)
-            .await?;
-        let student = self
-            .load_verified_student_route(scope, &publication.student_job_id)
-            .await?;
-        let deployment = self
-            .load_verified_student_winner_deployment_result(scope, &publication.student_job_id)
-            .await?;
-        let (deployment_claim, _) = self
-            .load_verified_student_winner_deployment_claim(scope, &publication.student_job_id)
-            .await?;
-        if publication.student_result_sha256 != student.student_result_sha256
-            || publication.model_manifest_sha256 != student.model_manifest_sha256
-            || publication.dev_receipt_sha256 != student.dev_receipt_sha256
-            || publication.cohort_sha256 != student.cohort_sha256
-            || publication.student_variant != student.student_variant
-            || publication.student_branch_runtime_image_reference
-                != student.student_branch_runtime_image_reference
-            || publication.deployment_sha256 != deployment.admission.deployment_sha256()?
-            || publication.winner_provider_binding_sha256
-                != decode_hex_digest(&deployment_claim.provider_binding_sha256)?
-            || publication.provider_terms_sha256
-                != decode_hex_digest(&deployment_claim.authority.provider_terms_sha256)?
-            || publication.candidate_basis_points
-                != deployment_claim.authority.canary_candidate_basis_points
-        {
-            bail!("route manifest differs from the verified production student winner");
-        }
-        self.verify_route_cohort_binding(scope, publication).await
-    }
-
-    async fn load_verified_student_route(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<VerifiedRouteWinner> {
-        let winner = self
-            .load_verified_student_winner(scope, student_job_id)
-            .await?;
-        for file in &winner.model_manifest.files {
-            self.verify_streamed_object(
-                &file.object_key,
-                &decode_hex_digest(&file.sha256)?,
-                file.bytes,
-            )
-            .await?;
-        }
-        let mut result_bytes = serde_json::to_vec(&winner.result)?;
-        result_bytes.push(b'\n');
-        let result_sha256 = Sha256::digest(&result_bytes).into();
-        let cohort_sha256 = decode_hex_digest(&winner.claim.definition.dev_set_sha256)?;
-        Ok(VerifiedRouteWinner {
-            student_job_id: *student_job_id,
-            student_result_sha256: result_sha256,
-            model_manifest_sha256: winner.model_manifest_sha256,
-            dev_receipt_sha256: winner.dev_receipt_sha256,
-            cohort_sha256,
-            student_variant: match winner.candidate.variant {
-                StudentVariant::Bf16 => WinnerVariant::Bf16,
-                StudentVariant::DynamicFp8 => WinnerVariant::DynamicFp8,
-                StudentVariant::StaticFp8 => WinnerVariant::StaticFp8,
-            },
-            student_branch_runtime_image_reference: winner
-                .claim
-                .definition
-                .student_branch_runtime_image_reference
-                .clone(),
-        })
-    }
-
-    async fn load_verified_student_winner(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<VerifiedStudentWinner> {
-        let (claim, _) = self
-            .load_verified_student_claim(scope, student_job_id)
-            .await?;
-        let result = self
-            .load_verified_student_result(scope, student_job_id)
-            .await?;
-        self.verify_staged_route_evidence(scope, student_job_id, &result)
-            .await?;
-
-        let (candidates, winner) = match &result.outcome {
-            StudentJobOutcome::Succeeded {
-                candidates, winner, ..
-            } => (candidates, *winner),
-            StudentJobOutcome::Failed { .. } => bail!("student job did not succeed"),
-        };
-        let candidate = candidates
-            .iter()
-            .find(|candidate| candidate.variant == winner)
-            .context("student winner has no candidate result")?
-            .clone();
-        let model_manifest_sha256 = decode_hex_digest(&candidate.model_manifest.sha256)?;
-        let model_manifest_bytes = self
-            .load_bytes(
-                &candidate.model_manifest.object_key,
-                MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
-            )
-            .await?;
-        if model_manifest_bytes.len() as u64 != candidate.model_manifest.bytes
-            || Sha256::digest(&model_manifest_bytes).as_slice() != model_manifest_sha256
-        {
-            bail!("winning student model manifest failed byte verification");
-        }
-        let model_manifest: StudentModelManifest = parse_canonical_json_line(
-            &model_manifest_bytes,
-            MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
-            "student model manifest",
-        )?;
-        if model_manifest.schema_version != "milk.student-model-manifest.v1"
-            || model_manifest.student_job_id != result.student_job_id
-            || model_manifest.variant != winner
-            || !model_manifest.retained
-            || !valid_lowercase_sha256(&model_manifest.inventory_sha256)
-            || model_manifest.file_count == 0
-            || model_manifest.file_count > MAX_STUDENT_ARTIFACT_FILES as u64
-            || model_manifest.artifact_bytes == 0
-            || model_manifest.artifact_bytes > MAX_STUDENT_ARTIFACT_BYTES
-        {
-            bail!("winning student model manifest is invalid");
-        }
-        let mut closure = HashSet::new();
-        let artifact_bytes = validate_student_manifest_files(
-            scope,
-            student_job_id,
-            &model_manifest.files,
-            &mut closure,
-        )?;
-        if model_manifest.files.len() as u64 != model_manifest.file_count
-            || artifact_bytes != model_manifest.artifact_bytes
-            || student_inventory_sha256(&model_manifest.files)? != model_manifest.inventory_sha256
-        {
-            bail!("winning student model inventory is invalid");
-        }
-        let dev_receipt_sha256 = decode_hex_digest(&candidate.dev_receipt.sha256)?;
-        let dev_receipt_bytes = self
-            .load_bytes(
-                &candidate.dev_receipt.object_key,
-                MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
-            )
-            .await?;
-        if dev_receipt_bytes.len() as u64 != candidate.dev_receipt.bytes
-            || Sha256::digest(&dev_receipt_bytes).as_slice() != dev_receipt_sha256
-        {
-            bail!("winning student DEV receipt failed byte verification");
-        }
-        let dev_receipt: StudentDevReceipt = parse_canonical_json_line(
-            &dev_receipt_bytes,
-            MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
-            "student DEV receipt",
-        )?;
-        let input = self.load_verified_student_input(scope, &claim).await?;
-        validate_student_dev_receipt(&input, &result, &candidate, &dev_receipt)?;
-
-        Ok(VerifiedStudentWinner {
-            claim,
-            result,
-            candidate,
-            model_manifest_sha256,
-            model_manifest_bytes,
-            model_manifest,
-            dev_receipt_sha256,
-        })
-    }
-
-    async fn load_verified_student_winner_deployment_claim(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<(StudentWinnerDeploymentClaim, Bytes)> {
-        let payload = self
-            .load_bytes(
-                &student_winner_deployment_claim_key(scope, student_job_id),
-                MAX_WINNER_DEPLOYMENT_CLAIM_BYTES,
-            )
-            .await?;
-        let claim: StudentWinnerDeploymentClaim = serde_json::from_slice(&payload)
-            .context("student winner deployment claim is not strict typed JSON")?;
-        let winner = self
-            .load_verified_student_winner(scope, student_job_id)
-            .await?;
-        validate_student_winner_deployment_claim(scope, student_job_id, &winner, &claim, &payload)?;
-        Ok((claim, payload))
-    }
-
-    async fn load_verified_student_winner_deployment_result(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<StudentWinnerDeploymentResult> {
-        Ok(self
-            .load_verified_student_winner_deployment_result_with_payload(scope, student_job_id)
-            .await?
-            .0)
-    }
-
-    async fn load_verified_student_winner_deployment_result_with_payload(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<(StudentWinnerDeploymentResult, Bytes)> {
-        let payload = self
-            .load_bytes(
-                &student_winner_deployment_result_key(scope, student_job_id),
-                MAX_WINNER_DEPLOYMENT_RESULT_BYTES,
-            )
-            .await?;
-        let result: StudentWinnerDeploymentResult = serde_json::from_slice(&payload)
-            .context("student winner deployment result is not strict typed JSON")?;
-        if serde_json::to_vec(&result)? != payload {
-            bail!("student winner deployment result is not canonical typed JSON");
-        }
-        let (claim, claim_payload) = self
-            .load_verified_student_winner_deployment_claim(scope, student_job_id)
-            .await?;
-        validate_student_winner_deployment_result(
-            scope,
-            student_job_id,
-            &claim,
-            &claim_payload,
-            &result,
-        )?;
-        Ok((result, payload))
-    }
-
-    async fn load_verified_provider_teardown_authorization_control(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<(ProviderTeardownAuthorization, Bytes)> {
-        let key = provider_teardown_authorization_key(scope, student_job_id);
-        let payload = self
-            .load_bytes(&key, MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES)
-            .await?;
-        let authorization: ProviderTeardownAuthorization = serde_json::from_slice(&payload)
-            .context("provider teardown authorization is not strict typed JSON")?;
-        if serde_json::to_vec(&authorization)? != payload {
-            bail!("provider teardown authorization is not canonical typed JSON");
-        }
-        let result_key = student_winner_deployment_result_key(scope, student_job_id);
-        let result_payload = self
-            .load_bytes(&result_key, MAX_WINNER_DEPLOYMENT_RESULT_BYTES)
-            .await?;
-        let result = self
-            .load_verified_student_winner_deployment_result(scope, student_job_id)
-            .await?;
-        let (claim, _) = self
-            .load_verified_student_winner_deployment_claim(scope, student_job_id)
-            .await?;
-        validate_provider_teardown_authorization(
-            scope,
-            student_job_id,
-            &claim,
-            &result_payload,
-            &result,
-            &authorization,
-        )?;
-        Ok((authorization, payload))
-    }
-
-    async fn load_verified_provider_teardown_authorization(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<(ProviderTeardownAuthorization, Bytes)> {
-        let (authorization, payload) = self
-            .load_verified_provider_teardown_authorization_control(scope, student_job_id)
-            .await?;
-        if let ProviderTeardownTrigger::RouteZero {
-            retirement_object_key,
-            retirement_sha256,
-            zero_route_revision,
-            canary_route_receipt,
-            zero_route_receipt,
-        } = &authorization.trigger
-        {
-            let retirement_payload = self
-                .load_bytes(retirement_object_key, MAX_ROUTE_RETIREMENT_BYTES)
-                .await?;
-            let retirement = self
-                .load_route_student_retirement(scope, student_job_id)
-                .await?
-                .context("provider teardown route trigger has no retirement")?;
-            if hex_digest(&Sha256::digest(&retirement_payload).into()) != *retirement_sha256
-                || retirement.zero_route_revision != *zero_route_revision
-            {
-                bail!("provider teardown route trigger differs from route authority");
-            }
-            for receipt in [canary_route_receipt, zero_route_receipt] {
-                let revision = decode_hex_digest(&receipt.route_revision)?;
-                let (commit, _, _) = self.load_verified_route_commit(scope, &revision).await?;
-                if receipt.route_revision != commit.route_revision
-                    || receipt.previous_route_revision != commit.previous_route_revision
-                    || receipt.manifest_object_key != commit.manifest_object_key
-                    || receipt.signature_object_key != commit.signature_object_key
-                {
-                    bail!("provider teardown route receipt differs from its committed route");
-                }
-            }
-        }
-        Ok((authorization, payload))
-    }
-
-    async fn load_verified_provider_teardown_frontier(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<ProviderTeardownFrontier> {
-        let key = provider_teardown_frontier_key(scope, student_job_id);
-        let payload = self
-            .load_bytes(&key, MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES)
-            .await?;
-        let frontier: ProviderTeardownFrontier = serde_json::from_slice(&payload)
-            .context("provider teardown frontier is not strict typed JSON")?;
-        let (authorization, authorization_payload) = self
-            .load_verified_provider_teardown_authorization(scope, student_job_id)
-            .await?;
-        if serde_json::to_vec(&frontier)? != payload
-            || frontier.schema_version != "milk.provider-teardown-frontier.v1"
-            || frontier.scope != *scope
-            || frontier.student_job_id != hex_digest(student_job_id)
-            || frontier.authorization_object_key
-                != provider_teardown_authorization_key(scope, student_job_id)
-            || frontier.authorization_sha256
-                != hex_digest(&Sha256::digest(&authorization_payload).into())
-            || frontier.student_job_id != authorization.student_job_id
-        {
-            bail!("provider teardown frontier differs from its immutable authority");
-        }
-        Ok(frontier)
-    }
-
-    async fn load_verified_provider_teardown_frontier_control(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<ProviderTeardownFrontier> {
-        let key = provider_teardown_frontier_key(scope, student_job_id);
-        let payload = self
-            .load_bytes(&key, MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES)
-            .await?;
-        let frontier: ProviderTeardownFrontier = serde_json::from_slice(&payload)
-            .context("provider teardown frontier is not strict typed JSON")?;
-        let (authorization, authorization_payload) = self
-            .load_verified_provider_teardown_authorization_control(scope, student_job_id)
-            .await?;
-        if serde_json::to_vec(&frontier)? != payload
-            || frontier.schema_version != "milk.provider-teardown-frontier.v1"
-            || frontier.scope != *scope
-            || frontier.student_job_id != hex_digest(student_job_id)
-            || frontier.authorization_object_key
-                != provider_teardown_authorization_key(scope, student_job_id)
-            || frontier.authorization_sha256
-                != hex_digest(&Sha256::digest(&authorization_payload).into())
-            || frontier.student_job_id != authorization.student_job_id
-        {
-            bail!("provider teardown frontier differs from its immutable authority");
-        }
-        Ok(frontier)
-    }
-
-    async fn ensure_provider_teardown_authorization(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        trigger: ProviderTeardownTrigger,
-        authorized_at: DateTime<Utc>,
-    ) -> Result<()> {
-        if self
-            .exists(&provider_teardown_result_key(scope, student_job_id))
-            .await?
-        {
-            self.load_verified_provider_teardown_result_control(scope, student_job_id)
-                .await?;
-            self.delete(&provider_teardown_frontier_key(scope, student_job_id))
-                .await?;
-            return Ok(());
-        }
-        let result_key = student_winner_deployment_result_key(scope, student_job_id);
-        let result_payload = self
-            .load_bytes(&result_key, MAX_WINNER_DEPLOYMENT_RESULT_BYTES)
-            .await?;
-        let result = self
-            .load_verified_student_winner_deployment_result(scope, student_job_id)
-            .await?;
-        let (claim, _) = self
-            .load_verified_student_winner_deployment_claim(scope, student_job_id)
-            .await?;
-        let authorization = ProviderTeardownAuthorization {
-            schema_version: "milk.provider-teardown-authorization.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: result.student_job_id.clone(),
-            claim_sha256: result.claim_sha256.clone(),
-            winner_result_object_key: result_key,
-            winner_result_sha256: hex_digest(&Sha256::digest(&result_payload).into()),
-            provider_acceptance_sha256: provider_acceptance_sha256(&result.provider_acceptance)?,
-            run_id: result.provider_acceptance.run_id.clone(),
-            selected_provider: result.provider_acceptance.selection.selected_provider(),
-            execution_id: result.admission.execution_id.clone(),
-            trigger,
-            authorized_at,
-        };
-        validate_provider_teardown_authorization(
-            scope,
-            student_job_id,
-            &claim,
-            &result_payload,
-            &result,
-            &authorization,
-        )?;
-        let authorization_object = encode_json(
-            provider_teardown_authorization_key(scope, student_job_id),
-            &authorization,
-        )?;
-        if authorization_object.payload.len() > MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES {
-            bail!("provider teardown authorization exceeds its hard byte limit");
-        }
-        let authorization_key = authorization_object.key.clone();
-        if self.exists(&authorization_key).await? {
-            let (existing, _) = self
-                .load_verified_provider_teardown_authorization_control(scope, student_job_id)
-                .await?;
-            if existing.student_job_id != authorization.student_job_id
-                || existing.claim_sha256 != authorization.claim_sha256
-                || existing.run_id != authorization.run_id
-            {
-                bail!("provider teardown authorization identity collision");
-            }
-        } else {
-            self.put_create_same(&authorization_object).await?;
-        }
-        let (_, stored_payload) = self
-            .load_verified_provider_teardown_authorization_control(scope, student_job_id)
-            .await?;
-        let frontier = ProviderTeardownFrontier {
-            schema_version: "milk.provider-teardown-frontier.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: hex_digest(student_job_id),
-            authorization_object_key: authorization_key,
-            authorization_sha256: hex_digest(&Sha256::digest(&stored_payload).into()),
-        };
-        let frontier_object = encode_json(
-            provider_teardown_frontier_key(scope, student_job_id),
-            &frontier,
-        )?;
-        if frontier_object.payload.len() > MAX_PROVIDER_TEARDOWN_FRONTIER_BYTES {
-            bail!("provider teardown frontier exceeds its hard byte limit");
-        }
-        self.put_create_same(&frontier_object).await?;
-        if self
-            .load_verified_provider_teardown_frontier_control(scope, student_job_id)
-            .await?
-            != frontier
-        {
-            bail!("provider teardown frontier changed after creation");
-        }
-        Ok(())
-    }
-
-    async fn load_verified_provider_teardown_result_control(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<ProviderTeardownResult> {
-        let payload = self
-            .load_bytes(
-                &provider_teardown_result_key(scope, student_job_id),
-                MAX_PROVIDER_TEARDOWN_RESULT_BYTES,
-            )
-            .await?;
-        let result: ProviderTeardownResult = serde_json::from_slice(&payload)
-            .context("provider teardown result is not strict typed JSON")?;
-        if serde_json::to_vec(&result)? != payload {
-            bail!("provider teardown result is not canonical typed JSON");
-        }
-        let (authorization, authorization_payload) = self
-            .load_verified_provider_teardown_authorization_control(scope, student_job_id)
-            .await?;
-        let winner = self
-            .load_verified_student_winner_deployment_result(scope, student_job_id)
-            .await?;
-        validate_provider_teardown_result(
-            scope,
-            student_job_id,
-            &authorization_payload,
-            &authorization,
-            &winner,
-            &result,
-            result.verified_zero_at,
-        )?;
-        Ok(result)
-    }
-
-    async fn load_verified_provider_teardown_result(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<ProviderTeardownResult> {
-        let (authorization, _) = self
-            .load_verified_provider_teardown_authorization(scope, student_job_id)
-            .await?;
-        let result = self
-            .load_verified_provider_teardown_result_control(scope, student_job_id)
-            .await?;
-        if result.run_id != authorization.run_id {
-            bail!("provider teardown result differs from its route authority");
-        }
-        Ok(result)
-    }
-
-    async fn verify_staged_route_evidence(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        result: &StoredStudentResult,
-    ) -> Result<()> {
-        let winner = student_result_winner(result).context("staged student has no winner")?;
-        let final_evidence = result
-            .gpu_evidence
-            .as_ref()
-            .context("staged student winner has no GPU evidence")?;
-        let (candidates, _) = match &result.outcome {
-            StudentJobOutcome::Succeeded {
-                candidates, winner, ..
-            } => (candidates, winner),
-            StudentJobOutcome::Failed { .. } => bail!("staged student did not succeed"),
-        };
-        for variant in student_variants() {
-            let branch = self
-                .load_verified_student_branch_result(scope, student_job_id, variant)
-                .await?;
-            let StudentBranchOutcome::Succeeded {
-                gpu_evidence,
-                model_manifest,
-                dev_receipt,
-                ..
-            } = branch.outcome
-            else {
-                bail!("staged route has a failed branch");
-            };
-            let evidence_bytes = self
-                .load_bytes(
-                    &gpu_evidence.object_key,
-                    MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
-                )
-                .await?;
-            let evidence: StudentGpuEvidence = parse_canonical_json_line(
-                &evidence_bytes,
-                MAX_STUDENT_ARTIFACT_REFERENCE_BYTES,
-                "student branch GPU evidence",
-            )?;
-            validate_student_stage_gpu_evidence(
-                &result.student_job_id,
-                &result.runner_sha256,
-                &evidence,
-                Some(variant),
-                true,
-            )?;
-            if evidence.kernels.len() != 1 {
-                bail!("staged route branch lacks its exact kernel evidence");
-            }
-            let candidate = candidates
-                .iter()
-                .find(|candidate| candidate.variant == variant)
-                .context("staged route branch has no final candidate")?;
-            if candidate.model_manifest != model_manifest
-                || candidate.dev_receipt != dev_receipt
-                || (variant == winner && *final_evidence != gpu_evidence)
-            {
-                bail!("staged route winner differs from its exact branch references");
+                bail!("operator zero route differs from its exact proposal predecessor");
             }
         }
         Ok(())
-    }
-
-    async fn materialize_student_winner(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-        stage_dir: &Path,
-    ) -> Result<StudentWinnerMaterializationReceipt> {
-        let winner = self
-            .load_verified_student_winner(scope, student_job_id)
-            .await?;
-        let receipt = self
-            .materialize_student_winner_files(
-                stage_dir,
-                student_job_id,
-                winner.candidate.variant,
-                &winner.model_manifest_sha256,
-                &winner.model_manifest_bytes,
-                &winner.model_manifest,
-            )
-            .await?;
-        let reverified = self
-            .load_verified_student_winner(scope, student_job_id)
-            .await;
-        let unchanged = reverified.as_ref().is_ok_and(|current| {
-            current.claim == winner.claim
-                && current.result == winner.result
-                && current.candidate == winner.candidate
-                && current.model_manifest_sha256 == winner.model_manifest_sha256
-                && current.model_manifest_bytes == winner.model_manifest_bytes
-                && current.model_manifest == winner.model_manifest
-                && current.dev_receipt_sha256 == winner.dev_receipt_sha256
-        });
-        if !unchanged {
-            cleanup_student_winner_stage(
-                stage_dir,
-                winner
-                    .model_manifest
-                    .files
-                    .iter()
-                    .map(|file| file.relative_path.as_str()),
-            );
-            reverified?;
-            bail!("student winner authority changed during materialization");
-        }
-        Ok(receipt)
     }
 
     async fn materialize_student_branch_model(
@@ -12095,117 +10665,6 @@ impl RecordStore {
                 Err(error)
             }
         }
-    }
-
-    async fn verify_route_cohort_binding(
-        &self,
-        scope: &Scope,
-        publication: &RoutePublication,
-    ) -> Result<()> {
-        let key = route_cohort_binding_key(scope, &publication.cohort_sha256);
-        if !self.exists(&key).await? {
-            return Ok(());
-        }
-        let bytes = self
-            .load_bytes(&key, MAX_ROUTE_COHORT_BINDING_BYTES)
-            .await?;
-        let binding: RouteCohortBinding = serde_json::from_slice(&bytes)?;
-        if serde_json::to_vec(&binding)? != bytes
-            || binding.schema_version != "milk.route-cohort-binding.v2"
-            || binding.scope != *scope
-            || binding.cohort_sha256 != hex_digest(&publication.cohort_sha256)
-            || binding.route_secret_sha256 != hex_digest(&publication.route_secret_sha256)
-        {
-            bail!("route secret differs from the route cohort binding");
-        }
-        Ok(())
-    }
-
-    async fn load_route_student_retirement(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<Option<RouteStudentRetirement>> {
-        let key = route_student_retirement_key(scope, student_job_id);
-        if !self.exists(&key).await? {
-            return Ok(None);
-        }
-        let bytes = self.load_bytes(&key, MAX_ROUTE_RETIREMENT_BYTES).await?;
-        let retirement: RouteStudentRetirement = serde_json::from_slice(&bytes)?;
-        if serde_json::to_vec(&retirement)? != bytes
-            || retirement.schema_version != "milk.route-student-retirement.v1"
-            || retirement.scope != *scope
-            || retirement.student_job_id != hex_digest(student_job_id)
-            || !valid_lowercase_sha256(&retirement.zero_route_revision)
-        {
-            bail!("route student retirement has the wrong canonical identity or scope");
-        }
-        Ok(Some(retirement))
-    }
-
-    async fn verify_student_route_is_live(
-        &self,
-        scope: &Scope,
-        student_job_id: &[u8; 32],
-    ) -> Result<()> {
-        if self
-            .load_route_student_retirement(scope, student_job_id)
-            .await?
-            .is_some()
-        {
-            bail!("zero-basis-point rollback permanently retires that student deployment");
-        }
-        Ok(())
-    }
-
-    async fn store_route_student_retirement(
-        &self,
-        scope: &Scope,
-        publication: &RoutePublication,
-    ) -> Result<()> {
-        if publication.candidate_basis_points != 0 {
-            bail!("route student retirement requires a zero-basis-point publication");
-        }
-        let retirement = RouteStudentRetirement {
-            schema_version: "milk.route-student-retirement.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: hex_digest(&publication.student_job_id),
-            zero_route_revision: publication.revision_hex(),
-        };
-        let object = encode_json(
-            route_student_retirement_key(scope, &publication.student_job_id),
-            &retirement,
-        )?;
-        if object.payload.len() > MAX_ROUTE_RETIREMENT_BYTES {
-            bail!("route student retirement exceeds {MAX_ROUTE_RETIREMENT_BYTES} bytes");
-        }
-        self.put_create_same(&object).await?;
-        if self
-            .load_route_student_retirement(scope, &publication.student_job_id)
-            .await?
-            != Some(retirement)
-        {
-            bail!("stored route student retirement differs from the zero publication");
-        }
-        Ok(())
-    }
-
-    async fn verify_zero_route_retirement(
-        &self,
-        scope: &Scope,
-        publication: &RoutePublication,
-    ) -> Result<()> {
-        if publication.candidate_basis_points != 0 {
-            bail!("route is not a zero-basis-point retirement");
-        }
-        let retirement = self
-            .load_route_student_retirement(scope, &publication.student_job_id)
-            .await?
-            .context("zero-basis-point route is missing its durable student retirement")?;
-        if retirement.zero_route_revision != publication.revision_hex() {
-            bail!("zero-basis-point route differs from its durable student retirement");
-        }
-        Ok(())
     }
 
     async fn load_harness_artifact<T: DeserializeOwned + Serialize>(
@@ -12920,13 +11379,10 @@ impl RecordStore {
             )
             .await?;
 
-        let budget_free = proposal.uses_budget_free_contract();
-        if budget_free
-            && (proposal.provenance.candidate_score.incumbent.api_url
-                != baseline_chat_completions_url
-                || proposal.provenance.candidate_score.incumbent.model != proposal.model)
+        if proposal.provenance.candidate_score.incumbent.api_url != baseline_chat_completions_url
+            || proposal.provenance.candidate_score.incumbent.model != proposal.model
         {
-            bail!("budget-free fallback evidence is not bound to the configured baseline");
+            bail!("fallback evidence is not bound to the configured baseline");
         }
         let structural: HarnessStructuralBinding =
             serde_json::from_str(summary.structural.get())
@@ -12940,11 +11396,9 @@ impl RecordStore {
             && summary.scope_id == scope.scope_id
             && summary.profile == proposal.profile
             && summary.code_version == proposal.code_version
-            && (!budget_free
-                || (summary.harness_revision.as_deref()
-                    == Some(proposal.provenance.harness_revision.as_str())
-                    && summary.config_sha256.as_deref()
-                        == Some(proposal.provenance.config_sha256.as_str())))
+            && summary.harness_revision.as_deref()
+                == Some(proposal.provenance.harness_revision.as_str())
+            && summary.config_sha256.as_deref() == Some(proposal.provenance.config_sha256.as_str())
             && structural.schema_version == "milk.structural-summary.v1"
             && structural.scope_id == scope.scope_id
             && structural.profile == proposal.profile
@@ -12953,11 +11407,10 @@ impl RecordStore {
             && readiness.scope_id == scope.scope_id
             && readiness.profile == proposal.profile
             && readiness.summary_sha256 == proposal.summary_sha256
-            && (!budget_free
-                || (readiness.harness_revision.as_deref()
-                    == Some(proposal.provenance.harness_revision.as_str())
-                    && readiness.config_sha256.as_deref()
-                        == Some(proposal.provenance.config_sha256.as_str())))
+            && readiness.harness_revision.as_deref()
+                == Some(proposal.provenance.harness_revision.as_str())
+            && readiness.config_sha256.as_deref()
+                == Some(proposal.provenance.config_sha256.as_str())
             && eval.scope_id == scope.scope_id
             && eval.profile == proposal.profile
             && eval.series_id == *series
@@ -12982,18 +11435,8 @@ impl RecordStore {
         if source.schema_version != "milk.summary-source-manifest.v1"
             || summary.schema_version != "milk.summary-version.v1"
             || readiness.schema_version != "milk.readiness.v1"
-            || eval.schema_version
-                != if budget_free {
-                    "milk.eval-revision.v2"
-                } else {
-                    "milk.eval-revision.v1"
-                }
-            || validation.schema_version
-                != if budget_free {
-                    "milk.eval-validation-revision.v2"
-                } else {
-                    "milk.eval-validation-revision.v1"
-                }
+            || eval.schema_version != "milk.eval-revision.v2"
+            || validation.schema_version != "milk.eval-validation-revision.v2"
             || score.schema_version != "milk.candidate-score-revision.v1"
             || !same_identity
             || !valid_optional_harness_digest(summary.parent_version_sha256.as_deref())
@@ -13012,21 +11455,12 @@ impl RecordStore {
         }
 
         let checks = readiness.checks;
-        let eval_generation_capacity = if budget_free {
-            if checks.eval_generation_budget_available.is_some() {
-                bail!("budget-free readiness contains the legacy budget gate");
-            }
-            checks
-                .eval_generation_capacity_available
-                .context("budget-free readiness lacks its capacity gate")?
-        } else {
-            if checks.eval_generation_capacity_available.is_some() {
-                bail!("legacy readiness contains a budget-free capacity gate");
-            }
-            checks
-                .eval_generation_budget_available
-                .context("legacy readiness lacks its budget gate")?
-        };
+        if checks.eval_generation_budget_available.is_some() {
+            bail!("readiness contains the removed budget gate");
+        }
+        let eval_generation_capacity = checks
+            .eval_generation_capacity_available
+            .context("readiness lacks its capacity gate")?;
         let all_ready = [
             checks.minimum_independent_sessions,
             checks.minimum_classified_sessions,
@@ -13039,6 +11473,7 @@ impl RecordStore {
             checks.represented_classes_meet_minimum,
             checks.representative_eval_capacity,
             checks.production_text_reference_capacity,
+            checks.eval_source_plan_feasible,
             checks.closed_watermark_without_capture_gap,
             eval_generation_capacity,
         ]
@@ -13050,6 +11485,7 @@ impl RecordStore {
                 != matches!(proposal.profile, HarnessProfile::Production)
             || readiness.represented_classes.is_empty()
             || !readiness.class_failures.is_empty()
+            || readiness.eval_plan_failure.is_some()
         {
             bail!("harness readiness did not pass every deterministic gate");
         }
@@ -13107,23 +11543,19 @@ impl RecordStore {
     ) -> Result<()> {
         let binding = &proposal.provenance.candidate_score;
         let result = &score.result;
-        let budget_free = proposal.uses_budget_free_contract();
         validate_harness_teacher(&proposal.provenance.teacher)?;
         validate_harness_candidate_score(binding)?;
-        if budget_free {
-            let expected_case_ids =
-                budget_free_harness_score_case_ids(&eval.cases, binding.held_out_cases)?;
-            validate_budget_free_harness_score_target(
-                &result.incumbent,
-                &expected_case_ids,
-                binding.case_reference_similarity_basis_points,
-            )?;
-            validate_budget_free_harness_score_target(
-                &result.candidate,
-                &expected_case_ids,
-                binding.case_reference_similarity_basis_points,
-            )?;
-        }
+        let expected_case_ids = harness_score_case_ids(&eval.cases, binding.held_out_cases)?;
+        validate_harness_score_target_evidence(
+            &result.incumbent,
+            &expected_case_ids,
+            binding.case_reference_similarity_basis_points,
+        )?;
+        validate_harness_score_target_evidence(
+            &result.candidate,
+            &expected_case_ids,
+            binding.case_reference_similarity_basis_points,
+        )?;
         let candidate_url = format!("{}chat/completions", proposal.api_base_url);
         let result_payload = harness_canonical_json_line(result)?;
         let result_sha256 = hex_digest(&Sha256::digest(&result_payload).into());
@@ -13139,9 +11571,6 @@ impl RecordStore {
             .and_then(|value| value.checked_add(result.candidate.input_tokens))
             .and_then(|value| value.checked_add(result.candidate.output_tokens))
             .context("candidate score token count overflow")?;
-        let fallback_reference = binding.minimum_fallback_reference_pass_basis_points;
-        let fallback_errors = binding.maximum_fallback_error_basis_points;
-        let fallback_latency = binding.maximum_fallback_p95_latency_ms;
         let expected_checks = HarnessScoreChecks {
             candidate_reference_pass_rate: result.candidate.reference_pass_basis_points
                 >= binding.minimum_candidate_reference_pass_basis_points,
@@ -13154,39 +11583,30 @@ impl RecordStore {
                 .candidate
                 .p95_latency_ms
                 .is_some_and(|latency| latency <= binding.maximum_candidate_p95_latency_ms),
-            incumbent_reference_pass_rate: fallback_reference
-                .map(|minimum| result.incumbent.reference_pass_basis_points >= minimum),
-            incumbent_errors: fallback_errors
-                .map(|maximum| result.incumbent.error_basis_points <= maximum),
-            incumbent_p95_latency: fallback_latency.map(|maximum| {
-                result
-                    .incumbent
-                    .p95_latency_ms
-                    .is_some_and(|latency| latency <= maximum)
-            }),
+            incumbent_reference_pass_rate: result.incumbent.reference_pass_basis_points
+                >= binding.minimum_fallback_reference_pass_basis_points,
+            incumbent_errors: result.incumbent.error_basis_points
+                <= binding.maximum_fallback_error_basis_points,
+            incumbent_p95_latency: result
+                .incumbent
+                .p95_latency_ms
+                .is_some_and(|latency| latency <= binding.maximum_fallback_p95_latency_ms),
         };
         let qualified = [
             expected_checks.candidate_reference_pass_rate,
             expected_checks.reference_pass_delta,
             expected_checks.candidate_errors,
             expected_checks.candidate_p95_latency,
-            expected_checks
-                .incumbent_reference_pass_rate
-                .unwrap_or(true),
-            expected_checks.incumbent_errors.unwrap_or(true),
-            expected_checks.incumbent_p95_latency.unwrap_or(true),
+            expected_checks.incumbent_reference_pass_rate,
+            expected_checks.incumbent_errors,
+            expected_checks.incumbent_p95_latency,
         ]
         .into_iter()
         .all(|passed| passed);
         if score.score_job_id != proposal.provenance.job_ids.candidate_score
             || score.provider_result_sha256 != result_sha256
             || !score.qualified
-            || result.schema_version
-                != if budget_free {
-                    "milk.candidate-score-job-result.v2"
-                } else {
-                    "milk.candidate-score-job-result.v1"
-                }
+            || result.schema_version != "milk.candidate-score-job-result.v2"
             || result.job_id != score.score_job_id
             || result.outcome != "succeeded"
             || !result.qualified
@@ -13245,71 +11665,6 @@ impl RecordStore {
         {
             bail!("harness route proposal token accounting is invalid");
         }
-        if budget_free {
-            if eval.cost_microusd.is_some()
-                || validation.cost_microusd.is_some()
-                || result.calculated_cost_microusd.is_some()
-                || result.accounted_cost_microusd.is_some()
-                || result.incumbent.calculated_cost_microusd.is_some()
-                || result.candidate.calculated_cost_microusd.is_some()
-                || fallback_reference.is_none()
-                || fallback_errors.is_none()
-                || fallback_latency.is_none()
-            {
-                bail!(
-                    "budget-free route evidence contains monetary fields or lacks fallback checks"
-                );
-            }
-        } else {
-            if fallback_reference.is_some()
-                || fallback_errors.is_some()
-                || fallback_latency.is_some()
-                || expected_checks.incumbent_reference_pass_rate.is_some()
-                || expected_checks.incumbent_errors.is_some()
-                || expected_checks.incumbent_p95_latency.is_some()
-            {
-                bail!("legacy route evidence contains budget-free fallback checks");
-            }
-            let incumbent_cost = harness_score_target_cost(&result.incumbent, &binding.incumbent)?;
-            let candidate_cost = harness_score_target_cost(&result.candidate, &binding.candidate)?;
-            let input_rate = teacher
-                .input_rate_microusd_per_million
-                .context("legacy teacher input rate is missing")?;
-            let output_rate = teacher
-                .output_rate_microusd_per_million
-                .context("legacy teacher output rate is missing")?;
-            let eval_cost = harness_token_cost(eval.token_usage.input_tokens, input_rate)?
-                .checked_add(harness_token_cost(
-                    eval.token_usage.output_tokens,
-                    output_rate,
-                )?)
-                .context("harness eval cost overflow")?;
-            let validation_cost =
-                harness_token_cost(validation.token_usage.input_tokens, input_rate)?
-                    .checked_add(harness_token_cost(
-                        validation.token_usage.output_tokens,
-                        output_rate,
-                    )?)
-                    .context("harness validation cost overflow")?;
-            let score_cost = incumbent_cost
-                .checked_add(candidate_cost)
-                .context("candidate score cost overflow")?;
-            let known_cost = eval_cost
-                .checked_add(validation_cost)
-                .and_then(|value| value.checked_add(score_cost))
-                .context("harness known cost overflow")?;
-            if eval.cost_microusd != Some(eval_cost)
-                || validation.cost_microusd != Some(validation_cost)
-                || result.calculated_cost_microusd != Some(score_cost)
-                || result.accounted_cost_microusd != Some(score_cost)
-                || proposal
-                    .provenance
-                    .accounted_cost_microusd
-                    .is_none_or(|accounted| accounted < known_cost)
-            {
-                bail!("legacy route proposal cost accounting is invalid");
-            }
-        }
         Ok(())
     }
 
@@ -13320,11 +11675,8 @@ impl RecordStore {
         previous: Option<&RoutePublication>,
         manifest: Vec<u8>,
         signature: Vec<u8>,
-        published_at: DateTime<Utc>,
+        _published_at: DateTime<Utc>,
     ) -> Result<RoutePublicationWrite> {
-        if !publication.is_operator_proposal() && publication.candidate_basis_points > 0 {
-            bail!("legacy student winner candidate routes are read-only");
-        }
         let manifest_sha256: [u8; 32] = Sha256::digest(&manifest).into();
         if manifest.len() > MAX_ROUTE_MANIFEST_BYTES
             || manifest_sha256 != publication.revision
@@ -13348,25 +11700,9 @@ impl RecordStore {
             payload: Bytes::from(signature.clone()),
             sha256: signature_sha256,
         };
-        let cohort_binding = (publication.candidate_basis_points > 0).then(|| {
-            encode_json(
-                route_cohort_binding_key(scope, &publication.cohort_sha256),
-                &RouteCohortBinding {
-                    schema_version: "milk.route-cohort-binding.v2".to_owned(),
-                    scope: scope.clone(),
-                    cohort_sha256: hex_digest(&publication.cohort_sha256),
-                    route_secret_sha256: hex_digest(&publication.route_secret_sha256),
-                },
-            )
-        });
-        let cohort_binding = cohort_binding.transpose()?;
-        if let Some(object) = &cohort_binding {
-            self.put_create_same(object).await?;
-        }
         for object in [&manifest_object, &signature_object] {
             self.put_create_same(object).await?;
         }
-        self.verify_route_cohort_binding(scope, publication).await?;
         let commit_key = route_commit_key(scope, &publication.revision);
         let commit = RoutePublicationCommit {
             schema_version: "milk.route-publication-commit.v2".to_owned(),
@@ -13395,27 +11731,7 @@ impl RecordStore {
         {
             bail!("stored route publication differs from the signed input");
         }
-        if !publication.is_operator_proposal()
-            && let Some(previous) = previous.filter(|route| route.candidate_basis_points == 0)
-        {
-            let (current, _) = self
-                .load_live_pointer(scope)
-                .await?
-                .context("zero-basis-point predecessor is not the live route")?;
-            if current.route_revision != previous.revision
-                && current.route_revision != publication.revision
-            {
-                bail!("zero-basis-point predecessor is not the live route");
-            }
-            self.store_route_student_retirement(scope, previous).await?;
-            self.verify_student_route_is_live(scope, &publication.student_job_id)
-                .await?;
-        }
         self.activate_route(scope, publication).await?;
-        if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
-            self.store_route_student_retirement(scope, publication)
-                .await?;
-        }
         let (pointer, live_manifest, live_signature) = self
             .load_live_route(scope)
             .await?
@@ -13426,36 +11742,8 @@ impl RecordStore {
         {
             bail!("live route differs from the activated publication");
         }
-        if publication.candidate_basis_points == 0 && !publication.is_operator_proposal() {
-            self.verify_zero_route_retirement(scope, publication)
-                .await?;
-            let canary = previous.context(
-                "provider teardown requires the verified canary preceding the zero route",
-            )?;
-            let (canary_commit, _, _) = self
-                .load_verified_route_commit(scope, &canary.revision)
-                .await?;
-            let retirement_key = route_student_retirement_key(scope, &publication.student_job_id);
-            let retirement_payload = self
-                .load_bytes(&retirement_key, MAX_ROUTE_RETIREMENT_BYTES)
-                .await?;
-            self.ensure_provider_teardown_authorization(
-                scope,
-                &publication.student_job_id,
-                ProviderTeardownTrigger::RouteZero {
-                    retirement_object_key: retirement_key,
-                    retirement_sha256: hex_digest(&Sha256::digest(&retirement_payload).into()),
-                    zero_route_revision: publication.revision_hex(),
-                    canary_route_receipt: Box::new(route_publication_write(&canary_commit, canary)),
-                    zero_route_receipt: Box::new(route_publication_write(&stored, publication)),
-                },
-                published_at,
-            )
-            .await?;
-        }
-        Ok(route_publication_write(&stored, publication))
+        route_publication_write(&stored, publication, previous)
     }
-
     async fn activate_route(&self, scope: &Scope, publication: &RoutePublication) -> Result<()> {
         let pointer = RouteLivePointer::new(
             route_scope(scope),
@@ -15694,12 +13982,6 @@ fn validate_harness_score_target(binding: &HarnessScoreTargetBinding) -> Result<
         || endpoint.fragment().is_some()
         || !endpoint.path().ends_with("/v1/chat/completions")
         || !valid_harness_model(&binding.model)
-        || binding
-            .input_rate_microusd_per_million
-            .is_some_and(|rate| rate > 1_000_000_000)
-        || binding
-            .output_rate_microusd_per_million
-            .is_some_and(|rate| rate > 1_000_000_000)
     {
         bail!("harness score target binding is invalid");
     }
@@ -15721,24 +14003,15 @@ fn validate_harness_teacher(binding: &HarnessTeacherBinding) -> Result<()> {
         || !(1..=120).contains(&binding.timeout_seconds)
         || !(128..=100_000).contains(&binding.max_input_tokens)
         || !(64..=16_384).contains(&binding.max_output_tokens)
-        || binding
-            .input_rate_microusd_per_million
-            .is_some_and(|rate| rate > 1_000_000_000)
-        || binding
-            .output_rate_microusd_per_million
-            .is_some_and(|rate| rate > 1_000_000_000)
     {
         bail!("harness teacher binding is invalid");
     }
     Ok(())
 }
 
-fn budget_free_harness_score_case_ids(
-    cases: &[HarnessEvalCase],
-    held_out_cases: u64,
-) -> Result<Vec<String>> {
-    let held_out_cases = usize::try_from(held_out_cases)
-        .context("budget-free score held-out case count is too large")?;
+fn harness_score_case_ids(cases: &[HarnessEvalCase], held_out_cases: u64) -> Result<Vec<String>> {
+    let held_out_cases =
+        usize::try_from(held_out_cases).context("score held-out case count is too large")?;
     if cases
         .iter()
         .any(|case| !valid_lowercase_hex(&case.case_id, 64))
@@ -15749,7 +14022,7 @@ fn budget_free_harness_score_case_ids(
             .len()
             != cases.len()
     {
-        bail!("budget-free eval case IDs are invalid or not unique");
+        bail!("eval case IDs are invalid or not unique");
     }
     let mut ranked = cases
         .iter()
@@ -15767,7 +14040,7 @@ fn budget_free_harness_score_case_ids(
         .map(|(_, case_id)| case_id)
         .collect::<Vec<_>>();
     if selected.len() != held_out_cases {
-        bail!("budget-free score held-out case IDs are incomplete");
+        bail!("score held-out case IDs are incomplete");
     }
     Ok(selected)
 }
@@ -15779,12 +14052,12 @@ fn harness_score_rate_basis_points(numerator: u64, denominator: u64) -> Result<u
     let basis_points = numerator
         .checked_mul(10_000)
         .and_then(|value| value.checked_add(denominator / 2))
-        .context("budget-free score rate overflow")?
+        .context("score rate overflow")?
         / denominator;
-    u16::try_from(basis_points.min(10_000)).context("budget-free score rate is invalid")
+    u16::try_from(basis_points.min(10_000)).context("score rate is invalid")
 }
 
-fn validate_budget_free_harness_score_target(
+fn validate_harness_score_target_evidence(
     target: &HarnessScoreTargetResult,
     expected_case_ids: &[String],
     reference_pass_threshold_basis_points: u16,
@@ -15796,7 +14069,7 @@ fn validate_budget_free_harness_score_target(
             .zip(expected_case_ids)
             .any(|(case, expected)| case.case_id.as_str() != expected)
     {
-        bail!("budget-free score rows differ from the deterministic held-out case order");
+        bail!("score rows differ from the deterministic held-out case order");
     }
 
     let mut reference_passes = 0_u64;
@@ -15804,7 +14077,7 @@ fn validate_budget_free_harness_score_target(
     let mut latencies = Vec::with_capacity(target.cases.len());
     for case in &target.cases {
         if case.reference_similarity_basis_points > 10_000 {
-            bail!("budget-free score row similarity is invalid");
+            bail!("score row similarity is invalid");
         }
         match (
             case.error_class.as_deref(),
@@ -15820,7 +14093,7 @@ fn validate_budget_free_harness_score_target(
             {
                 errors = errors
                     .checked_add(1)
-                    .context("budget-free score error count overflow")?;
+                    .context("score error count overflow")?;
             }
             (None, Some(latency), Some(provider_request_id_sha256))
                 if latency <= 120_000 && valid_lowercase_hex(provider_request_id_sha256, 64) =>
@@ -15828,11 +14101,11 @@ fn validate_budget_free_harness_score_target(
                 if case.reference_similarity_basis_points >= reference_pass_threshold_basis_points {
                     reference_passes = reference_passes
                         .checked_add(1)
-                        .context("budget-free score pass count overflow")?;
+                        .context("score pass count overflow")?;
                 }
                 latencies.push(latency);
             }
-            _ => bail!("budget-free score row evidence is inconsistent"),
+            _ => bail!("score row evidence is inconsistent"),
         }
     }
     latencies.sort_unstable();
@@ -15842,8 +14115,7 @@ fn validate_budget_free_harness_score_target(
         let index = ((latencies.len() - 1) * 95 + 99) / 100;
         Some(latencies[index])
     };
-    let attempted =
-        u64::try_from(target.cases.len()).context("budget-free score row count is too large")?;
+    let attempted = u64::try_from(target.cases.len()).context("score row count is too large")?;
     if target.attempted != attempted
         || target.reference_passes != reference_passes
         || target.reference_pass_basis_points
@@ -15852,7 +14124,7 @@ fn validate_budget_free_harness_score_target(
         || target.error_basis_points != harness_score_rate_basis_points(errors, attempted)?
         || target.p95_latency_ms != p95_latency_ms
     {
-        bail!("budget-free score aggregates differ from their row evidence");
+        bail!("score aggregates differ from their row evidence");
     }
     Ok(())
 }
@@ -15885,61 +14157,13 @@ fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> R
         || !(-10_000..=10_000).contains(&binding.minimum_reference_pass_delta_basis_points)
         || binding.maximum_candidate_error_basis_points > 10_000
         || !(1..=120_000).contains(&binding.maximum_candidate_p95_latency_ms)
-        || binding
-            .minimum_fallback_reference_pass_basis_points
-            .is_some_and(|value| !(1..=10_000).contains(&value))
-        || binding
-            .maximum_fallback_error_basis_points
-            .is_some_and(|value| value > 10_000)
-        || binding
-            .maximum_fallback_p95_latency_ms
-            .is_some_and(|value| !(1..=120_000).contains(&value))
+        || !(1..=10_000).contains(&binding.minimum_fallback_reference_pass_basis_points)
+        || binding.maximum_fallback_error_basis_points > 10_000
+        || !(1..=120_000).contains(&binding.maximum_fallback_p95_latency_ms)
     {
         bail!("harness candidate score binding is invalid");
     }
     Ok(())
-}
-
-fn harness_token_cost(tokens: u64, rate_microusd_per_million: u64) -> Result<u64> {
-    tokens
-        .checked_mul(rate_microusd_per_million)
-        .and_then(|value| value.checked_add(999_999))
-        .map(|value| value / 1_000_000)
-        .context("harness token cost overflow")
-}
-
-fn harness_score_target_cost(
-    target: &HarnessScoreTargetResult,
-    binding: &HarnessScoreTargetBinding,
-) -> Result<u64> {
-    validate_harness_score_target(binding)?;
-    let minimum = harness_token_cost(
-        target.input_tokens,
-        binding
-            .input_rate_microusd_per_million
-            .context("legacy score target input rate is missing")?,
-    )?
-    .checked_add(harness_token_cost(
-        target.output_tokens,
-        binding
-            .output_rate_microusd_per_million
-            .context("legacy score target output rate is missing")?,
-    )?)
-    .context("harness score target cost overflow")?;
-    // Harness bills each call with integer ceiling. Only aggregate tokens are
-    // retained, so each token category can add at most attempted - 1 microusd
-    // beyond the ceiling of its aggregate.
-    let rounding_allowance = target.attempted.saturating_sub(1).saturating_mul(2);
-    let maximum = minimum
-        .checked_add(rounding_allowance)
-        .context("harness score target cost overflow")?;
-    let calculated_cost_microusd = target
-        .calculated_cost_microusd
-        .context("legacy score target cost is missing")?;
-    if !(minimum..=maximum).contains(&calculated_cost_microusd) {
-        bail!("harness score target cost is inconsistent with its token accounting");
-    }
-    Ok(calculated_cost_microusd)
 }
 
 fn scope_prefix(scope: &Scope) -> String {
@@ -17167,545 +15391,6 @@ fn student_fanout_launch_write(
     }
 }
 
-fn prepare_student_winner_deployment_claim(
-    scope: &Scope,
-    winner: &VerifiedStudentWinner,
-    authority: WinnerDeploymentAuthority,
-    claimed_at: DateTime<Utc>,
-) -> Result<StudentWinnerDeploymentClaim> {
-    authority.validate()?;
-    if winner.claim.scope != *scope
-        || winner.result.scope != *scope
-        || winner.claim.student_job_id != winner.result.student_job_id
-        || winner.candidate.variant
-            != student_result_winner(&winner.result)
-                .context("verified student result has no winner")?
-        || winner.candidate.model_manifest.sha256 != hex_digest(&winner.model_manifest_sha256)
-        || winner.candidate.dev_receipt.sha256 != hex_digest(&winner.dev_receipt_sha256)
-        || winner
-            .claim
-            .definition
-            .student_branch_runtime_image_reference
-            != authority.student_branch_runtime_image_reference
-        || claimed_at < winner.result.finished_at
-        || claimed_at >= authority.authorization_not_after
-    {
-        bail!("student winner differs from its deployment authority");
-    }
-    let student_claim_sha256 =
-        hex_digest(&Sha256::digest(serde_json::to_vec(&winner.claim)?).into());
-    let student_result_sha256 =
-        hex_digest(&Sha256::digest(canonical_json_line(&winner.result)?).into());
-    Ok(StudentWinnerDeploymentClaim {
-        schema_version: "milk.student-winner-deployment-claim.v2".to_owned(),
-        scope: scope.clone(),
-        student_job_id: winner.claim.student_job_id.clone(),
-        student_claim_sha256,
-        student_result_sha256,
-        winner: winner.candidate.variant,
-        model_manifest: winner.candidate.model_manifest.clone(),
-        dev_receipt: winner.candidate.dev_receipt.clone(),
-        student_branch_runtime_image_reference: winner
-            .claim
-            .definition
-            .student_branch_runtime_image_reference
-            .clone(),
-        provider_binding_sha256: hex_digest(&authority.provider_binding_sha256()?),
-        expires_at: authority.authorization_not_after,
-        authority,
-        claimed_at,
-    })
-}
-
-fn validate_student_winner_deployment_claim(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-    winner: &VerifiedStudentWinner,
-    claim: &StudentWinnerDeploymentClaim,
-    payload: &[u8],
-) -> Result<()> {
-    validate_student_winner_deployment_claim_record(scope, student_job_id, claim, payload)?;
-    let expected = prepare_student_winner_deployment_claim(
-        scope,
-        winner,
-        claim.authority.clone(),
-        claim.claimed_at,
-    )?;
-    if claim != &expected {
-        bail!("student winner deployment claim identity or authority is invalid");
-    }
-    Ok(())
-}
-
-fn validate_student_winner_deployment_claim_record(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-    claim: &StudentWinnerDeploymentClaim,
-    payload: &[u8],
-) -> Result<()> {
-    claim.authority.validate()?;
-    validate_student_artifact_ref(scope, student_job_id, &claim.model_manifest)?;
-    validate_student_artifact_ref(scope, student_job_id, &claim.dev_receipt)?;
-    if serde_json::to_vec(claim)? != payload
-        || claim.schema_version != "milk.student-winner-deployment-claim.v2"
-        || claim.scope != *scope
-        || claim.student_job_id != hex_digest(student_job_id)
-        || !valid_lowercase_sha256(&claim.student_claim_sha256)
-        || !valid_lowercase_sha256(&claim.student_result_sha256)
-        || !valid_lowercase_sha256(&claim.provider_binding_sha256)
-        || claim.provider_binding_sha256 != hex_digest(&claim.authority.provider_binding_sha256()?)
-        || claim.student_branch_runtime_image_reference
-            != claim.authority.student_branch_runtime_image_reference
-        || claim.claimed_at >= claim.expires_at
-        || claim.expires_at != claim.authority.authorization_not_after
-    {
-        bail!("student winner deployment claim identity or authority is invalid");
-    }
-    Ok(())
-}
-
-impl WinnerProviderAcceptance {
-    fn validate(&self) -> Result<VerifiedWinnerProviderAcceptance> {
-        for digest in [
-            &self.campaign_id,
-            &self.run_id,
-            &self.claim_sha256,
-            &self.outbox_sha256,
-            &self.provider_binding_sha256,
-            &self.image_release_sha256,
-            &self.image_admission_sha256,
-            &self.provider_pass_claim_sha256,
-            &self.create_authorization_sha256,
-            &self.budget_reservation_sha256,
-        ] {
-            if !valid_lowercase_sha256(digest) {
-                bail!("winner provider acceptance digest is invalid");
-            }
-        }
-        if self.schema_version != "milk.winner-provider-acceptance.v1"
-            || self.state != "accepted"
-            || !(1..=self.max_cost_microusd).contains(&self.reserved_microusd)
-            || !(60..=crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS)
-                .contains(&self.max_wall_seconds)
-            || !(1..=crate::route::MAX_WINNER_DEPLOYMENT_COST_MICROUSD)
-                .contains(&self.max_cost_microusd)
-        {
-            bail!("winner provider acceptance bounds are invalid");
-        }
-        let (first_preflight_at, last_preflight_at) = match &self.selection {
-            WinnerProviderSelection::Baseten {
-                provider_identity,
-                primary_preflight,
-            } => {
-                if provider_identity.provider != WinnerProvider::Baseten
-                    || !valid_baseten_team_name(&provider_identity.team_name)
-                    || primary_preflight.provider != WinnerProvider::Baseten
-                    || primary_preflight.outcome != "ready"
-                    || !valid_lowercase_sha256(&primary_preflight.evidence_sha256)
-                {
-                    bail!("Baseten winner provider selection is invalid");
-                }
-                let observed_at = parse_provider_acceptance_time(&primary_preflight.observed_at)?;
-                (observed_at, observed_at)
-            }
-        };
-        let reserved_at = parse_provider_acceptance_time(&self.reserved_at)?;
-        let accepted_at = parse_provider_acceptance_time(&self.accepted_at)?;
-        let create_not_after = parse_provider_acceptance_time(&self.create_not_after)?;
-        let provider_not_after = parse_provider_acceptance_time(&self.provider_not_after)?;
-        let maximum_interval = TimeDelta::seconds(
-            i64::try_from(self.max_wall_seconds)
-                .context("winner provider wall bound is out of range")?,
-        );
-        if last_preflight_at > reserved_at
-            || reserved_at > accepted_at
-            || accepted_at >= create_not_after
-            || create_not_after > provider_not_after
-            || provider_not_after - accepted_at > maximum_interval
-        {
-            bail!("winner provider acceptance timing is invalid");
-        }
-        Ok(VerifiedWinnerProviderAcceptance {
-            selected_provider: WinnerProvider::Baseten,
-            first_preflight_at,
-            last_preflight_at,
-            reserved_at,
-            accepted_at,
-            create_not_after,
-            provider_not_after,
-        })
-    }
-}
-
-fn provider_neutral_winner_run_id(
-    acceptance: &WinnerProviderAcceptance,
-    student_job_id: &str,
-    student_result_sha256: &str,
-    winner: StudentVariant,
-) -> Result<String> {
-    let identity = ProviderNeutralWinnerRunIdentity {
-        schema_version: "milk.provider-neutral-winner-run.v1",
-        campaign_id: &acceptance.campaign_id,
-        claim_sha256: &acceptance.claim_sha256,
-        outbox_sha256: &acceptance.outbox_sha256,
-        operation: ProviderNeutralWinnerOperation {
-            kind: "student_winner_deployment",
-            student_job_id,
-            student_result_sha256,
-            winner,
-            max_wall_seconds: acceptance.max_wall_seconds,
-            max_cost_microusd: acceptance.max_cost_microusd,
-        },
-        image_release_sha256: &acceptance.image_release_sha256,
-        image_admission_sha256: &acceptance.image_admission_sha256,
-    };
-    let mut encoded = serde_json::to_vec(&identity)?;
-    encoded.push(b'\n');
-    let mut digest = Sha256::new();
-    digest.update(b"milk.provider-neutral-winner-run.v1\0");
-    digest.update(encoded);
-    Ok(hex_digest(&digest.finalize().into()))
-}
-
-fn valid_baseten_team_name(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .last()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'.' | b'_' | b'-'))
-}
-
-fn valid_provider_identity(value: &str, max_bytes: usize, punctuation: &[u8]) -> bool {
-    (1..=max_bytes).contains(&value.len())
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
-}
-
-fn parse_provider_acceptance_time(value: &str) -> Result<DateTime<Utc>> {
-    let bytes = value.as_bytes();
-    let fixed = (bytes.len() == 20 || (22..=30).contains(&bytes.len()))
-        && bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && bytes.get(10) == Some(&b'T')
-        && bytes.get(13) == Some(&b':')
-        && bytes.get(16) == Some(&b':')
-        && bytes.last() == Some(&b'Z')
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            4 | 7 | 10 | 13 | 16 => true,
-            19 if bytes.len() > 20 => *byte == b'.',
-            _ if index + 1 == bytes.len() => true,
-            _ => byte.is_ascii_digit(),
-        });
-    if !fixed || (bytes.len() == 20 && bytes.get(19) != Some(&b'Z')) {
-        bail!("winner provider acceptance time must be UTC RFC3339");
-    }
-    Ok(DateTime::parse_from_rfc3339(value)
-        .context("winner provider acceptance time must be UTC RFC3339")?
-        .with_timezone(&Utc))
-}
-
-fn validate_student_winner_deployment_result(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-    claim: &StudentWinnerDeploymentClaim,
-    claim_payload: &[u8],
-    result: &StudentWinnerDeploymentResult,
-) -> Result<()> {
-    result.admission.validate_for_authority(&claim.authority)?;
-    let acceptance = result.provider_acceptance.validate()?;
-    let (_, outbox) = student_winner_deployment_gpu_launch_outbox(scope, claim, claim_payload)?;
-    let claim_sha256 = hex_digest(&Sha256::digest(claim_payload).into());
-    let outbox_sha256 = hex_digest(&Sha256::digest(serde_json::to_vec(&outbox)?).into());
-    let expected_variant = match claim.winner {
-        StudentVariant::Bf16 => WinnerVariant::Bf16,
-        StudentVariant::DynamicFp8 => WinnerVariant::DynamicFp8,
-        StudentVariant::StaticFp8 => WinnerVariant::StaticFp8,
-    };
-    if result.schema_version != "milk.student-winner-deployment-result.v1"
-        || result.scope != *scope
-        || result.student_job_id != hex_digest(student_job_id)
-        || result.student_job_id != claim.student_job_id
-        || result.claim_sha256 != claim_sha256
-        || result.provider_binding_sha256 != claim.provider_binding_sha256
-        || result.provider_acceptance.claim_sha256 != claim_sha256
-        || result.provider_acceptance.outbox_sha256 != outbox_sha256
-        || result.provider_acceptance.provider_binding_sha256 != claim.provider_binding_sha256
-        || result.provider_acceptance.run_id
-            != provider_neutral_winner_run_id(
-                &result.provider_acceptance,
-                &claim.student_job_id,
-                &claim.student_result_sha256,
-                claim.winner,
-            )?
-        || result.provider_acceptance.max_wall_seconds != claim.authority.max_wall_seconds
-        || result.provider_acceptance.max_cost_microusd != claim.authority.max_cost_microusd
-        || result.observed_cost_microusd > result.provider_acceptance.reserved_microusd
-        || acceptance.selected_provider.as_str() != result.admission.provider
-        || claim.claimed_at > acceptance.first_preflight_at
-        || acceptance.last_preflight_at > acceptance.reserved_at
-        || acceptance.accepted_at > result.admission.launch_started_at
-        || result.admission.launch_started_at > acceptance.create_not_after
-        || result.admission.service_not_after > acceptance.provider_not_after
-        || acceptance.provider_not_after > claim.expires_at
-        || result.admission.student_job_id != claim.student_job_id
-        || result.admission.student_variant != expected_variant
-        || result.admission.model_manifest_sha256 != claim.model_manifest.sha256
-        || result.admission.student_branch_runtime_image_reference
-            != claim.student_branch_runtime_image_reference
-        || result.admission.launch_started_at < claim.claimed_at
-        || result.admission.admitted_at >= claim.expires_at
-    {
-        bail!("student winner deployment result differs from its immutable claim");
-    }
-    Ok(())
-}
-
-fn provider_acceptance_sha256(acceptance: &WinnerProviderAcceptance) -> Result<String> {
-    Ok(hex_digest(
-        &Sha256::digest(canonical_json_line(acceptance)?).into(),
-    ))
-}
-
-fn validate_provider_teardown_authorization(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-    claim: &StudentWinnerDeploymentClaim,
-    result_payload: &[u8],
-    result: &StudentWinnerDeploymentResult,
-    authorization: &ProviderTeardownAuthorization,
-) -> Result<()> {
-    let selected_provider = result.provider_acceptance.selection.selected_provider();
-    if authorization.schema_version != "milk.provider-teardown-authorization.v1"
-        || authorization.scope != *scope
-        || authorization.student_job_id != hex_digest(student_job_id)
-        || authorization.student_job_id != result.student_job_id
-        || authorization.claim_sha256 != result.claim_sha256
-        || authorization.winner_result_object_key
-            != student_winner_deployment_result_key(scope, student_job_id)
-        || authorization.winner_result_sha256 != hex_digest(&Sha256::digest(result_payload).into())
-        || authorization.provider_acceptance_sha256
-            != provider_acceptance_sha256(&result.provider_acceptance)?
-        || authorization.run_id != result.provider_acceptance.run_id
-        || authorization.selected_provider != selected_provider
-        || authorization.execution_id != result.admission.execution_id
-        || authorization.authorized_at < result.admission.admitted_at
-    {
-        bail!("provider teardown authorization differs from the admitted winner");
-    }
-    match &authorization.trigger {
-        ProviderTeardownTrigger::RouteZero {
-            retirement_object_key,
-            retirement_sha256,
-            zero_route_revision,
-            canary_route_receipt,
-            zero_route_receipt,
-        } => {
-            if retirement_object_key != &route_student_retirement_key(scope, student_job_id)
-                || !valid_lowercase_sha256(retirement_sha256)
-                || !valid_lowercase_sha256(zero_route_revision)
-                || zero_route_revision != &zero_route_receipt.route_revision
-            {
-                bail!("provider teardown zero-route trigger is invalid");
-            }
-            validate_provider_route_receipt(
-                scope,
-                claim,
-                canary_route_receipt,
-                crate::route::WINNER_CANARY_BASIS_POINTS,
-                None,
-                false,
-            )?;
-            validate_provider_route_receipt(
-                scope,
-                claim,
-                zero_route_receipt,
-                0,
-                Some(&canary_route_receipt.route_revision),
-                true,
-            )?;
-        }
-        ProviderTeardownTrigger::ServiceExpired { service_not_after } => {
-            if service_not_after != &result.admission.service_not_after
-                || authorization.authorized_at < *service_not_after
-            {
-                bail!("provider teardown expiry trigger is invalid");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_provider_route_receipt(
-    scope: &Scope,
-    claim: &StudentWinnerDeploymentClaim,
-    receipt: &RoutePublicationWrite,
-    candidate_basis_points: u16,
-    previous_route_revision: Option<&String>,
-    require_exact_previous: bool,
-) -> Result<()> {
-    let revision = decode_hex_digest(&receipt.route_revision)?;
-    let signature_prefix = format!(
-        "{}/routes/signatures/{}/",
-        scope_prefix(scope),
-        receipt.route_revision
-    );
-    let signature_sha256 = receipt
-        .signature_object_key
-        .strip_prefix(&signature_prefix)
-        .and_then(|value| value.strip_suffix(".ed25519"))
-        .context("provider teardown route signature key is invalid")?;
-    if receipt.schema_version != "milk.route-publication-receipt.v2"
-        || receipt.state != "active"
-        || receipt.student_job_id != claim.student_job_id
-        || receipt.student_result_sha256 != claim.student_result_sha256
-        || receipt.model_manifest_sha256 != claim.model_manifest.sha256
-        || receipt.dev_receipt_sha256 != claim.dev_receipt.sha256
-        || receipt.candidate_basis_points != candidate_basis_points
-        || if require_exact_previous {
-            receipt.previous_route_revision.as_ref() != previous_route_revision
-        } else {
-            receipt
-                .previous_route_revision
-                .as_ref()
-                .is_some_and(|value| !valid_lowercase_sha256(value))
-        }
-        || receipt.manifest_object_key != route_manifest_key(scope, &revision)
-        || !valid_lowercase_sha256(signature_sha256)
-        || receipt.live_pointer_object_key != route_live_key(scope)
-    {
-        bail!("provider teardown route receipt is invalid");
-    }
-    Ok(())
-}
-
-fn validate_provider_evidence_reference(reference: &ProviderEvidenceReference) -> Result<()> {
-    if !valid_lowercase_sha256(&reference.store_identity_sha256)
-        || !valid_lowercase_sha256(&reference.sha256)
-        || !(1..=MAX_STUDENT_ARTIFACT_REFERENCE_BYTES as u64).contains(&reference.bytes)
-        || !valid_provider_identity(&reference.object_key, 1_024, b"/._:-")
-        || reference
-            .object_key
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..")
-    {
-        bail!("provider teardown evidence reference is invalid");
-    }
-    Ok(())
-}
-
-fn validate_provider_teardown_result(
-    scope: &Scope,
-    student_job_id: &[u8; 32],
-    authorization_payload: &[u8],
-    authorization: &ProviderTeardownAuthorization,
-    winner: &StudentWinnerDeploymentResult,
-    result: &ProviderTeardownResult,
-    observed_at: DateTime<Utc>,
-) -> Result<()> {
-    for reference in [
-        &result.provider_zero_evidence,
-        &result.private_log_artifact,
-        &result.budget_settlement,
-    ] {
-        validate_provider_evidence_reference(reference)?;
-    }
-    let distinct = [
-        (
-            &result.provider_zero_evidence.store_identity_sha256,
-            &result.provider_zero_evidence.object_key,
-        ),
-        (
-            &result.private_log_artifact.store_identity_sha256,
-            &result.private_log_artifact.object_key,
-        ),
-        (
-            &result.budget_settlement.store_identity_sha256,
-            &result.budget_settlement.object_key,
-        ),
-    ]
-    .into_iter()
-    .collect::<HashSet<_>>();
-    if result.schema_version != "milk.provider-teardown-result.v1"
-        || result.scope != *scope
-        || result.student_job_id != hex_digest(student_job_id)
-        || result.student_job_id != authorization.student_job_id
-        || result.claim_sha256 != authorization.claim_sha256
-        || result.run_id != authorization.run_id
-        || result.selected_provider != authorization.selected_provider
-        || result.execution_id != authorization.execution_id
-        || result.teardown_authorization_sha256
-            != hex_digest(&Sha256::digest(authorization_payload).into())
-        || result.accounted_microusd != winner.provider_acceptance.reserved_microusd
-        || result.terminated_at < authorization.authorized_at
-        || result.verified_zero_at < result.terminated_at
-        || result.verified_zero_at > observed_at
-        || result.state != "zero"
-        || distinct.len() != 3
-    {
-        bail!("provider teardown result differs from its immutable authority");
-    }
-    Ok(())
-}
-
-fn student_winner_deployment_launch_write(
-    claim: &StudentWinnerDeploymentClaim,
-    payload: &[u8],
-    key: String,
-) -> StudentWinnerDeploymentLaunchWrite {
-    StudentWinnerDeploymentLaunchWrite {
-        schema_version: "milk.student-winner-deployment-launch.v2",
-        student_job_id: claim.student_job_id.clone(),
-        student_result_sha256: claim.student_result_sha256.clone(),
-        winner: claim.winner,
-        deployment_claim_object_key: key,
-        deployment_claim_sha256: hex_digest(&Sha256::digest(payload).into()),
-        provider_binding_sha256: claim.provider_binding_sha256.clone(),
-        provider_policy: claim.authority.provider_policy.clone(),
-        student_branch_runtime_image_reference: claim
-            .student_branch_runtime_image_reference
-            .clone(),
-        max_wall_seconds: claim.authority.max_wall_seconds,
-        max_cost_microusd: claim.authority.max_cost_microusd,
-        expires_at: claim.expires_at,
-    }
-}
-
-fn student_winner_deployment_result_write(
-    student_job_id: String,
-    result_object_key: String,
-) -> StudentWinnerDeploymentResultWrite {
-    StudentWinnerDeploymentResultWrite {
-        schema_version: "milk.student-winner-deployment-result-receipt.v1",
-        student_job_id,
-        result_object_key,
-        state: "admitted",
-    }
-}
-
-fn provider_teardown_result_write(
-    student_job_id: String,
-    result_object_key: String,
-) -> ProviderTeardownResultWrite {
-    ProviderTeardownResultWrite {
-        schema_version: "milk.provider-teardown-result-receipt.v1",
-        student_job_id,
-        result_object_key,
-        state: "zero",
-    }
-}
-
 fn student_stage_result_write(
     student_job_id: String,
     result_object_key: String,
@@ -18312,29 +15997,6 @@ fn valid_student_gpu_uuid(value: &str) -> bool {
     })
 }
 
-fn validate_student_dev_receipt(
-    input: &StudentInputBundle,
-    result: &StoredStudentResult,
-    candidate_result: &StudentCandidateResult,
-    receipt: &StudentDevReceipt,
-) -> Result<()> {
-    let summary = StudentDevSummary {
-        dev_rows: candidate_result.dev_rows,
-        mean_score_bps: candidate_result.mean_score_bps,
-        errors: candidate_result.errors,
-        total_latency_ms: candidate_result.total_latency_ms,
-        p95_latency_ms: candidate_result.p95_latency_ms,
-    };
-    validate_student_dev_receipt_fields(
-        input,
-        &result.student_job_id,
-        candidate_result.variant,
-        &candidate_result.dev_set_sha256,
-        &summary,
-        receipt,
-    )
-}
-
 fn validate_student_dev_receipt_fields(
     input: &StudentInputBundle,
     student_job_id: &str,
@@ -18939,21 +16601,24 @@ fn levenshtein<T: Eq>(left: &[T], right: &[T]) -> usize {
 fn route_publication_write(
     commit: &RoutePublicationCommit,
     publication: &RoutePublication,
-) -> RoutePublicationWrite {
-    RoutePublicationWrite {
-        schema_version: "milk.route-publication-receipt.v2".to_owned(),
+    previous: Option<&RoutePublication>,
+) -> Result<RoutePublicationWrite> {
+    let candidate_api_key_sha256 = publication
+        .candidate_api_key_sha256
+        .or_else(|| previous.and_then(|route| route.candidate_api_key_sha256))
+        .context("route publication lacks its candidate credential lineage")?;
+    Ok(RoutePublicationWrite {
+        schema_version: "milk.route-publication-receipt.v3".to_owned(),
         route_revision: commit.route_revision.clone(),
-        student_job_id: hex_digest(&publication.student_job_id),
-        student_result_sha256: hex_digest(&publication.student_result_sha256),
-        model_manifest_sha256: hex_digest(&publication.model_manifest_sha256),
-        dev_receipt_sha256: hex_digest(&publication.dev_receipt_sha256),
+        proposal_sha256: hex_digest(&publication.proposal_sha256),
+        candidate_api_key_sha256: hex_digest(&candidate_api_key_sha256),
         previous_route_revision: commit.previous_route_revision.clone(),
         candidate_basis_points: publication.candidate_basis_points,
         manifest_object_key: commit.manifest_object_key.clone(),
         signature_object_key: commit.signature_object_key.clone(),
         live_pointer_object_key: route_live_key(&commit.scope),
         state: "active".to_owned(),
-    }
+    })
 }
 
 struct SnapshotAnalyzerCallResult {
@@ -19427,54 +17092,6 @@ fn student_fanout_launch_outbox_key(scope: &Scope, student_job_id: &[u8; 32]) ->
     )
 }
 
-fn student_winner_deployment_claim_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/jobs/student/{}/winner-deployment/claim.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
-fn student_winner_deployment_launch_outbox_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/jobs/student/{}/winner-deployment/launch-outbox.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
-fn student_winner_deployment_result_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/jobs/student/{}/winner-deployment/result.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
-fn provider_teardown_frontier_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/frontier/provider-teardown/{}.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
-fn provider_teardown_authorization_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/jobs/student/{}/winner-deployment/teardown-authorization.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
-fn provider_teardown_result_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/jobs/student/{}/winner-deployment/teardown-result.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
-    )
-}
-
 fn gpu_launch_intent_key(scope: &Scope, dispatch_id: &[u8; 32]) -> String {
     format!(
         "{}/{}.json",
@@ -19533,16 +17150,6 @@ fn canonical_gpu_launch_intent_parts(
                 claim,
                 &claim_object.payload,
             )?;
-            (claim_object, outbox_key, outbox)
-        }
-        GpuLaunchIntentClaim::StudentWinnerDeployment { claim } => {
-            let student_job_id = decode_hex_digest(&claim.student_job_id)?;
-            let claim_object = encode_json(
-                student_winner_deployment_claim_key(scope, &student_job_id),
-                claim,
-            )?;
-            let (outbox_key, outbox) =
-                student_winner_deployment_gpu_launch_outbox(scope, claim, &claim_object.payload)?;
             (claim_object, outbox_key, outbox)
         }
     };
@@ -19797,38 +17404,6 @@ fn student_fanout_gpu_launch_outbox(
     ))
 }
 
-fn student_winner_deployment_gpu_launch_outbox(
-    scope: &Scope,
-    claim: &StudentWinnerDeploymentClaim,
-    claim_payload: &[u8],
-) -> Result<(String, GpuLaunchOutbox)> {
-    let student_job_id = decode_hex_digest(&claim.student_job_id)?;
-    validate_student_winner_deployment_claim_record(scope, &student_job_id, claim, claim_payload)?;
-    let claim_sha256 = hex_digest(&Sha256::digest(claim_payload).into());
-    Ok((
-        student_winner_deployment_launch_outbox_key(scope, &student_job_id),
-        GpuLaunchOutbox {
-            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
-            scope: scope.clone(),
-            dispatch_id: claim_sha256.clone(),
-            claim_object_key: student_winner_deployment_claim_key(scope, &student_job_id),
-            claim_sha256,
-            runtime_image_reference: claim.student_branch_runtime_image_reference.clone(),
-            created_at: claim.claimed_at,
-            expires_at: claim.expires_at,
-            operation: GpuLaunchOperation::StudentWinnerDeployment {
-                student_job_id: claim.student_job_id.clone(),
-                student_result_sha256: claim.student_result_sha256.clone(),
-                winner: claim.winner,
-                provider_binding_sha256: claim.provider_binding_sha256.clone(),
-                provider_policy: claim.authority.provider_policy.clone(),
-                max_wall_seconds: claim.authority.max_wall_seconds,
-                max_cost_microusd: claim.authority.max_cost_microusd,
-            },
-        },
-    ))
-}
-
 fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox) -> Result<()> {
     let dispatch_id = decode_hex_digest(&outbox.dispatch_id)?;
     let claim_sha256 = decode_hex_digest(&outbox.claim_sha256)?;
@@ -19920,28 +17495,6 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
                 && outbox.claim_object_key == student_fanout_claim_key(scope, &student_job_id)
                 && key == student_fanout_launch_outbox_key(scope, &student_job_id)
         }
-        GpuLaunchOperation::StudentWinnerDeployment {
-            student_job_id,
-            student_result_sha256,
-            winner: _,
-            provider_binding_sha256,
-            provider_policy,
-            max_wall_seconds,
-            max_cost_microusd,
-        } => {
-            let student_job_id = decode_hex_digest(student_job_id)?;
-            outbox.schema_version == "milk.gpu-launch-outbox.v1"
-                && valid_lowercase_sha256(student_result_sha256)
-                && valid_lowercase_sha256(provider_binding_sha256)
-                && provider_policy.only == crate::route::WINNER_PROVIDER
-                && (60..=crate::route::MAX_WINNER_DEPLOYMENT_WALL_SECONDS)
-                    .contains(max_wall_seconds)
-                && (1..=crate::route::MAX_WINNER_DEPLOYMENT_COST_MICROUSD)
-                    .contains(max_cost_microusd)
-                && outbox.claim_object_key
-                    == student_winner_deployment_claim_key(scope, &student_job_id)
-                && key == student_winner_deployment_launch_outbox_key(scope, &student_job_id)
-        }
     };
     if !matches!(
         outbox.schema_version.as_str(),
@@ -20013,14 +17566,6 @@ fn route_manifest_key(scope: &Scope, revision: &[u8; 32]) -> String {
     )
 }
 
-fn route_cohort_binding_key(scope: &Scope, cohort_sha256: &[u8; 32]) -> String {
-    format!(
-        "{}/routes/cohorts/{}.json",
-        scope_prefix(scope),
-        hex_digest(cohort_sha256)
-    )
-}
-
 fn route_signature_key(scope: &Scope, revision: &[u8; 32], signature_sha256: &[u8; 32]) -> String {
     format!(
         "{}/routes/signatures/{}/{}.ed25519",
@@ -20035,14 +17580,6 @@ fn route_commit_key(scope: &Scope, revision: &[u8; 32]) -> String {
         "{}/routes/commits/{}.json",
         scope_prefix(scope),
         hex_digest(revision)
-    )
-}
-
-fn route_student_retirement_key(scope: &Scope, student_job_id: &[u8; 32]) -> String {
-    format!(
-        "{}/routes/retired-students/{}.json",
-        scope_prefix(scope),
-        hex_digest(student_job_id)
     )
 }
 
@@ -20545,445 +18082,6 @@ mod tests {
             max_trace_bytes: 2 * 1_024 * 1_024,
             max_artifact_bytes: MAX_STUDENT_INPUT_BYTES,
             writer_id: Uuid::now_v7(),
-        }
-    }
-
-    async fn put_harness_value(
-        store: &RecordStore,
-        key: String,
-        value: &serde_json::Value,
-    ) -> String {
-        let bytes = harness_canonical_json_line(value).unwrap();
-        let sha256 = hex_digest(&Sha256::digest(&bytes).into());
-        store
-            .objects
-            .put(&ObjectPath::from(key), Bytes::from(bytes).into())
-            .await
-            .unwrap();
-        sha256
-    }
-
-    struct HarnessPreflightFixture {
-        store: RecordStore,
-        scope: Scope,
-        proposal: OperatorRouteProposal,
-        proposal_bytes: Vec<u8>,
-        current_key: String,
-    }
-
-    async fn harness_preflight_fixture(
-        validation_accepted: bool,
-        score_qualified: bool,
-    ) -> HarnessPreflightFixture {
-        let store = gpu_launch_test_store(Arc::new(InMemory::new()));
-        let scope = Scope {
-            scope_id: Uuid::from_u128(2),
-        };
-        let prefix = scope_prefix(&scope);
-        let digest = |byte: u8| hex_digest(&[byte; 32]);
-        let harness_revision = "7e1cc25a881ceeb3aad0ee085281e8d991eb85f6";
-        let config_sha256 = digest(0x31);
-        let classifier_job_id = digest(0x41);
-        let eval_job_id = digest(0x42);
-        let validation_job_id = digest(0x43);
-        let score_job_id = digest(0x44);
-        let classifier_result_sha256 = digest(0x51);
-        let eval_validation_result_sha256 = digest(0x53);
-        let series = "mechanics-v1";
-        let teacher = serde_json::json!({
-            "api_url": "https://teacher.example/v1/responses",
-            "input_rate_microusd_per_million": 1,
-            "max_input_tokens": 128,
-            "max_output_tokens": 64,
-            "model": "teacher-model",
-            "output_rate_microusd_per_million": 1,
-            "reasoning_effort": "high",
-            "timeout_seconds": 60
-        });
-        let score_binding = serde_json::json!({
-            "candidate": {
-                "api_url": "https://candidate.example/v1/chat/completions",
-                "input_rate_microusd_per_million": 1,
-                "model": "candidate-model",
-                "output_rate_microusd_per_million": 1
-            },
-            "case_reference_similarity_basis_points": 9000,
-            "held_out_cases": 1,
-            "incumbent": {
-                "api_url": "https://incumbent.example/v1/chat/completions",
-                "input_rate_microusd_per_million": 1,
-                "model": "incumbent-model",
-                "output_rate_microusd_per_million": 1
-            },
-            "max_calls_per_run": 2,
-            "max_input_tokens_per_call": 128,
-            "max_output_tokens_per_call": 16,
-            "max_total_tokens_per_run": 288,
-            "maximum_candidate_error_basis_points": 0,
-            "maximum_candidate_p95_latency_ms": 30000,
-            "minimum_candidate_reference_pass_basis_points": 9000,
-            "minimum_reference_pass_delta_basis_points": 0,
-            "minimum_request_interval_ms": 1000,
-            "timeout_seconds": 60
-        });
-        let source = serde_json::json!({
-            "code_version": "milk.harness-run-once.v2",
-            "decoded_trace_bytes": 128,
-            "profile": "mechanics",
-            "sampling_policy": null,
-            "schema_version": "milk.summary-source-manifest.v1",
-            "scope_id": scope.scope_id,
-            "stats": [{"key": format!("{prefix}/stats/closed.json"), "sha256": digest(0x61)}],
-            "traces": [{"key": format!("{prefix}/traffic/closed.json.zst"), "sha256": digest(0x62)}],
-            "windows": ["2026-08-29T12:00:00Z"]
-        });
-        let source_bytes = harness_canonical_json_line(&source).unwrap();
-        let source_sha256 = hex_digest(&Sha256::digest(&source_bytes).into());
-        put_harness_value(
-            &store,
-            format!("{prefix}/pending-source/versions/{source_sha256}.json"),
-            &source,
-        )
-        .await;
-
-        let summary = serde_json::json!({
-            "classifier_job_id": classifier_job_id,
-            "classifier_result_sha256": classifier_result_sha256,
-            "code_version": "milk.harness-run-once.v2",
-            "parent_version_sha256": null,
-            "profile": "mechanics",
-            "schema_version": "milk.summary-version.v1",
-            "scope_id": scope.scope_id,
-            "semantic": {},
-            "structural": {
-                "profile": "mechanics",
-                "schema_version": "milk.structural-summary.v1",
-                "scope_id": scope.scope_id,
-                "source": source,
-                "source_manifest_sha256": source_sha256
-            }
-        });
-        let summary_bytes = harness_canonical_json_line(&summary).unwrap();
-        let summary_sha256 = hex_digest(&Sha256::digest(&summary_bytes).into());
-        put_harness_value(
-            &store,
-            format!("{prefix}/summaries/versions/{summary_sha256}.json"),
-            &summary,
-        )
-        .await;
-
-        let readiness = serde_json::json!({
-            "checks": {
-                "closed_watermark_without_capture_gap": true,
-                "duplicates_at_most_0_1_percent": true,
-                "eval_generation_budget_available": true,
-                "independence_verified": true,
-                "minimum_classified_sessions": true,
-                "minimum_independent_sessions": true,
-                "other_plus_abstain_at_most_15_percent": true,
-                "pairing_at_least_99_percent": true,
-                "parse_at_least_99_5_percent": true,
-                "production_text_reference_capacity": true,
-                "representative_eval_capacity": true,
-                "represented_classes_meet_minimum": true,
-                "unknown_items_at_most_1_percent": true
-            },
-            "class_failures": [],
-            "eval_eligible_cases": 1,
-            "minimum_independent_sessions": 100,
-            "minimum_represented_class_sessions": 1,
-            "profile": "mechanics",
-            "ready": true,
-            "represented_classes": [{"operation": "generation", "sessions": 100}],
-            "schema_version": "milk.readiness.v1",
-            "scope_id": scope.scope_id,
-            "statistically_qualified": false,
-            "summary_sha256": summary_sha256,
-            "unsupported_eval_categories": {}
-        });
-        let readiness_bytes = harness_canonical_json_line(&readiness).unwrap();
-        let readiness_sha256 = hex_digest(&Sha256::digest(&readiness_bytes).into());
-        put_harness_value(
-            &store,
-            format!("{prefix}/readiness/versions/{readiness_sha256}.json"),
-            &readiness,
-        )
-        .await;
-
-        let case_id = digest(0x71);
-        let eval = serde_json::json!({
-            "cases": [{
-                "case_id": case_id,
-                "expected": "four",
-                "input": "What is two plus two?",
-                "operation": "generation",
-                "oracle": "reference",
-                "selection_reason": "representative_mix",
-                "source_trace_sha256": digest(0x62),
-                "suite": "representative"
-            }],
-            "code_version": "milk.harness-run-once.v2",
-            "cost_microusd": 2,
-            "generation_job_id": eval_job_id,
-            "parent_version_sha256": null,
-            "profile": "mechanics",
-            "provider_request_id": "eval-request",
-            "readiness_sha256": readiness_sha256,
-            "schema_version": "milk.eval-revision.v1",
-            "scope_id": scope.scope_id,
-            "series_id": series,
-            "summary_sha256": summary_sha256,
-            "token_usage": {"input_tokens": 1, "output_tokens": 1}
-        });
-        let eval_bytes = harness_canonical_json_line(&eval).unwrap();
-        let eval_sha256 = hex_digest(&Sha256::digest(&eval_bytes).into());
-        put_harness_value(
-            &store,
-            format!("{prefix}/evals/{series}/versions/{eval_sha256}.json"),
-            &eval,
-        )
-        .await;
-
-        let validation = serde_json::json!({
-            "accepted": validation_accepted,
-            "code_version": "milk.harness-run-once.v2",
-            "config_sha256": config_sha256,
-            "cost_microusd": 2,
-            "eval_sha256": eval_sha256,
-            "harness_revision": harness_revision,
-            "output": {
-                "accepted": validation_accepted,
-                "accepted_cases": if validation_accepted { 1 } else { 0 },
-                "case_count": 1,
-                "rejections": if validation_accepted { serde_json::json!([]) } else { serde_json::json!([{"case_id": case_id, "reason": "incorrect"}]) },
-                "schema_version": "milk.eval-validation-output.v1",
-                "verdicts": [{"accepted": validation_accepted, "case_id": case_id, "reason": if validation_accepted { "accepted" } else { "incorrect" }}]
-            },
-            "parent_version_sha256": null,
-            "profile": "mechanics",
-            "prompt_sha256": digest(0x32),
-            "provider_result_sha256": eval_validation_result_sha256,
-            "schema_version": "milk.eval-validation-revision.v1",
-            "scope_id": scope.scope_id,
-            "series_id": series,
-            "teacher": teacher,
-            "token_usage": {"input_tokens": 1, "output_tokens": 1},
-            "validation_job_id": validation_job_id
-        });
-        let validation_bytes = harness_canonical_json_line(&validation).unwrap();
-        let validation_sha256 = hex_digest(&Sha256::digest(&validation_bytes).into());
-        put_harness_value(
-            &store,
-            format!("{prefix}/eval-validations/{series}/versions/{validation_sha256}.json"),
-            &validation,
-        )
-        .await;
-
-        let target = |name: &str, latency: u64| {
-            serde_json::json!({
-                "attempted": 1,
-                "calculated_cost_microusd": 2,
-                "cases": [{
-                    "case_id": case_id,
-                    "error_class": null,
-                    "latency_ms": latency,
-                    "provider_request_id_sha256": digest(0x81),
-                    "reference_similarity_basis_points": 10000
-                }],
-                "error_basis_points": 0,
-                "errors": 0,
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "p95_latency_ms": latency,
-                "reference_metric": "normalized_token_f1_v1",
-                "reference_pass_basis_points": 10000,
-                "reference_pass_threshold_basis_points": 9000,
-                "reference_passes": 1,
-                "target": name
-            })
-        };
-        let score_result = serde_json::json!({
-            "accounted_cost_microusd": 4,
-            "calculated_cost_microusd": 4,
-            "candidate": target("candidate", 10),
-            "checks": {
-                "candidate_errors": score_qualified,
-                "candidate_p95_latency": score_qualified,
-                "candidate_reference_pass_rate": score_qualified,
-                "reference_pass_delta": score_qualified
-            },
-            "incumbent": target("incumbent", 10),
-            "job_id": score_job_id,
-            "outcome": "succeeded",
-            "provider_calls": 2,
-            "provider_tokens": 4,
-            "qualified": score_qualified,
-            "schema_version": "milk.candidate-score-job-result.v1"
-        });
-        let score_result_sha256 =
-            hex_digest(&Sha256::digest(harness_canonical_json_line(&score_result).unwrap()).into());
-        let score = serde_json::json!({
-            "code_version": "milk.harness-run-once.v2",
-            "config_sha256": config_sha256,
-            "eval_sha256": eval_sha256,
-            "eval_validation_sha256": validation_sha256,
-            "harness_revision": harness_revision,
-            "parent_version_sha256": null,
-            "profile": "mechanics",
-            "provider_result_sha256": score_result_sha256,
-            "qualified": score_qualified,
-            "result": score_result,
-            "schema_version": "milk.candidate-score-revision.v1",
-            "scope_id": scope.scope_id,
-            "score_job_id": score_job_id,
-            "series_id": series
-        });
-        let score_bytes = harness_canonical_json_line(&score).unwrap();
-        let score_sha256 = hex_digest(&Sha256::digest(&score_bytes).into());
-        put_harness_value(
-            &store,
-            format!("{prefix}/candidate-scores/{series}/versions/{score_sha256}.json"),
-            &score,
-        )
-        .await;
-
-        let proposal_value = serde_json::json!({
-            "api_base_url": "https://candidate.example/v1/",
-            "candidate_basis_points": 100,
-            "candidate_id": "candidate-mechanics-v1",
-            "candidate_score_sha256": score_sha256,
-            "code_version": "milk.harness-run-once.v2",
-            "eval_sha256": eval_sha256,
-            "eval_validation_sha256": validation_sha256,
-            "model": "candidate-model",
-            "profile": "mechanics",
-            "provenance": {
-                "accounted_cost_microusd": 10,
-                "budget": {"absolute_spend_microusd": 25000000, "starting_spend_microusd": 0, "stop_new_spend_microusd": 25000000},
-                "candidate_score": score_binding,
-                "config_sha256": config_sha256,
-                "harness_revision": harness_revision,
-                "job_ids": {"candidate_score": score_job_id, "classifier": classifier_job_id, "eval_generation": eval_job_id, "eval_validation": validation_job_id},
-                "prompt_sha256s": {"classifier": digest(0x30), "eval_generation": digest(0x31), "eval_validation": digest(0x32)},
-                "provider_tokens": 10,
-                "taxonomy_version": "milk.semantic-taxonomy.v1",
-                "teacher": teacher,
-                "teacher_result_sha256s": {"classifier": classifier_result_sha256, "eval_generation": digest(0x52), "eval_validation": eval_validation_result_sha256}
-            },
-            "readiness_sha256": readiness_sha256,
-            "schema_version": "milk.unsigned-route-proposal.v2",
-            "scope_id": scope.scope_id,
-            "series_id": series,
-            "source_manifest_sha256": source_sha256,
-            "summary_sha256": summary_sha256
-        });
-        let proposal_bytes = harness_canonical_json_line(&proposal_value).unwrap();
-        let proposal_sha256 = hex_digest(&Sha256::digest(&proposal_bytes).into());
-        let proposal_key = format!("{prefix}/route-proposals/versions/{proposal_sha256}.json");
-        put_harness_value(&store, proposal_key.clone(), &proposal_value).await;
-        let current_key = format!("{prefix}/route-proposals/current.json");
-        put_harness_value(
-            &store,
-            current_key.clone(),
-            &serde_json::json!({
-                "kind": "route_proposal",
-                "parent_version_sha256": null,
-                "schema_version": "milk.current-pointer.v1",
-                "version_key": proposal_key,
-                "version_sha256": proposal_sha256
-            }),
-        )
-        .await;
-        HarnessPreflightFixture {
-            store,
-            scope,
-            proposal: serde_json::from_slice(&proposal_bytes).unwrap(),
-            proposal_bytes,
-            current_key,
-        }
-    }
-
-    #[tokio::test]
-    async fn operator_route_preflight_rechecks_the_complete_harness_chain() {
-        let fixture = harness_preflight_fixture(true, true).await;
-        fixture
-            .store
-            .verify_operator_route_preflight(
-                &fixture.scope,
-                &fixture.proposal,
-                &fixture.proposal_bytes,
-            )
-            .await
-            .unwrap();
-
-        fixture
-            .store
-            .objects
-            .put(
-                &ObjectPath::from(fixture.current_key),
-                Bytes::from(
-                    harness_canonical_json_line(&serde_json::json!({
-                        "kind": "route_proposal_blocked",
-                        "parent_version_sha256": null,
-                        "schema_version": "milk.current-pointer.v1",
-                        "version_key": "milk/v1/scopes/blocked.json",
-                        "version_sha256": "00".repeat(32)
-                    }))
-                    .unwrap(),
-                )
-                .into(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            fixture
-                .store
-                .verify_operator_route_preflight(
-                    &fixture.scope,
-                    &fixture.proposal,
-                    &fixture.proposal_bytes,
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("current qualified proposal")
-        );
-        fixture
-            .store
-            .verify_operator_route_proposal_identity(
-                &fixture.scope,
-                &fixture.proposal,
-                &fixture.proposal_bytes,
-            )
-            .await
-            .unwrap();
-        let proposal_sha256: [u8; 32] = Sha256::digest(&fixture.proposal_bytes).into();
-        let (stored_proposal, stored_bytes) = fixture
-            .store
-            .load_operator_route_proposal(&fixture.scope, &proposal_sha256)
-            .await
-            .unwrap();
-        assert_eq!(stored_proposal, fixture.proposal);
-        assert_eq!(stored_bytes.as_ref(), fixture.proposal_bytes.as_slice());
-    }
-
-    #[tokio::test]
-    async fn operator_route_preflight_rejects_unaccepted_or_unqualified_evidence() {
-        for fixture in [
-            harness_preflight_fixture(false, true).await,
-            harness_preflight_fixture(true, false).await,
-        ] {
-            assert!(
-                fixture
-                    .store
-                    .verify_operator_route_preflight(
-                        &fixture.scope,
-                        &fixture.proposal,
-                        &fixture.proposal_bytes,
-                    )
-                    .await
-                    .is_err()
-            );
         }
     }
 
@@ -21506,557 +18604,6 @@ mod tests {
         );
     }
 
-    async fn persist_gpu_launch_test_winner(
-        store: &RecordStore,
-        scope: &Scope,
-        now: DateTime<Utc>,
-    ) -> ([u8; 32], [u8; 32]) {
-        persist_gpu_launch_test_winner_with_seed(store, scope, now, 0).await
-    }
-
-    async fn persist_gpu_launch_test_winner_with_seed(
-        store: &RecordStore,
-        scope: &Scope,
-        now: DateTime<Utc>,
-        seed: u8,
-    ) -> ([u8; 32], [u8; 32]) {
-        let provider_binding_sha256 = [0x31_u8.wrapping_add(seed); 32];
-        let recipe_sha256 = [0x32_u8.wrapping_add(seed); 32];
-        let expires_at = now + TimeDelta::hours(8);
-        let sources = vec![
-            persist_winner_test_teacher_source(
-                store,
-                scope,
-                "winner-train",
-                TeacherPartition::Train,
-                STUDENT_MIN_TRAIN_ROWS,
-                &provider_binding_sha256,
-                expires_at,
-            )
-            .await,
-            persist_winner_test_teacher_source(
-                store,
-                scope,
-                "winner-dev",
-                TeacherPartition::Dev,
-                73,
-                &provider_binding_sha256,
-                expires_at,
-            )
-            .await,
-            persist_winner_test_teacher_source(
-                store,
-                scope,
-                "winner-calibration",
-                TeacherPartition::Calibration,
-                STUDENT_CALIBRATION_ROWS,
-                &provider_binding_sha256,
-                expires_at,
-            )
-            .await,
-        ];
-        let started_at = now - TimeDelta::minutes(10);
-        let (claim, _) = prepare_student_job_claim(
-            scope,
-            &provider_binding_sha256,
-            &recipe_sha256,
-            TEST_STUDENT_TRAIN_RUNTIME_IMAGE_REFERENCE,
-            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE,
-            started_at,
-            &sources,
-        )
-        .unwrap()
-        .unwrap();
-        let student_job_id = decode_hex_digest(&claim.student_job_id).unwrap();
-        let claim_payload = serde_json::to_vec(&claim).unwrap();
-        store
-            .put_create_same(
-                &encode_json(student_job_claim_key(scope, &student_job_id), &claim).unwrap(),
-            )
-            .await
-            .unwrap();
-        let index = StudentJobIndex {
-            schema_version: "milk.student-job-index.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: claim.student_job_id.clone(),
-            source_expires_at: expires_at,
-            claim: claim.clone(),
-        };
-        store
-            .put_create_same(
-                &encode_json(
-                    student_job_frontier_key(scope, &provider_binding_sha256),
-                    &index,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let train_evidence =
-            persist_winner_test_artifact(store, scope, &student_job_id, b"train-evidence".to_vec())
-                .await;
-        let adapter_manifest = persist_winner_test_artifact(
-            store,
-            scope,
-            &student_job_id,
-            b"adapter-manifest".to_vec(),
-        )
-        .await;
-        let merged_manifest = persist_winner_test_artifact(
-            store,
-            scope,
-            &student_job_id,
-            b"merged-manifest".to_vec(),
-        )
-        .await;
-        let train = StudentTrainResult {
-            schema_version: "milk.student-train-result.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: claim.student_job_id.clone(),
-            claim_sha256: hex_digest(&Sha256::digest(&claim_payload).into()),
-            runner_sha256: claim.definition.recipe_sha256.clone(),
-            started_at,
-            finished_at: started_at + TimeDelta::minutes(1),
-            gpu_evidence: Some(train_evidence),
-            observed_gpu_seconds: 60,
-            outcome: StudentTrainOutcome::Succeeded {
-                adapter_manifest,
-                merged_model_manifest: merged_manifest,
-            },
-        };
-        store
-            .put_create_same(
-                &encode_compressed(student_train_result_key(scope, &student_job_id), &train)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let fanout = prepare_student_fanout_claim(&claim, &train, train.finished_at).unwrap();
-        let fanout_payload = serde_json::to_vec(&fanout).unwrap();
-        store
-            .put_create_same(
-                &encode_json(student_fanout_claim_key(scope, &student_job_id), &fanout).unwrap(),
-            )
-            .await
-            .unwrap();
-        let input =
-            student_input_bundle(scope, &hex_digest(&provider_binding_sha256), &sources).unwrap();
-        let dev_set_sha256 = student_dev_set_sha256(&input.dev).unwrap();
-
-        for variant in student_variants() {
-            let evidence = winner_test_gpu_evidence(
-                &claim.student_job_id,
-                &claim.definition.recipe_sha256,
-                variant,
-            );
-            let gpu_evidence = persist_winner_test_artifact(
-                store,
-                scope,
-                &student_job_id,
-                canonical_json_line(&evidence).unwrap(),
-            )
-            .await;
-            let model_manifest = if variant == StudentVariant::StaticFp8 {
-                let model_bytes = format!("model-{variant:?}").into_bytes();
-                let model_sha256: [u8; 32] = Sha256::digest(&model_bytes).into();
-                let file = StudentManifestFile {
-                    relative_path: "model.safetensors".to_owned(),
-                    object_key: student_artifact_key(scope, &student_job_id, &model_sha256),
-                    sha256: hex_digest(&model_sha256),
-                    bytes: model_bytes.len() as u64,
-                };
-                store
-                    .put_create_same(&EncodedObject {
-                        key: file.object_key.clone(),
-                        payload: Bytes::from(model_bytes),
-                        sha256: model_sha256,
-                    })
-                    .await
-                    .unwrap();
-                let manifest = StudentModelManifest {
-                    schema_version: "milk.student-model-manifest.v1".to_owned(),
-                    student_job_id: claim.student_job_id.clone(),
-                    variant,
-                    retained: true,
-                    inventory_sha256: student_inventory_sha256(std::slice::from_ref(&file))
-                        .unwrap(),
-                    file_count: 1,
-                    artifact_bytes: file.bytes,
-                    files: vec![file],
-                };
-                persist_winner_test_artifact(
-                    store,
-                    scope,
-                    &student_job_id,
-                    canonical_json_line(&manifest).unwrap(),
-                )
-                .await
-            } else {
-                persist_winner_test_artifact(
-                    store,
-                    scope,
-                    &student_job_id,
-                    format!("model-manifest-{variant:?}").into_bytes(),
-                )
-                .await
-            };
-            let receipt = StudentDevReceipt {
-                schema_version: "milk.student-dev-receipt.v1".to_owned(),
-                student_job_id: claim.student_job_id.clone(),
-                variant,
-                dev_set_sha256: dev_set_sha256.clone(),
-                rows: input
-                    .dev
-                    .iter()
-                    .map(|row| StudentDevReceiptRow {
-                        request_sha256: row.request_sha256.clone(),
-                        projection_sha256: hex_digest(
-                            &Sha256::digest(serde_json::to_vec(&row.projection).unwrap()).into(),
-                        ),
-                        evaluator_id: row.evaluator_id,
-                        reference_sha256: hex_digest(
-                            &Sha256::digest(row.reference.as_bytes()).into(),
-                        ),
-                        response_sha256: Some(hex_digest(
-                            &Sha256::digest(row.reference.as_bytes()).into(),
-                        )),
-                        candidate: Some(row.reference.clone()),
-                        score_bps: 10_000,
-                        latency_ms: 1,
-                        error: None,
-                    })
-                    .collect(),
-                summary: StudentDevSummary {
-                    dev_rows: input.dev.len() as u64,
-                    mean_score_bps: 10_000,
-                    errors: 0,
-                    total_latency_ms: input.dev.len() as u64,
-                    p95_latency_ms: 1,
-                },
-            };
-            let dev_receipt = persist_winner_test_artifact(
-                store,
-                scope,
-                &student_job_id,
-                if variant == StudentVariant::StaticFp8 {
-                    canonical_json_line(&receipt).unwrap()
-                } else {
-                    format!("dev-receipt-{variant:?}").into_bytes()
-                },
-            )
-            .await;
-            let branch = fanout_branch(&fanout, variant).unwrap();
-            let result = StudentBranchResult {
-                schema_version: "milk.student-branch-result.v1".to_owned(),
-                scope: scope.clone(),
-                student_job_id: claim.student_job_id.clone(),
-                branch_id: branch.branch_id.clone(),
-                fanout_claim_sha256: hex_digest(&Sha256::digest(&fanout_payload).into()),
-                runner_sha256: claim.definition.recipe_sha256.clone(),
-                variant,
-                started_at: fanout.created_at + TimeDelta::seconds(1),
-                finished_at: fanout.created_at + TimeDelta::minutes(1),
-                observed_gpu_seconds: 60,
-                outcome: StudentBranchOutcome::Succeeded {
-                    gpu_evidence,
-                    model_manifest,
-                    dev_receipt,
-                    summary: receipt.summary,
-                },
-            };
-            store
-                .put_create_same(
-                    &encode_compressed(
-                        student_branch_result_key(scope, &student_job_id, variant),
-                        &result,
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .join_student_stages(scope, &student_job_id)
-            .await
-            .unwrap();
-        store
-            .load_verified_student_winner(scope, &student_job_id)
-            .await
-            .unwrap();
-        (provider_binding_sha256, student_job_id)
-    }
-
-    fn winner_test_authority(now: DateTime<Utc>) -> WinnerDeploymentAuthority {
-        WinnerDeploymentAuthority {
-            schema_version: "milk.winner-deployment-authority.v3".to_owned(),
-            provider_policy: WinnerProviderPolicy {
-                only: crate::route::WINNER_PROVIDER.to_owned(),
-            },
-            provider_terms_sha256: hex_digest(&[0x41; 32]),
-            student_branch_runtime_image_reference: TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
-                .to_owned(),
-            admission_program_sha256: hex_digest(&[0x42; 32]),
-            authorization_not_after: now + TimeDelta::hours(4),
-            max_wall_seconds: 3_600,
-            max_cost_microusd: 10_000_000,
-            allow_private_candidate_http: false,
-            signing_public_key_hex: hex_digest(&[0x43; 32]),
-            signing_key_id: "winner-test-key".to_owned(),
-            candidate_max_in_flight: 1,
-            canary_candidate_basis_points: crate::route::WINNER_CANARY_BASIS_POINTS,
-            canary_valid_for_seconds: crate::route::WINNER_CANARY_VALID_FOR_SECONDS,
-            max_input_utf8_bytes: crate::route::CANDIDATE_MAX_INPUT_UTF8_BYTES,
-            max_input_messages: crate::route::CANDIDATE_MAX_INPUT_MESSAGES,
-            max_input_request_bytes: crate::route::CANDIDATE_MAX_INPUT_REQUEST_BYTES,
-            route_schema_version: crate::route::ROUTE_SCHEMA_VERSION.to_owned(),
-            winner_admission_schema_version: crate::route::WINNER_ADMISSION_SCHEMA_VERSION
-                .to_owned(),
-        }
-    }
-
-    fn winner_test_result(
-        claim: &StudentWinnerDeploymentClaim,
-        claim_payload: &[u8],
-    ) -> StudentWinnerDeploymentResult {
-        let (_, outbox) =
-            student_winner_deployment_gpu_launch_outbox(&claim.scope, claim, claim_payload)
-                .unwrap();
-        let observed_at = claim
-            .claimed_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let selection = WinnerProviderSelection::Baseten {
-            provider_identity: BasetenProviderIdentity {
-                provider: WinnerProvider::Baseten,
-                team_name: "milk-production".to_owned(),
-            },
-            primary_preflight: ReadyProviderPreflight {
-                provider: WinnerProvider::Baseten,
-                outcome: "ready".to_owned(),
-                evidence_sha256: hex_digest(&[0x80; 32]),
-                observed_at: observed_at.clone(),
-            },
-        };
-        let mut provider_acceptance = WinnerProviderAcceptance {
-            schema_version: "milk.winner-provider-acceptance.v1".to_owned(),
-            campaign_id: hex_digest(&[0x70; 32]),
-            run_id: hex_digest(&[0; 32]),
-            claim_sha256: hex_digest(&Sha256::digest(claim_payload).into()),
-            outbox_sha256: hex_digest(&Sha256::digest(serde_json::to_vec(&outbox).unwrap()).into()),
-            provider_binding_sha256: claim.provider_binding_sha256.clone(),
-            selection,
-            image_release_sha256: hex_digest(&[0x72; 32]),
-            image_admission_sha256: hex_digest(&[0x73; 32]),
-            provider_pass_claim_sha256: hex_digest(&[0x74; 32]),
-            create_authorization_sha256: hex_digest(&[0x75; 32]),
-            budget_reservation_sha256: hex_digest(&[0x76; 32]),
-            reserved_microusd: 2_000_000,
-            reserved_at: observed_at.clone(),
-            accepted_at: observed_at,
-            create_not_after: (claim.claimed_at + TimeDelta::minutes(2))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            provider_not_after: (claim.claimed_at + TimeDelta::minutes(30))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            max_wall_seconds: claim.authority.max_wall_seconds,
-            max_cost_microusd: claim.authority.max_cost_microusd,
-            state: "accepted".to_owned(),
-        };
-        provider_acceptance.run_id = provider_neutral_winner_run_id(
-            &provider_acceptance,
-            &claim.student_job_id,
-            &claim.student_result_sha256,
-            claim.winner,
-        )
-        .unwrap();
-        let launch_started_at = claim.claimed_at + TimeDelta::seconds(1);
-        StudentWinnerDeploymentResult {
-            schema_version: "milk.student-winner-deployment-result.v1".to_owned(),
-            scope: claim.scope.clone(),
-            student_job_id: claim.student_job_id.clone(),
-            claim_sha256: hex_digest(&Sha256::digest(claim_payload).into()),
-            provider_binding_sha256: claim.provider_binding_sha256.clone(),
-            provider_acceptance,
-            observed_cost_microusd: 1_000_000,
-            admission: WinnerAdmissionReceipt {
-                schema_version: crate::route::WINNER_ADMISSION_SCHEMA_VERSION.to_owned(),
-                provider: crate::route::WINNER_PROVIDER.to_owned(),
-                student_job_id: claim.student_job_id.clone(),
-                student_variant: match claim.winner {
-                    StudentVariant::Bf16 => WinnerVariant::Bf16,
-                    StudentVariant::DynamicFp8 => WinnerVariant::DynamicFp8,
-                    StudentVariant::StaticFp8 => WinnerVariant::StaticFp8,
-                },
-                model_manifest_sha256: claim.model_manifest.sha256.clone(),
-                model_alias: "winner-model".to_owned(),
-                model_alias_sha256: hex_digest(&Sha256::digest(b"winner-model").into()),
-                candidate_api_key_sha256: hex_digest(&Sha256::digest(b"candidate-key").into()),
-                student_branch_runtime_image_reference: claim
-                    .student_branch_runtime_image_reference
-                    .clone(),
-                admission_program_sha256: claim.authority.admission_program_sha256.clone(),
-                execution_id: "winner-execution-1".to_owned(),
-                execution_name: "winner-deployment".to_owned(),
-                api_base_url:
-                    "https://model-a1b2c3.api.baseten.co/environments/production/sync/v1/"
-                        .to_owned(),
-                models_response_sha256: hex_digest(&Sha256::digest(b"models").into()),
-                chat_request_sha256: hex_digest(&Sha256::digest(b"chat-request").into()),
-                chat_response_sha256: hex_digest(&Sha256::digest(b"chat-response").into()),
-                launch_started_at,
-                ready_at: launch_started_at + TimeDelta::seconds(1),
-                admitted_at: launch_started_at + TimeDelta::seconds(2),
-                service_not_after: launch_started_at
-                    + TimeDelta::minutes(16)
-                    + TimeDelta::seconds(2),
-            },
-        }
-    }
-
-    async fn persist_test_route_receipt(
-        store: &RecordStore,
-        scope: &Scope,
-        claim: &StudentWinnerDeploymentClaim,
-        candidate_basis_points: u16,
-        previous: Option<&RoutePublicationWrite>,
-        seed: u8,
-    ) -> RoutePublicationWrite {
-        let manifest = Bytes::from(vec![seed; 64]);
-        let revision: [u8; 32] = Sha256::digest(&manifest).into();
-        let signature = Bytes::from(vec![seed.saturating_add(1); ED25519_SIGNATURE_BYTES]);
-        let signature_sha256: [u8; 32] = Sha256::digest(&signature).into();
-        let manifest_object = EncodedObject {
-            key: route_manifest_key(scope, &revision),
-            payload: manifest.clone(),
-            sha256: revision,
-        };
-        let signature_object = EncodedObject {
-            key: route_signature_key(scope, &revision, &signature_sha256),
-            payload: signature.clone(),
-            sha256: signature_sha256,
-        };
-        store.put_create_same(&manifest_object).await.unwrap();
-        store.put_create_same(&signature_object).await.unwrap();
-        let commit = RoutePublicationCommit {
-            schema_version: "milk.route-publication-commit.v2".to_owned(),
-            scope: scope.clone(),
-            route_revision: hex_digest(&revision),
-            previous_route_revision: previous.map(|receipt| receipt.route_revision.clone()),
-            manifest_object_key: manifest_object.key,
-            manifest_bytes: manifest.len() as u64,
-            signature_object_key: signature_object.key,
-            signature_sha256: hex_digest(&signature_sha256),
-            signature_bytes: signature.len() as u64,
-        };
-        let commit_object = encode_json(route_commit_key(scope, &revision), &commit).unwrap();
-        store.put_create_same(&commit_object).await.unwrap();
-        store
-            .load_verified_route_commit(scope, &revision)
-            .await
-            .unwrap();
-        RoutePublicationWrite {
-            schema_version: "milk.route-publication-receipt.v2".to_owned(),
-            route_revision: commit.route_revision,
-            student_job_id: claim.student_job_id.clone(),
-            student_result_sha256: claim.student_result_sha256.clone(),
-            model_manifest_sha256: claim.model_manifest.sha256.clone(),
-            dev_receipt_sha256: claim.dev_receipt.sha256.clone(),
-            previous_route_revision: commit.previous_route_revision,
-            candidate_basis_points,
-            manifest_object_key: commit.manifest_object_key,
-            signature_object_key: commit.signature_object_key,
-            live_pointer_object_key: route_live_key(scope),
-            state: "active".to_owned(),
-        }
-    }
-
-    #[test]
-    fn winner_provider_acceptance_wire_matches_harness_and_rejects_adversarial_fixtures() {
-        const BASETEN: &str = concat!(
-            r#"{"schema_version":"milk.winner-provider-acceptance.v1","campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","claim_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","outbox_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","provider_binding_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","selection":{"selected_provider":"baseten","provider_identity":{"provider":"baseten","team_name":"milk-production"},"primary_preflight":{"provider":"baseten","outcome":"ready","evidence_sha256":"5555555555555555555555555555555555555555555555555555555555555555","observed_at":"2026-08-27T20:00:00Z"}},"image_release_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","image_admission_sha256":"1111111111111111111111111111111111111111111111111111111111111111","provider_pass_claim_sha256":"2222222222222222222222222222222222222222222222222222222222222222","create_authorization_sha256":"3333333333333333333333333333333333333333333333333333333333333333","budget_reservation_sha256":"4444444444444444444444444444444444444444444444444444444444444444","reserved_microusd":3750000,"reserved_at":"2026-08-27T20:01:00Z","accepted_at":"2026-08-27T20:02:00Z","create_not_after":"2026-08-27T20:03:00Z","provider_not_after":"2026-08-27T20:32:00Z","max_wall_seconds":1800,"max_cost_microusd":10000000,"state":"accepted"}"#,
-            "\n"
-        );
-        let acceptance: WinnerProviderAcceptance =
-            parse_canonical_json_line(BASETEN.as_bytes(), 8 * 1_024, "provider acceptance")
-                .unwrap();
-        assert_eq!(
-            acceptance.validate().unwrap().selected_provider,
-            WinnerProvider::Baseten
-        );
-        assert_eq!(
-            hex_digest(&Sha256::digest(BASETEN.as_bytes()).into()),
-            "54c4871a351a20d8e3599f2a761a21bc19b95069dbb140e8c9fae2f85505b314"
-        );
-        assert_eq!(
-            provider_neutral_winner_run_id(
-                &acceptance,
-                &"8".repeat(64),
-                &"9".repeat(64),
-                StudentVariant::StaticFp8,
-            )
-            .unwrap(),
-            "856f94e25504165c35175edbc6e576b136ca9b69c046af05b9b92c0df18d1683"
-        );
-        let reordered = BASETEN.replacen(
-            r#"{"schema_version":"milk.winner-provider-acceptance.v1","campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#,
-            r#"{"campaign_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema_version":"milk.winner-provider-acceptance.v1""#,
-            1,
-        );
-        assert!(
-            parse_canonical_json_line::<WinnerProviderAcceptance>(
-                reordered.as_bytes(),
-                8 * 1_024,
-                "provider acceptance",
-            )
-            .is_err()
-        );
-        let third_provider = BASETEN.replacen(
-            r#""selected_provider":"baseten""#,
-            r#""selected_provider":"runpod""#,
-            1,
-        );
-        assert!(
-            serde_json::from_slice::<WinnerProviderAcceptance>(
-                third_provider.trim_end().as_bytes()
-            )
-            .is_err()
-        );
-        let project_scoped = BASETEN.replacen(
-            r#""team_name":"milk-production""#,
-            r#""project_id":"training-project""#,
-            1,
-        );
-        assert!(
-            serde_json::from_slice::<WinnerProviderAcceptance>(
-                project_scoped.trim_end().as_bytes()
-            )
-            .is_err()
-        );
-
-        let mut malformed: WinnerProviderAcceptance =
-            parse_canonical_json_line(BASETEN.as_bytes(), 8 * 1_024, "provider acceptance")
-                .unwrap();
-        let WinnerProviderSelection::Baseten {
-            provider_identity, ..
-        } = &mut malformed.selection;
-        provider_identity.team_name = "Milk Production".to_owned();
-        assert!(malformed.validate().is_ok());
-        let WinnerProviderSelection::Baseten {
-            provider_identity, ..
-        } = &mut malformed.selection;
-        provider_identity.team_name = "milk-production-".to_owned();
-        assert!(malformed.validate().is_err());
-
-        let mut budget: WinnerProviderAcceptance =
-            parse_canonical_json_line(BASETEN.as_bytes(), 8 * 1_024, "provider acceptance")
-                .unwrap();
-        budget.reserved_microusd = budget.max_cost_microusd + 1;
-        assert!(budget.validate().is_err());
-        budget.reserved_microusd = 1;
-        budget.provider_pass_claim_sha256 = "0".repeat(63);
-        assert!(budget.validate().is_err());
-    }
-
-    #[actix_web::test]
     async fn staged_fanout_launches_once_and_join_preserves_ordered_quality_diagnostics() {
         let scope = qualification_scope();
         let now = Utc::now().with_nanosecond(0).unwrap() - TimeDelta::minutes(5);
@@ -23675,800 +20222,6 @@ mod tests {
                 .unwrap();
             std::mem::drop(crashed_lease);
         }
-    }
-
-    #[actix_web::test]
-    async fn winner_launch_remains_active_until_strict_zero_gpu_result() {
-        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = gpu_launch_test_store(Arc::clone(&objects));
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let (teacher_binding, student_job_id) =
-            persist_gpu_launch_test_winner(&store, &scope, now).await;
-        let authority = winner_test_authority(now);
-        let launch = store
-            .claim_student_winner_deployment(&scope, &teacher_binding, authority.clone(), now)
-            .await
-            .unwrap()
-            .expect("the immutable claim creator must emit one launch");
-        assert_eq!(launch.student_job_id, hex_digest(&student_job_id));
-        assert_eq!(
-            launch.provider_policy,
-            WinnerProviderPolicy {
-                only: "baseten".to_owned(),
-            }
-        );
-        assert_eq!(launch.max_wall_seconds, authority.max_wall_seconds);
-        assert_eq!(launch.max_cost_microusd, authority.max_cost_microusd);
-        assert_eq!(
-            launch.student_branch_runtime_image_reference,
-            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
-        );
-
-        let mut rotated = authority;
-        rotated.provider_terms_sha256 = hex_digest(&[0x51; 32]);
-        rotated.max_cost_microusd -= 1;
-        assert!(
-            store
-                .claim_student_winner_deployment(&scope, &teacher_binding, rotated, now)
-                .await
-                .unwrap()
-                .is_none(),
-            "a config rotation must not replace or re-emit the immutable claim"
-        );
-        let (claim, claim_payload) = store
-            .load_verified_student_winner_deployment_claim(&scope, &student_job_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            claim.provider_binding_sha256,
-            launch.provider_binding_sha256
-        );
-        let (_, outbox) =
-            student_winner_deployment_gpu_launch_outbox(&scope, &claim, &claim_payload).unwrap();
-        assert_eq!(
-            outbox.runtime_image_reference,
-            TEST_STUDENT_BRANCH_RUNTIME_IMAGE_REFERENCE
-        );
-        let dispatch_id = decode_hex_digest(&outbox.dispatch_id).unwrap();
-        let frontier_key = gpu_launch_frontier_key(&scope, outbox.expires_at, &dispatch_id);
-        assert!(store.exists(&frontier_key).await.unwrap());
-
-        let result = winner_test_result(&claim, &claim_payload);
-        assert_eq!(
-            StudentWinnerDeploymentResult::parse(&canonical_json_line(&result).unwrap()).unwrap(),
-            result
-        );
-
-        let mut wrong_claim = result.clone();
-        wrong_claim.provider_acceptance.claim_sha256 = hex_digest(&[0x90; 32]);
-        let mut wrong_outbox = result.clone();
-        wrong_outbox.provider_acceptance.outbox_sha256 = hex_digest(&[0x91; 32]);
-        let mut wrong_binding = result.clone();
-        wrong_binding.provider_acceptance.provider_binding_sha256 = hex_digest(&[0x92; 32]);
-        let mut wrong_run = result.clone();
-        wrong_run.provider_acceptance.run_id = hex_digest(&[0x93; 32]);
-        let mut wrong_image = result.clone();
-        wrong_image.provider_acceptance.image_release_sha256 = hex_digest(&[0x94; 32]);
-        let mut malformed_image = result.clone();
-        malformed_image.provider_acceptance.image_admission_sha256 = "0".repeat(63);
-        let mut wrong_budget = result.clone();
-        wrong_budget.provider_acceptance.reserved_microusd =
-            wrong_budget.observed_cost_microusd - 1;
-        let mut wrong_wall = result.clone();
-        wrong_wall.provider_acceptance.max_wall_seconds -= 1;
-        let mut wrong_provider = result.clone();
-        wrong_provider.admission.provider = "runpod".to_owned();
-        let mut late_acceptance = result.clone();
-        late_acceptance.provider_acceptance.accepted_at = (claim.claimed_at
-            + TimeDelta::seconds(2))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let mut late_service = result.clone();
-        late_service.admission.service_not_after = claim.claimed_at + TimeDelta::minutes(31);
-        for invalid in [
-            wrong_claim,
-            wrong_outbox,
-            wrong_binding,
-            wrong_run,
-            wrong_image,
-            malformed_image,
-            wrong_budget,
-            wrong_wall,
-            wrong_provider,
-            late_acceptance,
-            late_service,
-        ] {
-            assert!(
-                store
-                    .ingest_student_winner_deployment_result(&scope, invalid)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                !store
-                    .exists(&student_winner_deployment_result_key(
-                        &scope,
-                        &student_job_id,
-                    ))
-                    .await
-                    .unwrap(),
-                "an invalid provider acceptance must not become terminal"
-            );
-        }
-        let line = canonical_json_line(&result).unwrap();
-        assert_eq!(StudentWinnerDeploymentResult::parse(&line).unwrap(), result);
-        let receipt = store
-            .ingest_student_winner_deployment_result(&scope, result.clone())
-            .await
-            .unwrap();
-        assert_eq!(receipt.state, "admitted");
-        assert_eq!(
-            store
-                .ingest_student_winner_deployment_result(&scope, result.clone())
-                .await
-                .unwrap(),
-            receipt
-        );
-        let mut different_retry = result.clone();
-        different_retry
-            .provider_acceptance
-            .budget_reservation_sha256 = hex_digest(&[0x99; 32]);
-        assert!(
-            store
-                .ingest_student_winner_deployment_result(&scope, different_retry)
-                .await
-                .is_err()
-        );
-        store
-            .enforce_gpu_launch_frontier_bound(&scope, None, now + TimeDelta::seconds(10))
-            .await
-            .unwrap();
-        assert!(
-            store.exists(&frontier_key).await.unwrap(),
-            "winner admission is not proof that its GPU has stopped"
-        );
-        assert!(
-            store
-                .exists(&student_winner_deployment_launch_outbox_key(
-                    &scope,
-                    &student_job_id,
-                ))
-                .await
-                .unwrap()
-        );
-
-        let prior_route_receipt =
-            persist_test_route_receipt(&store, &scope, &claim, 0, None, 0x9e).await;
-        let canary_route_receipt = persist_test_route_receipt(
-            &store,
-            &scope,
-            &claim,
-            crate::route::WINNER_CANARY_BASIS_POINTS,
-            Some(&prior_route_receipt),
-            0xa0,
-        )
-        .await;
-        let zero_route_receipt = persist_test_route_receipt(
-            &store,
-            &scope,
-            &claim,
-            0,
-            Some(&canary_route_receipt),
-            0xa2,
-        )
-        .await;
-        let zero_route_revision = zero_route_receipt.route_revision.clone();
-        let retirement = RouteStudentRetirement {
-            schema_version: "milk.route-student-retirement.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: hex_digest(&student_job_id),
-            zero_route_revision: zero_route_revision.clone(),
-        };
-        let retirement_object = encode_json(
-            route_student_retirement_key(&scope, &student_job_id),
-            &retirement,
-        )
-        .unwrap();
-        store.put_create_same(&retirement_object).await.unwrap();
-        let authorized_at = result.admission.admitted_at + TimeDelta::seconds(1);
-        store
-            .ensure_provider_teardown_authorization(
-                &scope,
-                &student_job_id,
-                ProviderTeardownTrigger::RouteZero {
-                    retirement_object_key: retirement_object.key.clone(),
-                    retirement_sha256: hex_digest(&retirement_object.sha256),
-                    zero_route_revision,
-                    canary_route_receipt: Box::new(canary_route_receipt),
-                    zero_route_receipt: Box::new(zero_route_receipt),
-                },
-                authorized_at,
-            )
-            .await
-            .unwrap();
-        let (authorization, authorization_payload) = store
-            .load_verified_provider_teardown_authorization(&scope, &student_job_id)
-            .await
-            .unwrap();
-        assert_eq!(authorization.run_id, result.provider_acceptance.run_id);
-        assert!(
-            store
-                .exists(&provider_teardown_frontier_key(&scope, &student_job_id))
-                .await
-                .unwrap()
-        );
-        let tick_objects: Arc<dyn ObjectStore> = Arc::new(PartitionedObjectStore::new(
-            None,
-            Some((Arc::clone(&objects), StoreAccess::ReadWrite)),
-            None,
-        ));
-        let tick_store = gpu_launch_test_store(tick_objects);
-        tick_store
-            .enforce_gpu_launch_frontier_bound(&scope, None, outbox.expires_at)
-            .await
-            .unwrap();
-        assert!(store.exists(&frontier_key).await.unwrap());
-        let reference = |seed, key: &str| ProviderEvidenceReference {
-            store_identity_sha256: hex_digest(&[seed; 32]),
-            object_key: key.to_owned(),
-            sha256: hex_digest(&[seed.saturating_add(1); 32]),
-            bytes: 128,
-        };
-        let teardown = ProviderTeardownResult {
-            schema_version: "milk.provider-teardown-result.v1".to_owned(),
-            scope: scope.clone(),
-            student_job_id: hex_digest(&student_job_id),
-            claim_sha256: result.claim_sha256.clone(),
-            run_id: result.provider_acceptance.run_id.clone(),
-            selected_provider: WinnerProvider::Baseten,
-            execution_id: result.admission.execution_id.clone(),
-            teardown_authorization_sha256: hex_digest(
-                &Sha256::digest(&authorization_payload).into(),
-            ),
-            accounted_microusd: result.provider_acceptance.reserved_microusd,
-            provider_zero_evidence: reference(0xb0, "providers/baseten/zero.json"),
-            private_log_artifact: reference(0xb2, "operational/provider/winner.log.json"),
-            budget_settlement: reference(0xb4, "campaigns/winner/settlement.json"),
-            terminated_at: authorized_at + TimeDelta::seconds(1),
-            verified_zero_at: authorized_at + TimeDelta::seconds(2),
-            state: "zero".to_owned(),
-        };
-        assert_eq!(
-            ProviderTeardownResult::parse(&canonical_json_line(&teardown).unwrap()).unwrap(),
-            teardown
-        );
-        let mut wrong_authority = teardown.clone();
-        wrong_authority.teardown_authorization_sha256 = hex_digest(&[0xc0; 32]);
-        let mut duplicate_reference = teardown.clone();
-        duplicate_reference.private_log_artifact =
-            duplicate_reference.provider_zero_evidence.clone();
-        let mut underaccounted = teardown.clone();
-        underaccounted.accounted_microusd -= 1;
-        let mut future_zero = teardown.clone();
-        future_zero.verified_zero_at += TimeDelta::seconds(1);
-        for invalid in [
-            wrong_authority,
-            duplicate_reference,
-            underaccounted,
-            future_zero,
-        ] {
-            assert!(
-                store
-                    .ingest_provider_teardown_result(&scope, invalid, teardown.verified_zero_at,)
-                    .await
-                    .is_err()
-            );
-            assert!(store.exists(&frontier_key).await.unwrap());
-        }
-        let teardown_object = encode_json(
-            provider_teardown_result_key(&scope, &student_job_id),
-            &teardown,
-        )
-        .unwrap();
-        store.put_create_same(&teardown_object).await.unwrap();
-        tick_store
-            .enforce_gpu_launch_frontier_bound(&scope, None, teardown.verified_zero_at)
-            .await
-            .unwrap();
-        assert!(!store.exists(&frontier_key).await.unwrap());
-        assert!(
-            !store
-                .exists(&provider_teardown_frontier_key(&scope, &student_job_id))
-                .await
-                .unwrap()
-        );
-        let receipt = store
-            .ingest_provider_teardown_result(&scope, teardown.clone(), teardown.verified_zero_at)
-            .await
-            .unwrap();
-        assert_eq!(receipt.state, "zero");
-        assert_eq!(
-            store
-                .ingest_provider_teardown_result(
-                    &scope,
-                    teardown,
-                    authorized_at + TimeDelta::seconds(3),
-                )
-                .await
-                .unwrap(),
-            receipt
-        );
-        assert!(
-            store
-                .exists(&provider_teardown_authorization_key(
-                    &scope,
-                    &student_job_id,
-                ))
-                .await
-                .unwrap()
-        );
-    }
-
-    #[actix_web::test]
-    async fn expired_admitted_winner_creates_teardown_authority_and_keeps_its_slot() {
-        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = gpu_launch_test_store(objects);
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let (teacher_binding, student_job_id) =
-            persist_gpu_launch_test_winner(&store, &scope, now).await;
-        store
-            .claim_student_winner_deployment(
-                &scope,
-                &teacher_binding,
-                winner_test_authority(now),
-                now,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let (claim, claim_payload) = store
-            .load_verified_student_winner_deployment_claim(&scope, &student_job_id)
-            .await
-            .unwrap();
-        let (_, outbox) =
-            student_winner_deployment_gpu_launch_outbox(&scope, &claim, &claim_payload).unwrap();
-        let launch_frontier = gpu_launch_frontier_key(
-            &scope,
-            outbox.expires_at,
-            &decode_hex_digest(&outbox.dispatch_id).unwrap(),
-        );
-        let result = winner_test_result(&claim, &claim_payload);
-        store
-            .ingest_student_winner_deployment_result(&scope, result.clone())
-            .await
-            .unwrap();
-        store
-            .enforce_gpu_launch_frontier_bound(
-                &scope,
-                None,
-                result.admission.service_not_after - TimeDelta::seconds(1),
-            )
-            .await
-            .unwrap();
-        assert!(
-            !store
-                .exists(&provider_teardown_frontier_key(&scope, &student_job_id))
-                .await
-                .unwrap()
-        );
-        store
-            .enforce_gpu_launch_frontier_bound(&scope, None, result.admission.service_not_after)
-            .await
-            .unwrap();
-        let (authorization, _) = store
-            .load_verified_provider_teardown_authorization(&scope, &student_job_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            authorization.trigger,
-            ProviderTeardownTrigger::ServiceExpired {
-                service_not_after: result.admission.service_not_after,
-            }
-        );
-        assert_eq!(
-            authorization.authorized_at,
-            result.admission.service_not_after
-        );
-        assert!(store.exists(&launch_frontier).await.unwrap());
-        assert!(
-            store
-                .exists(&provider_teardown_frontier_key(&scope, &student_job_id))
-                .await
-                .unwrap()
-        );
-    }
-
-    #[actix_web::test]
-    async fn expired_winner_without_an_ingested_result_keeps_its_slot() {
-        let store = gpu_launch_test_store(Arc::new(InMemory::new()));
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let (teacher_binding, student_job_id) =
-            persist_gpu_launch_test_winner(&store, &scope, now).await;
-        store
-            .claim_student_winner_deployment(
-                &scope,
-                &teacher_binding,
-                winner_test_authority(now),
-                now,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let (claim, claim_payload) = store
-            .load_verified_student_winner_deployment_claim(&scope, &student_job_id)
-            .await
-            .unwrap();
-        let (_, outbox) =
-            student_winner_deployment_gpu_launch_outbox(&scope, &claim, &claim_payload).unwrap();
-        let frontier = gpu_launch_frontier_key(
-            &scope,
-            outbox.expires_at,
-            &decode_hex_digest(&outbox.dispatch_id).unwrap(),
-        );
-        store
-            .enforce_gpu_launch_frontier_bound(&scope, None, outbox.expires_at)
-            .await
-            .unwrap();
-        assert!(store.exists(&frontier).await.unwrap());
-        assert!(
-            !store
-                .exists(&provider_teardown_frontier_key(&scope, &student_job_id))
-                .await
-                .unwrap()
-        );
-    }
-
-    #[actix_web::test]
-    async fn winner_launch_intent_repairs_both_crash_windows_after_rotation_and_takeover() {
-        for persist_claim in [false, true] {
-            let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let first = gpu_launch_test_store(Arc::clone(&objects));
-            let second = gpu_launch_test_store(objects);
-            let scope = qualification_scope();
-            let now = Utc::now().with_nanosecond(0).unwrap();
-            let (teacher_binding, student_job_id) =
-                persist_gpu_launch_test_winner(&first, &scope, now).await;
-            let winner = first
-                .load_verified_student_winner(&scope, &student_job_id)
-                .await
-                .unwrap();
-            let claim = prepare_student_winner_deployment_claim(
-                &scope,
-                &winner,
-                winner_test_authority(now),
-                now,
-            )
-            .unwrap();
-            let crashed_lease = first
-                .acquire_tick_lease(&scope, now)
-                .await
-                .unwrap()
-                .unwrap();
-            let intent = first
-                .begin_gpu_launch_intent(
-                    &scope,
-                    GpuLaunchIntentClaim::StudentWinnerDeployment {
-                        claim: claim.clone(),
-                    },
-                    now,
-                )
-                .await
-                .unwrap();
-            if persist_claim {
-                first.put_create_same(&intent.claim_object).await.unwrap();
-            }
-            first
-                .delete(&student_job_frontier_key(&scope, &teacher_binding))
-                .await
-                .unwrap();
-            let mut rotated = winner_test_authority(now);
-            rotated.provider_terms_sha256 = hex_digest(&[0x77; 32]);
-            assert_ne!(
-                rotated.provider_binding_sha256().unwrap(),
-                claim.authority.provider_binding_sha256().unwrap()
-            );
-
-            let takeover_at =
-                now + TimeDelta::seconds(i64::try_from(TICK_LEASE_TTL_SECONDS).unwrap());
-            let takeover_lease = second
-                .acquire_tick_lease(&scope, takeover_at)
-                .await
-                .unwrap()
-                .unwrap();
-            second
-                .reconcile_gpu_launch_intents(&scope, takeover_at)
-                .await
-                .unwrap();
-            let (stored, _) = second
-                .load_verified_student_winner_deployment_claim(&scope, &student_job_id)
-                .await
-                .unwrap();
-            assert_eq!(stored, claim);
-            let dispatch_id = decode_hex_digest(&intent.record.dispatch_id).unwrap();
-            let frontier_key = gpu_launch_frontier_key(&scope, claim.expires_at, &dispatch_id);
-            assert_eq!(
-                second
-                    .load_verified_gpu_launch_frontier(&scope, &frontier_key)
-                    .await
-                    .unwrap()
-                    .outbox,
-                intent.record.outbox
-            );
-            assert!(
-                !second
-                    .exists(&gpu_launch_intent_key(&scope, &dispatch_id))
-                    .await
-                    .unwrap()
-            );
-            second
-                .release_tick_lease(takeover_lease, takeover_at + TimeDelta::seconds(1))
-                .await
-                .unwrap();
-            std::mem::drop(crashed_lease);
-        }
-    }
-
-    #[actix_web::test]
-    async fn winner_result_corruption_never_retires_frontier_and_policy_rejects_other_provider() {
-        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = gpu_launch_test_store(Arc::clone(&objects));
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let (teacher_binding, student_job_id) =
-            persist_gpu_launch_test_winner(&store, &scope, now).await;
-        store
-            .claim_student_winner_deployment(
-                &scope,
-                &teacher_binding,
-                winner_test_authority(now),
-                now,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let (claim, claim_payload) = store
-            .load_verified_student_winner_deployment_claim(&scope, &student_job_id)
-            .await
-            .unwrap();
-        let (_, outbox) =
-            student_winner_deployment_gpu_launch_outbox(&scope, &claim, &claim_payload).unwrap();
-        let frontier_key = gpu_launch_frontier_key(
-            &scope,
-            outbox.expires_at,
-            &decode_hex_digest(&outbox.dispatch_id).unwrap(),
-        );
-        let mut unauthorized = winner_test_result(&claim, &claim_payload);
-        unauthorized.admission.provider = "runpod".to_owned();
-        assert!(
-            validate_student_winner_deployment_result(
-                &scope,
-                &student_job_id,
-                &claim,
-                &claim_payload,
-                &unauthorized,
-            )
-            .is_err()
-        );
-        unauthorized.admission.provider = "runpod".to_owned();
-        unauthorized.claim_sha256 = hex_digest(&[0x66; 32]);
-        objects
-            .put(
-                &ObjectPath::parse(student_winner_deployment_result_key(
-                    &scope,
-                    &student_job_id,
-                ))
-                .unwrap(),
-                serde_json::to_vec(&unauthorized).unwrap().into(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .enforce_gpu_launch_frontier_bound(&scope, None, now + TimeDelta::seconds(1))
-                .await
-                .is_err()
-        );
-        assert!(store.exists(&frontier_key).await.unwrap());
-    }
-
-    #[actix_web::test]
-    async fn winner_intent_counts_toward_the_same_eighteen_entry_cap_and_expires_closed() {
-        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = gpu_launch_test_store(objects);
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let (_, student_job_id) = persist_gpu_launch_test_winner(&store, &scope, now).await;
-        let winner = store
-            .load_verified_student_winner(&scope, &student_job_id)
-            .await
-            .unwrap();
-        let claim = prepare_student_winner_deployment_claim(
-            &scope,
-            &winner,
-            winner_test_authority(now),
-            now,
-        )
-        .unwrap();
-        for nonce in 1..MAX_ACTIVE_GPU_LAUNCHES {
-            let (teacher, _) = gpu_launch_test_teacher_claim(
-                &scope,
-                u8::try_from(nonce).unwrap(),
-                now,
-                now + TimeDelta::hours(1),
-            );
-            store
-                .begin_gpu_launch_intent(
-                    &scope,
-                    GpuLaunchIntentClaim::TeacherRun { claim: teacher },
-                    now,
-                )
-                .await
-                .unwrap();
-        }
-        let winner_intent = store
-            .begin_gpu_launch_intent(
-                &scope,
-                GpuLaunchIntentClaim::StudentWinnerDeployment {
-                    claim: claim.clone(),
-                },
-                now,
-            )
-            .await
-            .unwrap();
-        let (nineteenth, _) =
-            gpu_launch_test_teacher_claim(&scope, 99, now, now + TimeDelta::hours(1));
-        let error = match store
-            .begin_gpu_launch_intent(
-                &scope,
-                GpuLaunchIntentClaim::TeacherRun { claim: nineteenth },
-                now,
-            )
-            .await
-        {
-            Ok(_) => panic!("winner intent must consume the eighteenth capacity slot"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("no capacity"));
-
-        assert_eq!(
-            store
-                .load_verified_gpu_launch_intents(&scope)
-                .await
-                .unwrap()
-                .len(),
-            MAX_ACTIVE_GPU_LAUNCHES
-        );
-        assert_ne!(
-            decode_hex_digest(&winner_intent.record.dispatch_id).unwrap(),
-            [0; 32]
-        );
-
-        let expiring = gpu_launch_test_store(Arc::new(InMemory::new()));
-        let (_, expiring_student_job_id) =
-            persist_gpu_launch_test_winner(&expiring, &scope, now).await;
-        let expiring_winner = expiring
-            .load_verified_student_winner(&scope, &expiring_student_job_id)
-            .await
-            .unwrap();
-        let mut expiring_authority = winner_test_authority(now);
-        expiring_authority.authorization_not_after = now + TimeDelta::minutes(1);
-        let expiring_claim = prepare_student_winner_deployment_claim(
-            &scope,
-            &expiring_winner,
-            expiring_authority,
-            now,
-        )
-        .unwrap();
-        let expiring_intent = expiring
-            .begin_gpu_launch_intent(
-                &scope,
-                GpuLaunchIntentClaim::StudentWinnerDeployment {
-                    claim: expiring_claim.clone(),
-                },
-                now,
-            )
-            .await
-            .unwrap();
-        expiring
-            .reconcile_gpu_launch_intents(&scope, expiring_claim.expires_at)
-            .await
-            .unwrap();
-        let expiring_dispatch = decode_hex_digest(&expiring_intent.record.dispatch_id).unwrap();
-        assert!(
-            expiring
-                .exists(&expiring_intent.claim_object.key)
-                .await
-                .unwrap()
-        );
-        assert!(
-            expiring
-                .exists(&expiring_intent.outbox_object.key)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !expiring
-                .exists(&gpu_launch_frontier_key(
-                    &scope,
-                    expiring_claim.expires_at,
-                    &expiring_dispatch,
-                ))
-                .await
-                .unwrap()
-        );
-        assert!(
-            !expiring
-                .exists(&gpu_launch_intent_key(&scope, &expiring_dispatch))
-                .await
-                .unwrap()
-        );
-    }
-
-    #[actix_web::test]
-    async fn second_winner_intent_is_serialized_before_claim_or_outbox_creation() {
-        let store = gpu_launch_test_store(Arc::new(InMemory::new()));
-        let scope = qualification_scope();
-        let now = Utc::now().with_nanosecond(0).unwrap();
-        let (_, student_job_id) = persist_gpu_launch_test_winner(&store, &scope, now).await;
-        let winner = store
-            .load_verified_student_winner(&scope, &student_job_id)
-            .await
-            .unwrap();
-        let first_claim = prepare_student_winner_deployment_claim(
-            &scope,
-            &winner,
-            winner_test_authority(now),
-            now,
-        )
-        .unwrap();
-        let first = store
-            .begin_gpu_launch_intent(
-                &scope,
-                GpuLaunchIntentClaim::StudentWinnerDeployment { claim: first_claim },
-                now,
-            )
-            .await
-            .unwrap();
-
-        let mut second_authority = winner_test_authority(now);
-        second_authority.provider_terms_sha256 = hex_digest(&[0x78; 32]);
-        second_authority.max_cost_microusd -= 1;
-        let second_claim =
-            prepare_student_winner_deployment_claim(&scope, &winner, second_authority, now)
-                .unwrap();
-        let (_, second_outbox) = student_winner_deployment_gpu_launch_outbox(
-            &scope,
-            &second_claim,
-            &serde_json::to_vec(&second_claim).unwrap(),
-        )
-        .unwrap();
-        assert_ne!(first.record.dispatch_id, second_outbox.dispatch_id);
-        assert!(
-            store
-                .other_active_winner_exists(&scope, &second_outbox.dispatch_id, now)
-                .await
-                .unwrap(),
-            "a second winner must remain pending before intent creation"
-        );
-        assert_eq!(
-            store
-                .load_verified_gpu_launch_intents(&scope)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(
-            !store
-                .exists(&student_winner_deployment_launch_outbox_key(
-                    &scope,
-                    &student_job_id,
-                ))
-                .await
-                .unwrap()
-        );
     }
 
     #[actix_web::test]
