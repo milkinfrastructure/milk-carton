@@ -49,6 +49,7 @@ const MAX_STUDENT_TRAIN_ROWS: usize = 10_000;
 const MAX_JSON_BYTES_PER_CAPTURE_BYTE: usize = 6;
 const MAX_DECODE_EXPANSION: usize = 8;
 const MAX_STUDENT_DEV_ROWS: usize = 128;
+const MAX_STUDENT_CALIBRATION_ROWS: usize = 128;
 const MAX_ANALYZER_REQUEST_BYTES: usize = 48 * 1_024;
 const MAX_ANALYZER_RESPONSE_BYTES: usize = 1_024 * 1_024;
 const MAX_SNAPSHOT_BATCH_ENTRIES: usize = 128;
@@ -57,7 +58,13 @@ const MAX_SNAPSHOT_ANALYSIS_PROVIDER_REQUEST_BYTES: usize = 96 * 1_024 * 1_024;
 const MAX_SNAPSHOT_ANALYSIS_RESPONSE_BYTES: usize = 1_024 * 1_024;
 const MAX_ITERATION_SNAPSHOT_ARTIFACTS: usize = 4_096;
 const ITERATION_EVAL_MAX_ZERO_FAILURE_UPPER_BPS: u16 = 500;
-const ITERATION_MIN_CALIBRATION_GROUPS: u64 = 128;
+const LEGACY_STUDENT_MIN_TRAIN_ROWS: u64 = 50;
+const LEGACY_STUDENT_DEV_ROWS: u64 = 73;
+const LEGACY_STUDENT_CALIBRATION_ROWS: u64 = 128;
+#[cfg(test)]
+const STUDENT_MIN_TRAIN_ROWS: usize = LEGACY_STUDENT_MIN_TRAIN_ROWS as usize;
+#[cfg(test)]
+const STUDENT_CALIBRATION_ROWS: usize = LEGACY_STUDENT_CALIBRATION_ROWS as usize;
 pub(crate) const MAX_STUDENT_INPUT_BYTES: usize = MAX_STUDENT_TRAIN_BUNDLE_BYTES
     + MAX_STUDENT_DEV_BUNDLE_BYTES
     + MAX_STUDENT_CALIBRATION_BUNDLE_BYTES
@@ -143,9 +150,6 @@ const TRACE_SCHEMA_VERSION: &str = "milk.trace.v1";
 const STATS_SHARD_SCHEMA_VERSION: &str = "milk.stats-shard.v1";
 pub(crate) const ANALYZER_OPERATION_TIMEOUT: Duration = Duration::from_secs(210);
 const STUDENT_MAX_MESSAGES: usize = 256;
-const STUDENT_CALIBRATION_ROWS: usize = 128;
-const STUDENT_MIN_TRAIN_ROWS: usize = 50;
-const STUDENT_DEV_ROWS: u64 = 73;
 const STUDENT_MAX_SOURCE_BYTES: usize = 1_024 * 1_024;
 const STUDENT_MAX_TARGET_BYTES: usize = 64 * 1_024;
 static TRACE_PERSISTENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -2350,6 +2354,8 @@ struct StudentJobDefinition {
     teacher_provider_binding_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     student_admission_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_plan_sha256: Option<String>,
     teacher_results: Vec<StudentTeacherResultRef>,
     input_sha256: String,
     dev_set_sha256: String,
@@ -2782,6 +2788,10 @@ enum GpuLaunchOperation {
     },
     StudentTrainMerge {
         student_job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        student_admission_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quota_plan_sha256: Option<String>,
         counts: StudentInputCounts,
         max_gpu_seconds: u64,
     },
@@ -3277,6 +3287,7 @@ struct VerifiedTeacherResultObject {
     provider_binding_sha256: String,
     expires_at: DateTime<Utc>,
     observed_cost_microusd: u64,
+    quota_slot: Option<StudentQuotaSlotBinding>,
     result: TeacherResult,
 }
 
@@ -5646,11 +5657,26 @@ impl RecordStore {
             Err(error) if is_not_found(&error) => {}
             Err(error) => return Err(error),
         }
-        if let GpuLaunchIntentClaim::TeacherRun { claim } = &record.claim
-            && (claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
-                || claim.schema_version != "milk.teacher-gpu-run-claim.v2")
-        {
-            bail!("legacy teacher GPU launch intents are read-only");
+        match &record.claim {
+            GpuLaunchIntentClaim::TeacherRun { claim }
+                if claim.definition.schema_version != "milk.teacher-gpu-run-definition.v3"
+                    || claim.schema_version != "milk.teacher-gpu-run-claim.v2" =>
+            {
+                bail!("legacy teacher GPU launch intents are read-only");
+            }
+            GpuLaunchIntentClaim::StudentTrainMerge { claim }
+                if claim.definition.schema_version != "milk.student-job-definition.v6"
+                    || claim.schema_version != "milk.student-job-claim.v6" =>
+            {
+                bail!("legacy student GPU launch intents are read-only");
+            }
+            GpuLaunchIntentClaim::StudentFanout { parent, .. }
+                if parent.definition.schema_version != "milk.student-job-definition.v6"
+                    || parent.schema_version != "milk.student-job-claim.v6" =>
+            {
+                bail!("legacy student fanout intents are read-only");
+            }
+            _ => {}
         }
         let intent_count = self
             .enforce_gpu_launch_frontier_bound(scope, Some(&dispatch_id), now)
@@ -9765,6 +9791,7 @@ impl RecordStore {
                             .clone(),
                         expires_at: artifact.definition.expires_at,
                         observed_cost_microusd: artifact.observed_cost_microusd,
+                        quota_slot: artifact.quota_slot.clone(),
                         result: artifact.result,
                     };
                     Some(source)
@@ -9900,6 +9927,8 @@ impl RecordStore {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let student_job_id = decode_hex_digest(&claim.student_job_id)?;
+        let admitted = claim.schema_version == "milk.student-job-claim.v6"
+            && claim.definition.schema_version == "milk.student-job-definition.v6";
         let train_terminal = if self
             .exists(&student_train_result_key(scope, &student_job_id))
             .await?
@@ -9916,7 +9945,7 @@ impl RecordStore {
             scope,
             train_outbox_key,
             train_outbox,
-            !student_terminal && !train_terminal && now < claim.definition.expires_at,
+            admitted && !student_terminal && !train_terminal && now < claim.definition.expires_at,
             now,
         )
         .await?;
@@ -9943,7 +9972,7 @@ impl RecordStore {
                 scope,
                 fanout_outbox_key,
                 fanout_outbox,
-                !student_terminal && now < fanout.expires_at,
+                admitted && !student_terminal && now < fanout.expires_at,
                 now,
             )
             .await?;
@@ -9991,20 +10020,33 @@ impl RecordStore {
             self.delete(&reservation_key).await?;
             return Ok(None);
         }
-        if let Some(admission_sha256) = frontier
-            .index
-            .claim
-            .definition
-            .student_admission_sha256
-            .as_deref()
+        if frontier.index.claim.schema_version != "milk.student-job-claim.v6"
+            || frontier.index.claim.definition.schema_version != "milk.student-job-definition.v6"
         {
-            self.load_student_admission_version(scope, admission_sha256)
-                .await?;
+            return Ok(None);
         }
         let encoded = encode_json(
             student_job_claim_key(scope, &student_job_id),
             &frontier.index.claim,
         )?;
+        let admission_sha256 = frontier
+            .index
+            .claim
+            .definition
+            .student_admission_sha256
+            .as_deref()
+            .context("student job v6 lacks its admission digest")?;
+        if self
+            .load_current_student_admission(scope)
+            .await?
+            .is_none_or(|current| {
+                current.sha256 != admission_sha256
+                    || current.admission.schema_version != "milk.student-admission.v2"
+            })
+        {
+            self.delete(&reservation_key).await?;
+            return Ok(None);
+        }
         let intent = self
             .begin_gpu_launch_intent(
                 scope,
@@ -10080,7 +10122,85 @@ impl RecordStore {
                 return Ok(Some(write));
             }
         }
-        Ok(None)
+        let Some(admission) = self.load_current_student_admission(scope).await? else {
+            return Ok(None);
+        };
+        if admission.admission.schema_version != "milk.student-admission.v2" {
+            return Ok(None);
+        }
+        let active_teachers = self
+            .load_active_teacher_jobs(scope, teacher_provider_binding_sha256, now)
+            .await?;
+        let verified = active_teachers
+            .into_iter()
+            .filter_map(|job| job.result)
+            .collect::<Vec<_>>();
+        let Some((claim, _)) = prepare_student_job_claim_with_admission(
+            scope,
+            teacher_provider_binding_sha256,
+            recipe_sha256,
+            student_train_runtime_image_reference,
+            student_branch_runtime_image_reference,
+            now,
+            Some(&admission),
+            &verified,
+        )?
+        else {
+            return Ok(None);
+        };
+        let student_job_id = decode_hex_digest(&claim.student_job_id)?;
+        let encoded = encode_json(student_job_claim_key(scope, &student_job_id), &claim)?;
+        if encoded.payload.len() > MAX_STUDENT_CLAIM_BYTES {
+            bail!("student job claim exceeds its hard byte limit");
+        }
+        let source_expires_at = self
+            .verified_student_source_expires_at(scope, &claim)
+            .await?;
+        let index = StudentJobIndex {
+            schema_version: "milk.student-job-index.v1".to_owned(),
+            scope: scope.clone(),
+            student_job_id: claim.student_job_id.clone(),
+            source_expires_at,
+            claim: claim.clone(),
+        };
+        let index_object = encode_json(
+            student_job_frontier_key(scope, teacher_provider_binding_sha256),
+            &index,
+        )?;
+        if index_object.payload.len() > MAX_STUDENT_INDEX_BYTES {
+            bail!("student job frontier exceeds its hard byte limit");
+        }
+        if self
+            .load_current_student_admission(scope)
+            .await?
+            .is_none_or(|current| current.sha256 != admission.sha256)
+        {
+            return Ok(None);
+        }
+        let frontier = match self
+            .objects
+            .put_opts(
+                &ObjectPath::parse(&index_object.key)?,
+                index_object.payload.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => VerifiedStudentFrontier {
+                index,
+                canonical: None,
+            },
+            Err(object_store::Error::AlreadyExists { .. }) => self
+                .load_student_reservation(scope, teacher_provider_binding_sha256)
+                .await?
+                .context("student reservation disappeared during contention")?,
+            Err(error) => return Err(error.into()),
+        };
+        self.reconcile_student_reservation(scope, teacher_provider_binding_sha256, frontier, now)
+            .await
     }
 
     async fn status(
@@ -10266,8 +10386,22 @@ impl RecordStore {
             .context("student job claim is not strict typed JSON")?;
         validate_student_job_claim(scope, student_job_id, &claim, &payload)?;
         if let Some(admission_sha256) = claim.definition.student_admission_sha256.as_deref() {
-            self.load_student_admission_version(scope, admission_sha256)
+            let admission = self
+                .load_student_admission_version(scope, admission_sha256)
                 .await?;
+            if claim.definition.schema_version == "milk.student-job-definition.v6" {
+                let plan = admission
+                    .admission
+                    .teacher_quota_plan
+                    .as_ref()
+                    .context("student job admission lacks its quota plan")?;
+                if admission.admission.schema_version != "milk.student-admission.v2"
+                    || claim.definition.quota_plan_sha256 != admission.admission.quota_plan_sha256
+                    || claim.definition.counts != plan.primary_quotas
+                {
+                    bail!("student job differs from its admitted quota plan");
+                }
+            }
         }
         Ok((claim, payload))
     }
@@ -10311,6 +10445,7 @@ impl RecordStore {
                 provider_binding_sha256: artifact.definition.provider_binding_sha256.clone(),
                 expires_at: artifact.definition.expires_at,
                 observed_cost_microusd: artifact.observed_cost_microusd,
+                quota_slot: artifact.quota_slot.clone(),
                 result: artifact.result,
             });
         }
@@ -10318,6 +10453,22 @@ impl RecordStore {
             let admission = self
                 .load_student_admission_version(scope, admission_sha256)
                 .await?;
+            if claim.definition.schema_version == "milk.student-job-definition.v6" {
+                let selected = admitted_teacher_sources(&admission, &verified)?
+                    .context("student job does not fill its admitted quota plan")?;
+                let selected_references = selected
+                    .iter()
+                    .map(|source| &source.reference)
+                    .collect::<Vec<_>>();
+                let claimed_references = verified
+                    .iter()
+                    .map(|source| &source.reference)
+                    .collect::<Vec<_>>();
+                if selected_references != claimed_references {
+                    bail!("student job includes a teacher result outside its admitted quota plan");
+                }
+                verified = selected;
+            }
             let held_out = admission
                 .admission
                 .held_out_trace_sha256s
@@ -13280,6 +13431,35 @@ fn student_partition_count(counts: StudentInputCounts, partition: TeacherPartiti
     }
 }
 
+fn student_counts_within_safety(counts: StudentInputCounts, allow_zero: bool) -> bool {
+    let minimum = u64::from(!allow_zero);
+    (minimum..=MAX_STUDENT_TRAIN_ROWS as u64).contains(&counts.train)
+        && (minimum..=MAX_STUDENT_DEV_ROWS as u64).contains(&counts.dev)
+        && (minimum..=MAX_STUDENT_CALIBRATION_ROWS as u64).contains(&counts.calibration)
+}
+
+fn valid_student_quota_counts(
+    profile: HarnessProfile,
+    primary: StudentInputCounts,
+    reserve: StudentInputCounts,
+) -> Result<bool> {
+    let total = primary
+        .train
+        .checked_add(primary.dev)
+        .and_then(|value| value.checked_add(primary.calibration))
+        .and_then(|value| value.checked_add(reserve.train))
+        .and_then(|value| value.checked_add(reserve.dev))
+        .and_then(|value| value.checked_add(reserve.calibration));
+    if !student_counts_within_safety(primary, false)
+        || !student_counts_within_safety(reserve, true)
+        || total.is_none_or(|value| value > MAX_ITERATION_SNAPSHOT_ARTIFACTS as u64)
+    {
+        return Ok(false);
+    }
+    Ok(profile != HarnessProfile::Production
+        || wilson_upper_bps(0, primary.dev)? <= ITERATION_EVAL_MAX_ZERO_FAILURE_UPPER_BPS)
+}
+
 fn quota_plan_sha256(plan: &StudentQuotaPlan) -> Result<String> {
     let canonical = serde_json::to_vec(&recursively_sorted_json(serde_json::to_value(plan)?))?;
     Ok(hex_digest(&Sha256::digest(canonical).into()))
@@ -13349,6 +13529,8 @@ fn validate_student_admission_contract(
         .teacher_quota_plan
         .as_ref()
         .context("student admission v2 lacks its inline quota plan")?;
+    let quota_counts_valid =
+        valid_student_quota_counts(admission.profile, plan.primary_quotas, plan.reserve_quotas)?;
     if admission.held_out_trace_sha256s != eval_held_out
         || !valid_lowercase_sha256(expected_plan_sha256)
         || quota_plan_sha256(plan)? != expected_plan_sha256
@@ -13356,18 +13538,7 @@ fn validate_student_admission_contract(
         || plan.scope_id != scope.scope_id
         || plan.source_manifest_sha256 != admission.source_manifest_sha256
         || plan.partition_policy_id != admission.partition_policy_id
-        || plan.primary_quotas
-            != (StudentInputCounts {
-                train: STUDENT_MIN_TRAIN_ROWS as u64,
-                dev: STUDENT_DEV_ROWS,
-                calibration: STUDENT_CALIBRATION_ROWS as u64,
-            })
-        || plan.reserve_quotas
-            != (StudentInputCounts {
-                train: 13,
-                dev: 18,
-                calibration: 38,
-            })
+        || !quota_counts_valid
     {
         bail!("student admission v2 quota-plan identity is invalid");
     }
@@ -15102,7 +15273,7 @@ fn summarize_generation(
                 true
             }
             TeacherOutput::Calibration { .. }
-                if effective.calibration < STUDENT_CALIBRATION_ROWS as u64 =>
+                if effective.calibration < MAX_STUDENT_CALIBRATION_ROWS as u64 =>
             {
                 effective.calibration = effective.calibration.saturating_add(1);
                 true
@@ -16007,6 +16178,110 @@ fn validate_teacher_result(result: &TeacherResult, sources: &[CompleteSnapshot])
     Ok(())
 }
 
+fn admitted_teacher_sources(
+    admission: &VerifiedStudentAdmission,
+    verified: &[VerifiedTeacherResultObject],
+) -> Result<Option<Vec<VerifiedTeacherResultObject>>> {
+    let plan = admission
+        .admission
+        .teacher_quota_plan
+        .as_ref()
+        .context("student admission lacks its quota plan")?;
+    let plan_sha256 = admission
+        .admission
+        .quota_plan_sha256
+        .as_deref()
+        .context("student admission lacks its quota-plan digest")?;
+    if admission.admission.schema_version != "milk.student-admission.v2"
+        || quota_plan_sha256(plan)? != plan_sha256
+    {
+        bail!("student admission quota plan is invalid");
+    }
+    let mut slots = BTreeMap::new();
+    for source in verified {
+        let Some(slot) = source.quota_slot.as_ref() else {
+            continue;
+        };
+        if slot.student_admission_sha256 != admission.sha256
+            || slot.quota_plan_sha256 != plan_sha256
+        {
+            continue;
+        }
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.partition == slot.partition && candidate.rank == slot.rank)
+            .context("student teacher result addresses an unknown quota slot")?;
+        let [entry] = source.result.entries.as_slice() else {
+            bail!("student quota result must contain exactly one entry");
+        };
+        validate_teacher_output_for_student(entry)?;
+        if entry.trace_id != candidate.trace_id
+            || entry.trace_payload_sha256 != candidate.trace_payload_sha256
+            || entry.request_sha256 != candidate.request_sha256
+        {
+            bail!("student teacher result differs from its quota candidate");
+        }
+        let usable = matches!(
+            (&entry.output, slot.partition),
+            (TeacherOutput::Train { .. }, TeacherPartition::Train)
+                | (
+                    TeacherOutput::Dev {
+                        evaluation: TeacherDevEvaluation::Automatic { .. },
+                        ..
+                    },
+                    TeacherPartition::Dev
+                )
+                | (
+                    TeacherOutput::Calibration { .. },
+                    TeacherPartition::Calibration
+                )
+        );
+        if usable
+            && slots
+                .insert((slot.partition, slot.rank), source.clone())
+                .is_some()
+        {
+            bail!("student quota slot has more than one usable teacher result");
+        }
+    }
+    let mut selected = Vec::new();
+    for partition in [
+        TeacherPartition::Train,
+        TeacherPartition::Dev,
+        TeacherPartition::Calibration,
+    ] {
+        let required = student_partition_count(plan.primary_quotas, partition) as usize;
+        let mut partition_sources = slots
+            .iter()
+            .filter(|((candidate_partition, _), _)| *candidate_partition == partition)
+            .map(|((_, rank), source)| (*rank, source.clone()))
+            .collect::<Vec<_>>();
+        partition_sources.sort_by_key(|(rank, _)| *rank);
+        if partition_sources.len() < required {
+            return Ok(None);
+        }
+        selected.extend(
+            partition_sources
+                .into_iter()
+                .take(required)
+                .map(|(_, source)| source),
+        );
+    }
+    selected.sort_by(|left, right| {
+        left.reference
+            .teacher_job_id
+            .cmp(&right.reference.teacher_job_id)
+    });
+    if selected
+        .windows(2)
+        .any(|pair| pair[0].reference.teacher_job_id >= pair[1].reference.teacher_job_id)
+    {
+        bail!("student teacher-result references are not unique");
+    }
+    Ok(Some(selected))
+}
+
 fn prepare_student_job_claim_with_admission(
     scope: &Scope,
     teacher_provider_binding_sha256: &[u8; 32],
@@ -16021,125 +16296,32 @@ fn prepare_student_job_claim_with_admission(
         student_train_runtime_image_reference,
         student_branch_runtime_image_reference,
     )?;
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
     let provider_binding = hex_digest(teacher_provider_binding_sha256);
-    let held_out = admission
-        .into_iter()
-        .flat_map(|verified| verified.admission.held_out_trace_sha256s.iter())
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut current = verified
+    let eligible = verified
         .iter()
         .filter(|source| source.expires_at > now)
         .cloned()
-        .filter_map(|mut source| {
-            source
-                .result
-                .entries
-                .retain(|entry| !held_out.contains(entry.trace_payload_sha256.as_str()));
-            (!source.result.entries.is_empty()).then_some(source)
-        })
         .collect::<Vec<_>>();
-    current.sort_by(|left, right| {
-        left.reference
-            .teacher_job_id
-            .cmp(&right.reference.teacher_job_id)
-    });
-    if current.is_empty() {
+    let Some(current) = admitted_teacher_sources(admission, &eligible)? else {
         return Ok(None);
-    }
-    if current
-        .windows(2)
-        .any(|pair| pair[0].reference.teacher_job_id >= pair[1].reference.teacher_job_id)
-    {
-        bail!("student teacher-result references are not unique");
-    }
-    if current.len() > MAX_ITERATION_SNAPSHOT_ARTIFACTS {
-        let mut grouped = BTreeMap::<String, Option<TeacherOutput>>::new();
-        for source in &current {
-            for entry in &source.result.entries {
-                grouped
-                    .entry(entry.request_sha256.clone())
-                    .and_modify(|output| {
-                        if output.as_ref() != Some(&entry.output) {
-                            *output = None;
-                        }
-                    })
-                    .or_insert_with(|| Some(entry.output.clone()));
-            }
-        }
-        let mut desired = HashSet::new();
-        let mut counts = StudentInputCounts {
-            train: 0,
-            dev: 0,
-            calibration: 0,
-        };
-        for (request_sha256, output) in &grouped {
-            let selected = match output {
-                Some(TeacherOutput::Train { .. })
-                    if counts.train < STUDENT_MIN_TRAIN_ROWS as u64 =>
-                {
-                    counts.train = counts.train.saturating_add(1);
-                    true
-                }
-                Some(TeacherOutput::Dev {
-                    evaluation: TeacherDevEvaluation::Automatic { .. },
-                    ..
-                }) if counts.dev < MAX_STUDENT_DEV_ROWS as u64 => {
-                    counts.dev = counts.dev.saturating_add(1);
-                    true
-                }
-                Some(TeacherOutput::Calibration { .. })
-                    if counts.calibration < STUDENT_CALIBRATION_ROWS as u64 =>
-                {
-                    counts.calibration = counts.calibration.saturating_add(1);
-                    true
-                }
-                _ => false,
-            };
-            if selected {
-                desired.insert(request_sha256.clone());
-            }
-        }
-        if !student_input_ready(counts)? {
-            return Ok(None);
-        }
-        let mut covered = HashSet::new();
-        let mut selected = Vec::new();
-        for source in current {
-            let clean = source.result.entries.iter().all(|entry| {
-                grouped
-                    .get(&entry.request_sha256)
-                    .is_some_and(|output| output.as_ref() == Some(&entry.output))
-            });
-            let contributes = clean
-                && source.result.entries.iter().any(|entry| {
-                    desired.contains(&entry.request_sha256)
-                        && !covered.contains(&entry.request_sha256)
-                });
-            if contributes {
-                covered.extend(
-                    source
-                        .result
-                        .entries
-                        .iter()
-                        .filter(|entry| desired.contains(&entry.request_sha256))
-                        .map(|entry| entry.request_sha256.clone()),
-                );
-                selected.push(source);
-                if covered.len() == desired.len() {
-                    break;
-                }
-            }
-        }
-        if covered.len() != desired.len() || selected.len() > MAX_ITERATION_SNAPSHOT_ARTIFACTS {
-            return Ok(None);
-        }
-        current = selected;
-    }
+    };
     let bundle = student_input_bundle(scope, &provider_binding, &current)?;
     let counts = student_input_counts(&bundle);
-    if !student_input_ready(counts)? {
-        return Ok(None);
+    let plan = admission
+        .admission
+        .teacher_quota_plan
+        .as_ref()
+        .context("student admission lacks its quota plan")?;
+    let plan_sha256 = admission
+        .admission
+        .quota_plan_sha256
+        .as_deref()
+        .context("student admission lacks its quota-plan digest")?;
+    if counts != plan.primary_quotas {
+        bail!("student input does not fill its admitted primary quotas");
     }
     let input = encode_student_input(&bundle)?;
     let expires_at = current
@@ -16148,14 +16330,10 @@ fn prepare_student_job_claim_with_admission(
         .min()
         .context("student job has no teacher expiry")?;
     let definition = StudentJobDefinition {
-        schema_version: if admission.is_some() {
-            "milk.student-job-definition.v5"
-        } else {
-            "milk.student-job-definition.v4"
-        }
-        .to_owned(),
+        schema_version: "milk.student-job-definition.v6".to_owned(),
         teacher_provider_binding_sha256: provider_binding,
-        student_admission_sha256: admission.map(|verified| verified.sha256.clone()),
+        student_admission_sha256: Some(admission.sha256.clone()),
+        quota_plan_sha256: Some(plan_sha256.to_owned()),
         teacher_results: current.into_iter().map(|source| source.reference).collect(),
         input_sha256: hex_digest(&Sha256::digest(&input).into()),
         dev_set_sha256: student_dev_set_sha256(&bundle.dev)?,
@@ -16175,12 +16353,7 @@ fn prepare_student_job_claim_with_admission(
     };
     let student_job_id: [u8; 32] = Sha256::digest(serde_json::to_vec(&definition)?).into();
     let claim = StudentJobClaim {
-        schema_version: if admission.is_some() {
-            "milk.student-job-claim.v5"
-        } else {
-            "milk.student-job-claim.v4"
-        }
-        .to_owned(),
+        schema_version: "milk.student-job-claim.v6".to_owned(),
         scope: scope.clone(),
         student_job_id: hex_digest(&student_job_id),
         definition,
@@ -16280,7 +16453,7 @@ fn student_input_bundle(
     }
     train.truncate(MAX_STUDENT_TRAIN_ROWS);
     dev.truncate(MAX_STUDENT_DEV_ROWS);
-    calibration.truncate(STUDENT_CALIBRATION_ROWS);
+    calibration.truncate(MAX_STUDENT_CALIBRATION_ROWS);
     if serde_json::to_vec(&train)?.len() > MAX_STUDENT_TRAIN_BUNDLE_BYTES
         || serde_json::to_vec(&dev)?.len() > MAX_STUDENT_DEV_BUNDLE_BYTES
         || serde_json::to_vec(&calibration)?.len() > MAX_STUDENT_CALIBRATION_BUNDLE_BYTES
@@ -16365,13 +16538,13 @@ fn student_input_counts(bundle: &StudentInputBundle) -> StudentInputCounts {
     }
 }
 
-fn student_input_ready(counts: StudentInputCounts) -> Result<bool> {
-    Ok(counts.train >= STUDENT_MIN_TRAIN_ROWS as u64
+fn legacy_student_input_ready(counts: StudentInputCounts) -> Result<bool> {
+    Ok(counts.train >= LEGACY_STUDENT_MIN_TRAIN_ROWS
         && counts.train <= MAX_STUDENT_TRAIN_ROWS as u64
-        && counts.dev > 0
+        && counts.dev >= LEGACY_STUDENT_DEV_ROWS
         && counts.dev <= MAX_STUDENT_DEV_ROWS as u64
         && wilson_upper_bps(0, counts.dev)? <= ITERATION_EVAL_MAX_ZERO_FAILURE_UPPER_BPS
-        && counts.calibration == ITERATION_MIN_CALIBRATION_GROUPS)
+        && counts.calibration == LEGACY_STUDENT_CALIBRATION_ROWS)
 }
 
 fn encode_student_input(bundle: &StudentInputBundle) -> Result<Vec<u8>> {
@@ -16402,19 +16575,39 @@ fn validate_student_job_claim(
         .teacher_results
         .windows(2)
         .all(|pair| pair[0].teacher_job_id < pair[1].teacher_job_id);
-    let valid_version = ((claim.schema_version == "milk.student-job-claim.v4"
+    let legacy_version = (claim.schema_version == "milk.student-job-claim.v4"
         && claim.definition.schema_version == "milk.student-job-definition.v4"
-        && claim.definition.student_admission_sha256.is_none())
+        && claim.definition.student_admission_sha256.is_none()
+        && claim.definition.quota_plan_sha256.is_none())
         || (claim.schema_version == "milk.student-job-claim.v5"
             && claim.definition.schema_version == "milk.student-job-definition.v5"
             && claim
                 .definition
                 .student_admission_sha256
                 .as_deref()
-                .is_some_and(valid_lowercase_sha256)))
+                .is_some_and(valid_lowercase_sha256)
+            && claim.definition.quota_plan_sha256.is_none());
+    let admitted_version = claim.schema_version == "milk.student-job-claim.v6"
+        && claim.definition.schema_version == "milk.student-job-definition.v6"
+        && claim
+            .definition
+            .student_admission_sha256
+            .as_deref()
+            .is_some_and(valid_lowercase_sha256)
+        && claim
+            .definition
+            .quota_plan_sha256
+            .as_deref()
+            .is_some_and(valid_lowercase_sha256);
+    let valid_version = (legacy_version || admitted_version)
         && claim.definition.max_train_gpu_seconds == STUDENT_MAX_TRAIN_GPU_SECONDS
         && claim.definition.max_branch_gpu_seconds == STUDENT_MAX_BRANCH_GPU_SECONDS
         && claim.definition.max_total_gpu_seconds == STUDENT_MAX_TOTAL_GPU_SECONDS;
+    let counts_valid = if admitted_version {
+        student_counts_within_safety(claim.definition.counts, false)
+    } else {
+        legacy_student_input_ready(claim.definition.counts)?
+    };
     if serde_json::to_vec(claim)? != payload
         || !valid_version
         || claim.scope != *scope
@@ -16438,7 +16631,7 @@ fn validate_student_job_claim(
                 || !valid_lowercase_sha256(&reference.object_sha256)
                 || reference.bytes == 0
         })
-        || !student_input_ready(claim.definition.counts)?
+        || !counts_valid
         || claim.definition.quality.min_mean_score_bps != STUDENT_MIN_MEAN_SCORE_BPS
         || claim.definition.quality.max_mean_loss_vs_bf16_bps != STUDENT_MAX_MEAN_LOSS_VS_BF16_BPS
         || claim.definition.quality.max_p95_latency_ms != STUDENT_MAX_P95_LATENCY_MS
@@ -19199,10 +19392,16 @@ fn student_train_gpu_launch_outbox(
     let student_job_id = decode_hex_digest(&claim.student_job_id)?;
     validate_student_job_claim(scope, &student_job_id, claim, claim_payload)?;
     let claim_sha256 = hex_digest(&Sha256::digest(claim_payload).into());
+    let admitted = claim.definition.schema_version == "milk.student-job-definition.v6";
     Ok((
         student_job_launch_outbox_key(scope, &student_job_id),
         GpuLaunchOutbox {
-            schema_version: "milk.gpu-launch-outbox.v1".to_owned(),
+            schema_version: if admitted {
+                "milk.gpu-launch-outbox.v2"
+            } else {
+                "milk.gpu-launch-outbox.v1"
+            }
+            .to_owned(),
             scope: scope.clone(),
             dispatch_id: claim_sha256.clone(),
             claim_object_key: student_job_claim_key(scope, &student_job_id),
@@ -19215,6 +19414,12 @@ fn student_train_gpu_launch_outbox(
             expires_at: claim.definition.expires_at,
             operation: GpuLaunchOperation::StudentTrainMerge {
                 student_job_id: claim.student_job_id.clone(),
+                student_admission_sha256: admitted
+                    .then(|| claim.definition.student_admission_sha256.clone())
+                    .flatten(),
+                quota_plan_sha256: admitted
+                    .then(|| claim.definition.quota_plan_sha256.clone())
+                    .flatten(),
                 counts: claim.definition.counts,
                 max_gpu_seconds: claim.definition.max_train_gpu_seconds,
             },
@@ -19325,12 +19530,30 @@ fn validate_gpu_launch_outbox(scope: &Scope, key: &str, outbox: &GpuLaunchOutbox
         }
         GpuLaunchOperation::StudentTrainMerge {
             student_job_id,
+            student_admission_sha256,
+            quota_plan_sha256,
             counts,
             max_gpu_seconds,
         } => {
             let student_job_id = decode_hex_digest(student_job_id)?;
-            outbox.schema_version == "milk.gpu-launch-outbox.v1"
-                && student_input_ready(*counts)?
+            let lineage_valid = match outbox.schema_version.as_str() {
+                "milk.gpu-launch-outbox.v1" => {
+                    student_admission_sha256.is_none()
+                        && quota_plan_sha256.is_none()
+                        && legacy_student_input_ready(*counts)?
+                }
+                "milk.gpu-launch-outbox.v2" => {
+                    student_admission_sha256
+                        .as_deref()
+                        .is_some_and(valid_lowercase_sha256)
+                        && quota_plan_sha256
+                            .as_deref()
+                            .is_some_and(valid_lowercase_sha256)
+                        && student_counts_within_safety(*counts, false)
+                }
+                _ => false,
+            };
+            lineage_valid
                 && *max_gpu_seconds == STUDENT_MAX_TRAIN_GPU_SECONDS
                 && outbox.claim_object_key == student_job_claim_key(scope, &student_job_id)
                 && key == student_job_launch_outbox_key(scope, &student_job_id)
@@ -20470,6 +20693,7 @@ mod tests {
             schema_version: "milk.student-job-definition.v4".to_owned(),
             teacher_provider_binding_sha256: hex_digest(&[1; 32]),
             student_admission_sha256: None,
+            quota_plan_sha256: None,
             teacher_results: vec![StudentTeacherResultRef {
                 teacher_job_id: hex_digest(&[2; 32]),
                 object_sha256: hex_digest(&[3; 32]),
@@ -20687,6 +20911,7 @@ mod tests {
             provider_binding_sha256: provider_binding_sha256.to_owned(),
             expires_at,
             observed_cost_microusd: 0,
+            quota_slot: None,
             result,
         }
     }
@@ -20761,6 +20986,7 @@ mod tests {
             reserved_cost_microusd: snapshot_analysis_reserved_cost(&budget).unwrap(),
             budget,
             expires_at,
+            quota_slot: None,
         };
         let teacher_job_id: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&definition).unwrap()).into();
@@ -20789,6 +21015,7 @@ mod tests {
             observed_cost_microusd: 2,
             result_sha256,
             result: result.clone(),
+            quota_slot: None,
         };
         validate_stored_teacher_result_metadata(scope, &teacher_job_id, &artifact).unwrap();
         let encoded =
@@ -20804,6 +21031,7 @@ mod tests {
             provider_binding_sha256: provider_binding,
             expires_at,
             observed_cost_microusd: 2,
+            quota_slot: None,
             result,
         }
     }
