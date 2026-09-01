@@ -1353,14 +1353,14 @@ pub(crate) struct SnapshotAnalysisAuthorization {
     capture_rights_state: String,
     projection_id: String,
     analyzer_provider_binding_sha256: String,
-    complete_snapshot_disclosure_allowed: bool,
-    output_training_allowed: bool,
     #[serde(
         default,
         rename = "max_decisions",
         skip_serializing_if = "Option::is_none"
     )]
     _retired_max_decisions: Option<u32>,
+    complete_snapshot_disclosure_allowed: bool,
+    output_training_allowed: bool,
     not_after: DateTime<Utc>,
 }
 
