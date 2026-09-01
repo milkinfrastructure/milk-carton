@@ -39,7 +39,6 @@ const _: () = assert!(
 );
 const MAX_ROUTE_VALIDITY_HOURS: i64 = 24;
 const MAX_PUBLICATION_START_DELAY_MINUTES: i64 = 5;
-const MAX_HARNESS_CANDIDATE_BASIS_POINTS: u16 = 1_000;
 const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v4";
 const HARNESS_TAXONOMY_VERSION: &str = "milk.semantic-taxonomy.v1";
 
@@ -548,9 +547,6 @@ pub(crate) fn parse_operator_route_proposal(
     }
     if proposal.scope_id != scope.scope_id {
         bail!("route proposal scope does not match startup configuration");
-    }
-    if proposal.candidate_basis_points > MAX_HARNESS_CANDIDATE_BASIS_POINTS {
-        bail!("candidate_basis_points cannot exceed 1000");
     }
     for (value, description) in [
         (&proposal.source_manifest_sha256, "source manifest SHA-256"),

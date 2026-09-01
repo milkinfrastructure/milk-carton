@@ -350,7 +350,6 @@ struct TeacherConfig {
     terms_sha256: String,
     authorization_id: String,
     authorization_not_after: DateTime<Utc>,
-    max_decisions: u32,
     max_projected_bytes: u64,
     max_input_tokens: u64,
     max_output_tokens: u16,
@@ -795,10 +794,7 @@ struct StatusWrite {
 struct GenerationStatusWrite {
     schema_version: &'static str,
     scope_id: Uuid,
-    max_decisions: u32,
     claimed_decisions: u32,
-    remaining_decisions: u32,
-    generation_done: bool,
 }
 
 #[derive(Deserialize)]
@@ -1616,7 +1612,6 @@ async fn tick_action_with_records(
         config.capture_policy_version.clone(),
         config.capture_rights_state.clone(),
         provider_binding,
-        teacher.max_decisions,
         teacher.authorization_not_after,
     )?;
     let recipe_sha256 = decode_lowercase_sha256(&teacher.student_recipe_sha256)?;
@@ -1691,18 +1686,14 @@ async fn generation_status_once(config: &FileConfig, now: DateTime<Utc>) -> Resu
     )
     .await?;
     let provider_binding = snapshot_provider_binding(config)?;
-    let max_decisions = teacher_config(config)?.max_decisions;
     let status = records
-        .status(&config_scope(config), &provider_binding, max_decisions, now)
+        .status(&config_scope(config), &provider_binding, now)
         .await?;
     let generation = status.generation;
     Ok(serde_json::to_string(&GenerationStatusWrite {
-        schema_version: "milk.generation-status.v1",
+        schema_version: "milk.generation-status.v2",
         scope_id: config_scope(config).scope_id,
-        max_decisions: generation.max_decisions,
         claimed_decisions: generation.claimed_decisions,
-        remaining_decisions: generation.remaining_decisions,
-        generation_done: generation.remaining_decisions == 0,
     })?)
 }
 
@@ -2095,7 +2086,6 @@ fn validate_config_for_command(config: &FileConfig, command: Option<&Command>) -
 
 fn validate_teacher_config(config: &FileConfig) -> Result<()> {
     let teacher = teacher_config(config)?;
-    records::validate_teacher_max_decisions(teacher.max_decisions)?;
     parse_openai_compatible_endpoint(&teacher.chat_completions_url, teacher.allow_loopback_http)?;
     decode_lowercase_sha256(&teacher.deployment_sha256)?;
     decode_lowercase_sha256(&teacher.terms_sha256)?;

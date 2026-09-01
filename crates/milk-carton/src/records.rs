@@ -118,7 +118,6 @@ const TEACHER_TERMINALIZATION_MARGIN_SECONDS: i64 = 5 * 60;
 const TEACHER_MAX_GPU_SECONDS: u64 = 60 * 60;
 const TEACHER_MAX_CALLS: u8 = 64;
 const TEACHER_MAX_PARALLEL_RUNS: u8 = 16;
-pub(crate) const TEACHER_MAX_DECISIONS: u32 = 4_096;
 const MAX_ACTIVE_GPU_LAUNCHES: usize = 18;
 pub(crate) const TICK_LEASE_TTL_SECONDS: u64 = 10 * 60;
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1352,7 +1351,6 @@ pub(crate) struct SnapshotAnalysisAuthorization {
     capture_rights_state: String,
     projection_id: String,
     analyzer_provider_binding_sha256: String,
-    max_decisions: u32,
     complete_snapshot_disclosure_allowed: bool,
     output_training_allowed: bool,
     not_after: DateTime<Utc>,
@@ -1366,18 +1364,16 @@ impl SnapshotAnalysisAuthorization {
         capture_policy_version: String,
         capture_rights_state: String,
         analyzer_provider_binding_sha256: [u8; 32],
-        max_decisions: u32,
         not_after: DateTime<Utc>,
     ) -> Result<(Self, [u8; 32])> {
         let policy = Self {
-            schema_version: "milk.teacher-policy.v2".to_owned(),
+            schema_version: "milk.teacher-policy.v3".to_owned(),
             policy_id,
             scope: scope.clone(),
             capture_policy_version,
             capture_rights_state,
             projection_id: SNAPSHOT_ANALYSIS_PROJECTION_ID.to_owned(),
             analyzer_provider_binding_sha256: hex_digest(&analyzer_provider_binding_sha256),
-            max_decisions,
             complete_snapshot_disclosure_allowed: true,
             output_training_allowed: true,
             not_after,
@@ -2305,10 +2301,7 @@ pub(crate) enum TeacherGpuTickWrite {
 }
 
 enum TeacherGpuClaimPreparation {
-    Ready {
-        claim: Box<TeacherJobClaim>,
-        created_decision: bool,
-    },
+    Ready(Box<TeacherJobClaim>),
     Advanced(SnapshotLocalRejectionWrite),
     None,
 }
@@ -3076,9 +3069,7 @@ pub(crate) struct ExpiryStatusWrite {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenerationStatusWrite {
     pub(crate) provider_binding_sha256: String,
-    pub(crate) max_decisions: u32,
     pub(crate) claimed_decisions: u32,
-    pub(crate) remaining_decisions: u32,
     pub(crate) active_teacher_jobs: u64,
     pub(crate) active_ambiguous_teacher_jobs: u64,
     pub(crate) prepared_teacher_gpu_jobs: u64,
@@ -4110,11 +4101,10 @@ impl Records {
         &self,
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
-        max_decisions: u32,
         now: DateTime<Utc>,
     ) -> Result<RecordsStatusWrite> {
         self.store
-            .status(scope, teacher_provider_binding_sha256, max_decisions, now)
+            .status(scope, teacher_provider_binding_sha256, now)
             .await
     }
 
@@ -6004,10 +5994,9 @@ impl RecordStore {
         while let Some(meta) = listed.next().await {
             let key = meta?.location.to_string();
             validate_teacher_job_batch_index_path(&key_prefix, &key)?;
-            if count >= TEACHER_MAX_DECISIONS {
-                bail!("teacher decision claims exceed {TEACHER_MAX_DECISIONS}");
-            }
-            count += 1;
+            count = count
+                .checked_add(1)
+                .context("teacher decision count overflow")?;
         }
         Ok(count)
     }
@@ -6034,14 +6023,9 @@ impl RecordStore {
         let mut claimed = BTreeSet::new();
         let mut accepted = BTreeMap::<TeacherPartition, u64>::new();
         let mut pending = BTreeMap::<TeacherPartition, u64>::new();
-        let mut listed_count = 0_usize;
         while let Some(meta) = listed.next().await {
             let key = meta?.location.to_string();
             validate_teacher_job_batch_index_path(&key_prefix, &key)?;
-            listed_count = listed_count.saturating_add(1);
-            if listed_count > TEACHER_MAX_DECISIONS as usize {
-                bail!("teacher decision claims exceed {TEACHER_MAX_DECISIONS}");
-            }
             let index_payload = self.load_bytes(&key, self.max_trace_bytes).await?;
             let index: TeacherJobIndex = serde_json::from_slice(&index_payload)?;
             validate_teacher_job_index(scope, &key, &index, &index_payload)?;
@@ -7362,7 +7346,6 @@ impl RecordStore {
         source_authorization_sha256: &[u8; 32],
         config: &SnapshotAnalyzerConfig,
         max_gpu_seconds: u64,
-        claimed_decisions: u32,
         now: DateTime<Utc>,
         admission: &VerifiedStudentAdmission,
     ) -> Result<TeacherGpuClaimPreparation> {
@@ -7392,13 +7375,6 @@ impl RecordStore {
             )
             .await?;
         let batch_id = decode_hex_digest(&batch.snapshot_batch_id)?;
-        let created_decision = self
-            .load_teacher_job_index_by_batch(scope, &batch_id)
-            .await?
-            .is_none();
-        if created_decision && claimed_decisions >= authorization.max_decisions {
-            return Ok(TeacherGpuClaimPreparation::None);
-        }
         let prepared = match self
             .prepare_teacher_analysis(scope, &batch_id, config, now)
             .await?
@@ -7430,10 +7406,7 @@ impl RecordStore {
             .await?;
         let claim: TeacherJobClaim = serde_json::from_slice(&claim_payload)?;
         validate_teacher_job_claim(scope, &prepared.teacher_job_id, &claim, &claim_payload)?;
-        Ok(TeacherGpuClaimPreparation::Ready {
-            claim: Box::new(claim),
-            created_decision,
-        })
+        Ok(TeacherGpuClaimPreparation::Ready(Box::new(claim)))
     }
 
     async fn claim_teacher_gpu_run(
@@ -7488,7 +7461,6 @@ impl RecordStore {
         if admission.admission.schema_version != "milk.student-admission.v2" {
             return Ok(TeacherGpuTickWrite::Hold);
         }
-        let mut claimed_decisions = self.teacher_decision_count(scope).await?;
         let active = self
             .load_active_teacher_jobs(scope, &provider_binding_sha256, now)
             .await?;
@@ -7531,21 +7503,12 @@ impl RecordStore {
                         &source_authorization_sha256,
                         &config,
                         max_gpu_seconds,
-                        claimed_decisions,
                         now,
                         &admission,
                     )
                     .await?
                 {
-                    TeacherGpuClaimPreparation::Ready {
-                        claim,
-                        created_decision,
-                    } => {
-                        if created_decision {
-                            claimed_decisions = claimed_decisions
-                                .checked_add(1)
-                                .context("teacher decision count overflow")?;
-                        }
+                    TeacherGpuClaimPreparation::Ready(claim) => {
                         if !self
                             .teacher_job_is_admitted(scope, &claim, &admission)
                             .await?
@@ -7643,23 +7606,12 @@ impl RecordStore {
                     &source_authorization_sha256,
                     &config,
                     max_gpu_seconds,
-                    claimed_decisions,
                     now,
                     &admission,
                 )
                 .await?
             {
-                TeacherGpuClaimPreparation::Ready {
-                    claim,
-                    created_decision,
-                } => {
-                    if created_decision {
-                        claimed_decisions = claimed_decisions
-                            .checked_add(1)
-                            .context("teacher decision count overflow")?;
-                    }
-                    *claim
-                }
+                TeacherGpuClaimPreparation::Ready(claim) => *claim,
                 TeacherGpuClaimPreparation::Advanced(write) => {
                     advanced = Some(write);
                     break;
@@ -9655,10 +9607,8 @@ impl RecordStore {
         &self,
         scope: &Scope,
         teacher_provider_binding_sha256: &[u8; 32],
-        max_decisions: u32,
         now: DateTime<Utc>,
     ) -> Result<RecordsStatusWrite> {
-        validate_teacher_max_decisions(max_decisions)?;
         let capture = self.capture_status(scope, now).await?;
         let expiry = self.expiry_status(scope, now).await?;
         let claimed_decisions = self.teacher_decision_count(scope).await?;
@@ -9683,7 +9633,6 @@ impl RecordStore {
         let mut generation = summarize_generation(
             hex_digest(teacher_provider_binding_sha256),
             &unconsumed,
-            max_decisions,
             claimed_decisions,
         );
         let mut active_ambiguous_teacher_jobs = 0_u64;
@@ -13685,7 +13634,6 @@ fn unconsumed_teacher_results(
 fn summarize_generation(
     provider_binding_sha256: String,
     sources: &[VerifiedTeacherResultObject],
-    max_decisions: u32,
     claimed_decisions: u32,
 ) -> GenerationStatusWrite {
     let mut grouped = BTreeMap::<String, (Option<TeacherOutput>, BTreeSet<String>)>::new();
@@ -13765,9 +13713,7 @@ fn summarize_generation(
     }
     GenerationStatusWrite {
         provider_binding_sha256,
-        max_decisions,
         claimed_decisions,
-        remaining_decisions: max_decisions.saturating_sub(claimed_decisions),
         active_teacher_jobs: 0,
         active_ambiguous_teacher_jobs: 0,
         prepared_teacher_gpu_jobs: 0,
@@ -14362,26 +14308,18 @@ fn validate_snapshot_analysis_authorization(
     scope: &Scope,
     authorization: &SnapshotAnalysisAuthorization,
 ) -> Result<()> {
-    if authorization.schema_version != "milk.teacher-policy.v2"
+    if authorization.schema_version != "milk.teacher-policy.v3"
         || !valid_analysis_identifier(&authorization.policy_id, 128)
         || authorization.scope != *scope
         || !bounded_nonempty(&authorization.capture_policy_version, 256)
         || !bounded_nonempty(&authorization.capture_rights_state, 128)
         || authorization.projection_id != SNAPSHOT_ANALYSIS_PROJECTION_ID
         || !valid_lowercase_sha256(&authorization.analyzer_provider_binding_sha256)
-        || validate_teacher_max_decisions(authorization.max_decisions).is_err()
         || !authorization.complete_snapshot_disclosure_allowed
         || !authorization.output_training_allowed
         || authorization.not_after.timestamp() <= 0
     {
         bail!("teacher policy is invalid or lacks disclosure and training authority");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_teacher_max_decisions(max_decisions: u32) -> Result<()> {
-    if !(1..=TEACHER_MAX_DECISIONS).contains(&max_decisions) {
-        bail!("teacher max_decisions must be in 1..={TEACHER_MAX_DECISIONS}");
     }
     Ok(())
 }

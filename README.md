@@ -46,7 +46,7 @@ The important settings are:
 - request-key records containing the key UUID, exact key hash, stable scope UUID, and capture authority;
 - optional `revocation` metadata, whose presence disables that key without moving its scope history;
 - capture, control, and route object-store roles, which may share one physical bucket;
-- an operator-assigned scope per request key, its `milk/v1/scopes/<scope_id>/` object namespace, and its hard decision/call limits; routed and control deployments use one scope;
+- an operator-assigned scope per request key and its `milk/v1/scopes/<scope_id>/` object namespace; routed and control deployments use one scope;
 - immutable teacher, student, and image identities.
 
 Secrets stay in environment variables:
@@ -99,7 +99,7 @@ Keep the sampling key stable for a version so session selection remains determin
 
 ## Bounded evaluation loop
 
-`tick --once` reads captured traffic and the current eval configuration. Durable data is isolated under `milk/v1/scopes/<scope_id>/`; eval revisions do not create traffic namespaces. The command acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks stop creating teacher work when `teacher.max_decisions` is reached for the scope. Existing reconciliation and teardown continue even after the limit.
+`tick --once` reads captured traffic and the current eval configuration. Durable data is isolated under `milk/v1/scopes/<scope_id>/`; eval revisions do not create traffic namespaces. The command acquires one object-store lease, repairs incomplete work, and creates no more than one new launch record. Repeated ticks drain all admitted work; per-job deadlines and resource bounds terminate failed work without imposing a scope-wide quota.
 
 The object store is authoritative. A scheduler, Exo, or a local shell may invoke the command, but none of them can manufacture a claim or authorize provider spend.
 
