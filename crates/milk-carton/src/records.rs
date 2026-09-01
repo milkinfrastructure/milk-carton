@@ -11034,7 +11034,10 @@ impl RecordStore {
         let source_body = source_bytes
             .strip_suffix(b"\n")
             .context("student admission source manifest has no canonical LF")?;
-        let budget_free = admission.code_version == "milk.harness-run-once.v4";
+        let budget_free = matches!(
+            admission.code_version.as_str(),
+            "milk.harness-run-once.v4" | "milk.harness-run-once.v5"
+        );
         let checks = readiness.checks;
         let eval_generation_capacity = if budget_free {
             if checks.eval_generation_budget_available.is_some() {
