@@ -215,10 +215,6 @@ struct HarnessReadinessChecks {
     production_text_reference_capacity: bool,
     eval_source_plan_feasible: bool,
     closed_watermark_without_capture_gap: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    eval_generation_budget_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    eval_generation_capacity_available: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -11039,21 +11035,6 @@ impl RecordStore {
             "milk.harness-run-once.v4" | "milk.harness-run-once.v5"
         );
         let checks = readiness.checks;
-        let eval_generation_capacity = if budget_free {
-            if checks.eval_generation_budget_available.is_some() {
-                bail!("budget-free student readiness contains the legacy budget gate");
-            }
-            checks
-                .eval_generation_capacity_available
-                .context("budget-free student readiness lacks its capacity gate")?
-        } else {
-            if checks.eval_generation_capacity_available.is_some() {
-                bail!("legacy student readiness contains a budget-free capacity gate");
-            }
-            checks
-                .eval_generation_budget_available
-                .context("legacy student readiness lacks its budget gate")?
-        };
         let all_ready = [
             checks.minimum_independent_sessions,
             checks.minimum_classified_sessions,
@@ -11066,8 +11047,8 @@ impl RecordStore {
             checks.represented_classes_meet_minimum,
             checks.representative_eval_capacity,
             checks.production_text_reference_capacity,
+            checks.eval_source_plan_feasible,
             checks.closed_watermark_without_capture_gap,
-            eval_generation_capacity,
         ]
         .into_iter()
         .all(|passed| passed);
@@ -11390,12 +11371,6 @@ impl RecordStore {
         }
 
         let checks = readiness.checks;
-        if checks.eval_generation_budget_available.is_some() {
-            bail!("readiness contains the removed budget gate");
-        }
-        let eval_generation_capacity = checks
-            .eval_generation_capacity_available
-            .context("readiness lacks its capacity gate")?;
         let all_ready = [
             checks.minimum_independent_sessions,
             checks.minimum_classified_sessions,
@@ -11410,7 +11385,6 @@ impl RecordStore {
             checks.production_text_reference_capacity,
             checks.eval_source_plan_feasible,
             checks.closed_watermark_without_capture_gap,
-            eval_generation_capacity,
         ]
         .into_iter()
         .all(|passed| passed);

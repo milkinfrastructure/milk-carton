@@ -39,7 +39,7 @@ const _: () = assert!(
 );
 const MAX_ROUTE_VALIDITY_HOURS: i64 = 24;
 const MAX_PUBLICATION_START_DELAY_MINUTES: i64 = 5;
-const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v4";
+const HARNESS_CODE_VERSION: &str = "milk.harness-run-once.v5";
 const HARNESS_TAXONOMY_VERSION: &str = "milk.semantic-taxonomy.v1";
 
 #[derive(Clone, Debug, Deserialize)]
