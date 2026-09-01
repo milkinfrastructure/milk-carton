@@ -1355,6 +1355,12 @@ pub(crate) struct SnapshotAnalysisAuthorization {
     analyzer_provider_binding_sha256: String,
     complete_snapshot_disclosure_allowed: bool,
     output_training_allowed: bool,
+    #[serde(
+        default,
+        rename = "max_decisions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    _retired_max_decisions: Option<u32>,
     not_after: DateTime<Utc>,
 }
 
@@ -1378,6 +1384,7 @@ impl SnapshotAnalysisAuthorization {
             analyzer_provider_binding_sha256: hex_digest(&analyzer_provider_binding_sha256),
             complete_snapshot_disclosure_allowed: true,
             output_training_allowed: true,
+            _retired_max_decisions: None,
             not_after,
         };
         validate_snapshot_analysis_authorization(&scope, &policy)?;
