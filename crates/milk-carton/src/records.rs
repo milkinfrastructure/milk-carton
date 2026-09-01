@@ -14303,8 +14303,10 @@ fn validate_snapshot_analysis_authorization(
     scope: &Scope,
     authorization: &SnapshotAnalysisAuthorization,
 ) -> Result<()> {
-    if authorization.schema_version != "milk.teacher-policy.v3"
-        || !valid_analysis_identifier(&authorization.policy_id, 128)
+    if !matches!(
+        authorization.schema_version.as_str(),
+        "milk.teacher-policy.v2" | "milk.teacher-policy.v3"
+    ) || !valid_analysis_identifier(&authorization.policy_id, 128)
         || authorization.scope != *scope
         || !bounded_nonempty(&authorization.capture_policy_version, 256)
         || !bounded_nonempty(&authorization.capture_rights_state, 128)
