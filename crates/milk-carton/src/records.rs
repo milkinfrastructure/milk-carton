@@ -120,7 +120,6 @@ const TEACHER_MAX_CALLS: u8 = 64;
 const TEACHER_MAX_PARALLEL_RUNS: u8 = 16;
 pub(crate) const TEACHER_MAX_DECISIONS: u32 = 4_096;
 const MAX_ACTIVE_GPU_LAUNCHES: usize = 18;
-const LEGACY_PROVIDER_CLAIM_CREATION_ENABLED: bool = false;
 pub(crate) const TICK_LEASE_TTL_SECONDS: u64 = 10 * 60;
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
@@ -7481,9 +7480,6 @@ impl RecordStore {
             .await?
         {
             return Ok(write);
-        }
-        if !LEGACY_PROVIDER_CLAIM_CREATION_ENABLED {
-            return Ok(TeacherGpuTickWrite::Hold);
         }
         if !self
             .teacher_gpu_capacity_available(
