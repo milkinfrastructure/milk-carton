@@ -6911,19 +6911,6 @@ impl RecordStore {
         {
             bail!("student quota candidate differs from its captured independent text request");
         }
-        let frontier_key = snapshot_trace_frontier_key(scope, candidate.trace_id)?;
-        let frontier_payload = self
-            .load_bytes(&frontier_key, self.max_trace_bytes)
-            .await
-            .context("student quota candidate lacks its live trace frontier")?;
-        let frontier: SnapshotTraceFrontier = serde_json::from_slice(&frontier_payload)?;
-        validate_snapshot_trace_frontier(scope, &frontier_key, &frontier, &frontier_payload)?;
-        if frontier.trace_id != candidate.trace_id
-            || frontier.trace_object_key != candidate.trace_object_key
-            || frontier.trace_payload_sha256 != candidate.trace_payload_sha256
-        {
-            bail!("student quota candidate frontier differs from its admission");
-        }
         let entry = self
             .snapshot_batch_entry(
                 scope,
