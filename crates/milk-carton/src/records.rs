@@ -11503,6 +11503,16 @@ impl RecordStore {
             .and_then(|value| value.checked_add(result.candidate.input_tokens))
             .and_then(|value| value.checked_add(result.candidate.output_tokens))
             .context("candidate score token count overflow")?;
+        let score_token_ceiling = binding
+            .held_out_cases
+            .checked_mul(2)
+            .and_then(|calls| {
+                binding
+                    .max_input_tokens_per_call
+                    .checked_add(binding.max_output_tokens_per_call)
+                    .and_then(|tokens| calls.checked_mul(tokens))
+            })
+            .context("candidate score token ceiling overflow")?;
         let expected_checks = HarnessScoreChecks {
             candidate_reference_pass_rate: result.candidate.reference_pass_basis_points
                 >= binding.minimum_candidate_reference_pass_basis_points,
@@ -11548,7 +11558,6 @@ impl RecordStore {
             || result.provider_tokens != tokens
             || binding.candidate.api_url != candidate_url
             || binding.candidate.model != proposal.model
-            || binding.max_calls_per_run != binding.held_out_cases.saturating_mul(2)
             || result.incumbent.attempted != binding.held_out_cases
             || result.candidate.attempted != binding.held_out_cases
             || result.incumbent.cases.len() as u64 != binding.held_out_cases
@@ -11561,8 +11570,7 @@ impl RecordStore {
                 != binding.case_reference_similarity_basis_points
             || result.candidate.reference_pass_threshold_basis_points
                 != binding.case_reference_similarity_basis_points
-            || result.provider_calls > binding.max_calls_per_run
-            || result.provider_tokens > binding.max_total_tokens_per_run
+            || result.provider_tokens > score_token_ceiling
             || result
                 .incumbent
                 .cases
@@ -11586,7 +11594,7 @@ impl RecordStore {
             .max_input_tokens
             .checked_add(teacher.max_output_tokens)
             .and_then(|value| value.checked_mul(3))
-            .and_then(|value| value.checked_add(binding.max_total_tokens_per_run))
+            .and_then(|value| value.checked_add(score_token_ceiling))
             .context("harness maximum token count overflow")?;
         if eval.token_usage.input_tokens > teacher.max_input_tokens
             || validation.token_usage.input_tokens > teacher.max_input_tokens
@@ -14065,7 +14073,7 @@ fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> R
         .held_out_cases
         .checked_mul(2)
         .context("harness candidate score call bound overflow")?;
-    let reserved_tokens = expected_calls
+    expected_calls
         .checked_mul(
             binding
                 .max_input_tokens_per_call
@@ -14076,11 +14084,8 @@ fn validate_harness_candidate_score(binding: &HarnessCandidateScoreBinding) -> R
     if !(1..=32).contains(&binding.held_out_cases)
         || !(1..=120).contains(&binding.timeout_seconds)
         || binding.minimum_request_interval_ms > 60_000
-        || binding.max_calls_per_run != expected_calls
         || !(128..=100_000).contains(&binding.max_input_tokens_per_call)
         || !(16..=16_384).contains(&binding.max_output_tokens_per_call)
-        || !(binding.max_calls_per_run..=1_000_000).contains(&binding.max_total_tokens_per_run)
-        || binding.max_total_tokens_per_run < reserved_tokens
         || !(9_000..=10_000).contains(&binding.case_reference_similarity_basis_points)
         || !(1..=10_000).contains(&binding.minimum_candidate_reference_pass_basis_points)
         || !(-10_000..=10_000).contains(&binding.minimum_reference_pass_delta_basis_points)
