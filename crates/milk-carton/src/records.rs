@@ -215,7 +215,11 @@ struct HarnessReadinessChecks {
     production_text_reference_capacity: bool,
     eval_source_plan_feasible: bool,
     closed_watermark_without_capture_gap: bool,
-    #[serde(default, rename = "eval_generation_capacity_available")]
+    #[serde(
+        default,
+        rename = "eval_generation_capacity_available",
+        skip_serializing_if = "Option::is_none"
+    )]
     _retired_eval_generation_capacity_available: Option<bool>,
 }
 
